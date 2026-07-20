@@ -9,7 +9,7 @@ The goal of this roadmap is to prove the core, novel concepts of the architectur
 ## 1. Scope Reductions (What We Cut)
 
 *   **Cryptography (Simplified PQ):** Cut ML-DSA (Dilithium) signatures and the complex Asynchronous PQ Session Healing. **Target:** Use standard Ed25519 for identity signatures, but implement a **Hybrid Post-Quantum Handshake** using ML-KEM (Kyber) alongside X25519 strictly for the initial session establishment. The active Double Ratchet will remain purely classical (X25519).
-*   **Networking:** Cut HTTP/3 (QUIC) encapsulation. **Target:** Send raw custom UDP datagrams over the network.
+*   **Networking (Achievable Obfuscation):** Instead of rewriting a custom QUIC stack to strip keep-alives (which is too hard), use a standard Rust QUIC library (`quinn`) over port 443 to send QUIC Unreliable Datagrams. This successfully mimics HTTP/3 traffic to evade basic Deep Packet Inspection (DPI) firewalls, getting you 90% of the way to the real roadmap's obfuscation goal.
 *   **Hardware APIs:** Cut Samsung Knox/TE integration. **Target:** Store the SQLite database and keys in standard Android Encrypted Shared Preferences or SQLCipher.
 *   **Server Hardening:** Cut Proof-of-Work (PoW) and NVMe disk spilling. **Target:** A simple RAM-only relay that queues and routes packets based on tokens.
 *   **Features:** Cut Group Chats (Ephemeral Multicast). **Target:** Strict 1-on-1 messaging.
@@ -29,6 +29,7 @@ The MVP will demonstrate a Mobile-to-Mobile messenger built with a Rust core, ro
 *   **Hybrid PQ Session Bootstrapping:** The very first handshake message utilizes a Rust crate like `pqcrypto-kyber` to encapsulate an ML-KEM secret against the peer's public key. This secret is fed into the HKDF alongside the X25519 secrets to seed the initial Double Ratchet.
 *   **E2E Encryption:** Basic X25519 Double Ratchet for ongoing messages (ignoring PQ session healing).
 *   **Transport (RaptorQ):** Use a Rust FEC crate (e.g., `raptorq`) to slice encrypted messages into redundant symbols.
+*   **Hop-by-Hop Link Encryption:** To prevent DPI from fingerprinting the RaptorQ symbols, you will wrap every packet in an outer layer of XChaCha20-Poly1305 encryption before sending it to the Relay.
 *   **The Metronome:** A background Rust thread running a `sleep(100ms)` loop. **Crucial Android Note:** The app *must* run as an Android "Foreground Service" with a persistent sticky notification to prevent Doze mode from killing the timer.
 
 ### B. The Server (Relay)
@@ -48,11 +49,12 @@ The MVP will demonstrate a Mobile-to-Mobile messenger built with a Rust core, ro
 
 ### Phase 2: The Network Metronome & Double Ratchet (Weeks 5-7)
 *   **Task 2.1 (Rust Crypto):** Implement the standard X25519 Double Ratchet state machine, seeded by the Master Key generated in Phase 1.
-*   **Task 2.2 (Rust Transport):** Build the 100ms `tokio` metronome thread in the Rust core, emitting Dummy packets when idle.
+*   **Task 2.2 (Rust Transport):** Integrate the `quinn` QUIC library to send Datagrams over port 443. Build the 100ms `tokio` metronome thread in the Rust core, emitting Dummy packets when idle.
+*   **Task 2.2b (Rust Transport):** Implement outer Link Encryption (XChaCha20-Poly1305) so every QUIC datagram looks like pure cryptographic noise to an outside observer.
 *   **Task 2.3 (Mobile UI):** Wrap the Rust metronome execution in an Android **Foreground Service**. 
 
 ### Phase 3: The Blind Relay Server (Weeks 8-9)
-*   **Task 3.1 (Server):** Build a basic asynchronous UDP server in Rust (`tokio`) or Go on AWS.
+*   **Task 3.1 (Server):** Build a basic asynchronous QUIC Datagram server in Rust (using `quinn`) on AWS, binding to port 443.
 *   **Task 3.2 (Server):** Implement the RAM-only Routing Table and Offline Queuing logic.
 *   **Task 3.3 (Rust Core):** Implement a fetch request in the client to ask the server for queued offline packets upon opening the app.
 
@@ -66,7 +68,7 @@ The MVP will demonstrate a Mobile-to-Mobile messenger built with a Rust core, ro
 ## 4. Division of Labor (Suggested for 4 People)
 
 *   **Student 1 (Mobile UI & FFI Lead):** Focuses on the Kotlin app, QR code camera integration, the `uniffi` bridge, and Android Foreground Services.
-*   **Student 2 (Post-Quantum Crypto Lead):** Focuses on the Hybrid PQ Handshake (ML-KEM + X25519), HKDF derivation, and the X25519 Double Ratchet.
+*   **Logan (Post-Quantum Crypto Lead):** Focuses on the Hybrid PQ Handshake (ML-KEM + X25519), HKDF derivation, and the X25519 Double Ratchet.
 *   **Student 3 (Transport & FEC Lead):** Focuses on the RaptorQ symbol encoding/decoding, the Rust 100ms metronome, Dummy packet generation, and UDP reassembly.
 *   **Student 4 (Server Lead):** Focuses on the AWS Relay, building the asynchronous UDP routing dictionary and offline queues.
 
