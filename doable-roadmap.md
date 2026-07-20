@@ -9,10 +9,11 @@ The goal of this roadmap is to prove the core, novel concepts of the architectur
 ## 1. Scope Reductions (What We Cut)
 
 *   **Cryptography (Simplified PQ):** Cut ML-DSA (Dilithium) signatures and the complex Asynchronous PQ Session Healing. **Target:** Use standard Ed25519 for identity signatures, but implement a **Hybrid Post-Quantum Handshake** using ML-KEM (Kyber) alongside X25519 strictly for the initial session establishment. The active Double Ratchet will remain purely classical (X25519).
-*   **Networking (Achievable Obfuscation):** Instead of rewriting a custom QUIC stack to strip keep-alives (which is too hard), use a standard Rust QUIC library (`quinn`) over port 443 to send QUIC Unreliable Datagrams. This successfully mimics HTTP/3 traffic to evade basic Deep Packet Inspection (DPI) firewalls, getting you 90% of the way to the real roadmap's obfuscation goal.
+*   **Networking (Pure UDP for Extreme Environments):** Cut the complex QUIC integration. Use pure, raw UDP (`tokio::net::UdpSocket`) over port 443. *Justification:* In extreme deployment conditions (SATCOM, degraded 2G/3G), the stateful handshakes and congestion control overhead of QUIC actively degrade performance and fail entirely under 95% packet loss. Since advanced stateful DPI is not the primary threat over SATCOM or rural 3G, raw UDP maximizes bandwidth efficiency and reliability.
+*   **Hardening (Bug Fixes Integrated):** Mitigate architectural edge-cases by ensuring stateless DoS protection at the relay, handling link key rotation jitter smoothly, and hardening the RaptorQ FEC recovery logic to prevent deadlocks.
 *   **Hardware APIs:** Cut Samsung Knox/TE integration. **Target:** Store the SQLite database and keys in standard Android Encrypted Shared Preferences or SQLCipher.
 *   **Server Hardening:** Cut Proof-of-Work (PoW) and NVMe disk spilling. **Target:** A simple RAM-only relay that queues and routes packets based on tokens.
-*   **Features:** Cut Group Chats (Ephemeral Multicast). **Target:** Strict 1-on-1 messaging.
+*   **Features:** Group Chats (Ephemeral Multicast) are moved to a **Stretch Goal**. Focus on strict 1-on-1 messaging first.
 
 ---
 
@@ -49,12 +50,12 @@ The MVP will demonstrate a Mobile-to-Mobile messenger built with a Rust core, ro
 
 ### Phase 2: The Network Metronome & Double Ratchet (Weeks 5-7)
 *   **Task 2.1 (Rust Crypto):** Implement the standard X25519 Double Ratchet state machine, seeded by the Master Key generated in Phase 1.
-*   **Task 2.2 (Rust Transport):** Integrate the `quinn` QUIC library to send Datagrams over port 443. Build the 100ms `tokio` metronome thread in the Rust core, emitting Dummy packets when idle.
-*   **Task 2.2b (Rust Transport):** Implement outer Link Encryption (XChaCha20-Poly1305) so every QUIC datagram looks like pure cryptographic noise to an outside observer.
+*   **Task 2.2 (Rust Transport):** Integrate a raw `tokio::net::UdpSocket` to send datagrams over port 443. Build the 100ms `tokio` metronome thread in the Rust core, emitting Dummy packets when idle.
+*   **Task 2.2b (Rust Transport):** Implement outer Link Encryption (XChaCha20-Poly1305) so every UDP datagram looks like pure cryptographic noise to an outside observer. Ensure link key rotation handles network jitter correctly.
 *   **Task 2.3 (Mobile UI):** Wrap the Rust metronome execution in an Android **Foreground Service**. 
 
 ### Phase 3: The Blind Relay Server (Weeks 8-9)
-*   **Task 3.1 (Server):** Build a basic asynchronous QUIC Datagram server in Rust (using `quinn`) on AWS, binding to port 443.
+*   **Task 3.1 (Server):** Build a basic asynchronous raw UDP server in Rust (using `tokio`) on AWS, binding to port 443. Implement stateless DoS protection to drop invalid routing tokens instantly without memory allocation.
 *   **Task 3.2 (Server):** Implement the RAM-only Routing Table and Offline Queuing logic.
 *   **Task 3.3 (Rust Core):** Implement a fetch request in the client to ask the server for queued offline packets upon opening the app.
 
@@ -62,6 +63,12 @@ The MVP will demonstrate a Mobile-to-Mobile messenger built with a Rust core, ro
 *   **Task 4.1 (Mobile UI):** Connect the Chat UI to the Rust backend (Type -> Ratchet Encrypt -> RaptorQ slice -> Metronome Transmit).
 *   **Task 4.2 (Mobile UI):** Polish the UX from QR scanning to chat window.
 *   **Task 4.3 (The Big Demo):** Demo two phones establishing a Hybrid Post-Quantum session and sending messages to each other over a network that is artificially dropping 90% of UDP packets.
+
+### Phase 5 (Stretch Goal): Ephemeral Multicast Group Chats
+*   If you finish Phase 4 early, attempt to implement the Ephemeral Multicast Routing design from the original roadmap.
+*   **Task 5.1 (Rust Crypto):** Implement a "Sender Key" generation and distribute it over your 1-on-1 Double Ratchet channels.
+*   **Task 5.2 (Rust Transport):** Inject `MULTICAST_BIND` control packets into the RaptorQ stream to tell the relay which 1-on-1 tokens belong to the temporary group ID.
+*   **Task 5.3 (Server):** Add fanout logic to the AWS Relay: when a packet addressed to an Ephemeral Multicast Token arrives, duplicate it into the queues of all bound recipient tokens.
 
 ---
 

@@ -1,68 +1,69 @@
-# E2E Tactical Messenger: Learning Curriculum
+# E2E Messenger: MVP Learning Curriculum
 
-This document serves as the technical study guide and prerequisite learning curriculum for implementing the master architecture defined in `ROADMAP.md`. Because the system spans post-quantum cryptography, advanced erasure coding, low-level network obfuscation, and hardware-backed mobile security, this guide explains *what* you need to understand to build the system successfully.
+This document serves as the technical study guide for implementing the MVP architecture defined in `doable-roadmap.md`. Because this project spans Rust systems programming, Mobile UI integration (FFI), advanced error correction, and cryptography, this guide explains *what* your team needs to understand to build the system successfully.
 
 ---
 
-## 1. Post-Quantum Cryptography & Hybrid Key Exchange
+## 1. Hybrid Cryptography & Key Exchange (Logan's Focus)
 
-### ML-KEM (Kyber) vs. Diffie-Hellman
-Traditional Diffie-Hellman (X25519) allows two parties to combine their private keys with each other's public keys to arrive at a shared secret mathmatically. Post-Quantum algorithms do not work this way. **ML-KEM** (Module-Lattice-Based Key-Encapsulation Mechanism) requires one party to encapsulate a randomly generated symmetric secret against the other party's public key, producing a ciphertext. The second party decapsulates this ciphertext to recover the secret. 
-* **Learning Requirement**: Understand the KEM API flow (`KeyGen`, `Encapsulate`, `Decapsulate`) and how to safely bind KEM ciphertexts into protocol transcripts to prevent Key Compromise Impersonation (KCI).
+### Ed25519 & X25519
+*   **Ed25519**: A digital signature algorithm used for long-term identity. You use this to sign your keys so the other person knows it's really you.
+*   **X25519**: Elliptic Curve Diffie-Hellman. Allows two parties to combine their private keys with each other's public keys to mathematically arrive at a shared secret.
 
-### ML-DSA (Dilithium)
-The post-quantum digital signature algorithm used to authenticate identity keys and prekey bundles.
-* **Learning Requirement**: Understand the massive key size and signature size differences between Ed25519 (64-byte signatures) and ML-DSA-65 (3,300+ byte signatures), and why ML-DSA keys cannot be transmitted in every network packet due to MTU limitations.
+### ML-KEM (Kyber) & Key Encapsulation
+Post-Quantum algorithms do not work like Diffie-Hellman. **ML-KEM** (Module-Lattice-Based Key-Encapsulation Mechanism) requires one party to generate a random secret and "encapsulate" it into a ciphertext using the other party's public key. The second party decapsulates it. 
+*   **Learning Requirement**: Understand the KEM API flow (`KeyGen`, `Encapsulate`, `Decapsulate`).
 
 ### Hybrid Key Derivation (HKDF)
-Because post-quantum algorithms are novel, the NSA (CSfC) and industry standards mandate **Hybrid Cryptography**. 
-* **Learning Requirement**: Understand how to safely cascade multiple shared secrets. In this protocol, 4 classical X25519 secrets and 2 ML-KEM secrets are concatenated alongside the public transcripts and fed into **HKDF-SHA256** (HMAC-based Extract-and-Expand Key Derivation Function) to produce a Master Key that is secure as long as *at least one* of the underlying algorithms remains unbroken.
+Because post-quantum algorithms are novel, the NSA and industry standards mandate **Hybrid Cryptography**. 
+*   **Learning Requirement**: Understand how to safely cascade multiple shared secrets. You must combine the classical X25519 secret and the ML-KEM secret using **HKDF-SHA256** (HMAC-based Extract-and-Expand Key Derivation Function) to produce a Master Key. If a quantum computer breaks ML-KEM in the future, your X25519 math still protects the key.
 
 ---
 
-## 2. The Signal Double Ratchet Algorithm
+## 2. The Signal Double Ratchet Algorithm (Logan's Focus)
 
-The core messaging engine that provides Perfect Forward Secrecy (PFS) and Post-Compromise Security (PCS).
-* **Root Chain & Message Chains**: Understand how KDFs advance forward on every message (Symmetric Ratchet) to ensure an attacker who steals today's key cannot read yesterday's messages.
-* **Diffie-Hellman Ratcheting**: Understand how sending a new ephemeral public key with every message forces the Root Chain to rotate, guaranteeing that if an attacker steals today's key, they lose access as soon as the participants exchange new messages.
-* **Out-of-Order Execution**: UDP guarantees packet loss and reordering. You must understand how the Double Ratchet handles skipped messages (storing derived message keys in a dictionary for future late arrivals) up to a `MAX_SKIP` limit.
-* **Asynchronous PQ Healing**: Because ML-KEM ciphertexts are too large to append to every message, you must understand how to execute the standard classical Double Ratchet, while periodically sending out-of-band ML-KEM encapsulations (`PQ_REKEY`) to "heal" the root chain against quantum adversaries.
+The core messaging engine that provides Perfect Forward Secrecy (PFS).
+*   **Per-Message Symmetric Ratcheting**: Understand how Key Derivation Functions (KDFs) advance forward on *every single message*. A new Message Key is derived dynamically from the previous state, ensuring an attacker who steals today's key cannot read yesterday's messages.
+*   **Diffie-Hellman Ratcheting**: Understand how sending a new ephemeral X25519 public key occasionally forces the root chain to rotate, guaranteeing that if an attacker steals today's key, they lose access as soon as you exchange new DH keys.
+*   **Out-of-Order Execution**: UDP guarantees packet loss and reordering. You must understand how the Double Ratchet handles skipped messages (storing derived message keys in a dictionary for future late arrivals).
 
 ---
 
-## 3. Forward Error Correction (FEC) & RaptorQ
+## 3. Forward Error Correction & RaptorQ (Student 3)
 
 Tolerating 95% packet loss without Acknowledgment (ACK) packets requires completely abandoning standard TCP/ARQ logic.
-* **Erasure Codes vs. ARQ**: Understand why reactive retransmission fails when round-trip loss is 95%.
-* **Rateless Fountain Codes (RaptorQ - RFC 6330)**: Understand how RaptorQ can take a file sliced into $K$ source symbols and generate an infinite stream of repair symbols. A receiver can successfully reconstruct the entire original message by collecting *any* $K + \epsilon$ symbols, regardless of which specific packets were dropped.
-* **Interleaved Round-Robin Scheduling**: To prevent active typing from starving active block transmissions, you must understand how to interleave FEC block transmissions inside a fixed timer loop, streaming repair symbols during idle ticks.
-* **Galois Fields (`GF(256)`)**: A conceptual understanding of how erasure coding matrix math works in finite fields will aid in debugging decoder failures.
+*   **Erasure Codes vs. ARQ**: Understand why reactive retransmission (waiting for an ACK) completely fails when round-trip loss is 95%.
+*   **Rateless Fountain Codes (RaptorQ)**: Understand how RaptorQ can take a file (or ciphertext) sliced into $K$ source symbols and generate a nearly infinite stream of mathematical repair symbols. A receiver can successfully reconstruct the entire original message by collecting *any* subset of symbols, regardless of which specific packets were dropped.
 
 ---
 
-## 4. Low-Level Networking & Censorship Evasion
+## 4. Networking & Obfuscation (Student 3)
 
-* **MTU & IP Fragmentation**: Understand why the UDP packet size is strictly capped at **1350 bytes**. If a datagram exceeds the network path MTU (typically 1500 bytes), routers fragment it. If either fragment is lost, the whole packet is lost, squaring your effective packet loss rate and destroying the RaptorQ math.
-* **Constant-Rate Tunnels (CRT)**: Understand traffic analysis and timing correlation. To hide metadata, the application must fire a packet every 100ms exactly, padding empty ticks with cryptographic noise (Dummy Packets).
-* **HTTP/3 (QUIC) Datagrams (RFC 9221)**: Because sending raw, metronomic UDP packets looks highly anomalous to Deep Packet Inspection (DPI) firewalls, you must learn how to wrap raw UDP datagrams inside a QUIC connection (over port 443) to camouflage the traffic as standard web browsing.
-* **Harmonic Signatures**: Understand that default QUIC implementations inject Keep-Alives and MTU probes. When overlaid on a 100ms CRT loop, these create harmonic timing frequencies. You must learn how to modify a QUIC stack to achieve total protocol silence.
-
----
-
-## 5. Hardware Security & Mobile OS Internals
-
-To meet tactical CSfC constraints, you must understand the Android/Samsung hardware boundaries.
-* **Samsung Knox Vault (EAL5+)**: Understand the physical separation between the Application Processor (OS), the Trusted Execution Environment (TEE/TrustZone), and dedicated Secure Elements (SE).
-* **Key Wrapping Architectures**: Because hardware APIs often lag behind cryptographic research (e.g., lack of ML-KEM support in Knox), you must learn how to generate software keys in volatile RAM, and use the hardware element to generate an AES Key Encryption Key (KEK) to securely "wrap" the software keys before saving them to disk.
-* **Write-Ahead Logging (WAL)**: When you delete a one-time prekey from the hardware Keystore and update the Double Ratchet state in the SQLite database, you are updating two independent systems. If the phone crashes halfway, the session is permanently locked. You must understand Two-Phase Commits and WAL concepts to ensure atomicity.
-* **Memory Hygiene**: Learn system calls and memory management techniques to prevent RAM scraping: `zeroize` traits in Rust to wipe buffers on drop, `mlock` to pin pages and prevent OS swapping to disk, and Android `onTrimMemory` lifecycle hooks.
+*   **QUIC Datagrams (RFC 9221)**: You will be using a Rust crate like `quinn`. QUIC is HTTP/3. It runs over UDP but looks like standard HTTPS web traffic to Deep Packet Inspection (DPI) firewalls. You will use the "Unreliable Datagrams" feature of QUIC so packets aren't artificially held back by the library.
+*   **Constant-Rate Tunnels (CRT)**: Understand traffic analysis. To hide metadata (who is talking and when), your app must fire a packet every 100ms exactly. If the user isn't typing, you send a Dummy Packet filled with cryptographic noise.
+*   **Hop-by-Hop Link Encryption**: Understand why wrapping the outer payload in XChaCha20-Poly1305 is necessary. It ensures the DPI firewall cannot look inside your QUIC packets and see the RaptorQ headers, which would identify your app as a messenger.
 
 ---
 
-## 6. Advanced Server Architecture (Blind Routing)
+## 5. Mobile & Rust FFI Integration (Student 1)
+
+*   **Foreign Function Interfaces (FFI)**: You cannot easily write UDP sockets or RaptorQ math in standard Kotlin without massive performance hits. You must learn how to bridge a Rust Core library to an Android UI. Look deeply into **Mozilla's `uniffi-rs`**, which automatically generates the Kotlin bindings for your Rust code.
+*   **Android Foreground Services**: Modern mobile operating systems (like Android Doze mode) will aggressively kill any background threads trying to fire a timer every 100ms to save battery. You must learn how to implement an Android Foreground Service with a persistent, sticky notification to tell the OS "Do not kill my Rust metronome."
+*   **QR Code Trust**: Understand how to generate QR codes locally in Android that contain the Rust-generated public keys, and how to pass a scanned string back into Rust.
+
+---
+
+## 6. The Blind Relay Server (Student 4)
 
 The AWS Relay must route messages without knowing who is talking, what they are saying, or when they are saying it.
-* **Metronomic Decoupling**: If a server forwards a packet the millisecond it receives it, global adversaries can correlate the processing latency ($\Delta T$) to link Alice to Bob. You must understand how to buffer ingress traffic and only flush egress queues on globally aligned timer ticks.
-* **Stateless Proof-of-Work (PoW)**: To prevent socket exhaustion DDoS attacks, you must learn how to issue stateless cryptographic challenges (e.g., $HMAC(ClientIP + DailySecret) = Cookie$), forcing the client to solve a CPU-bound hashcash puzzle before the server allocates any RAM.
-* **Hash Ratcheting & Blind Queuing**: Understand how to use one-way hashing ($H(Token) \rightarrow R_0, H(R_0) \rightarrow R_1$) to create "Offline Rendezvous Tokens." This allows the server to queue data to a mailbox that constantly changes names, preventing the server from tracking long-term subscriptions.
-* **Delete Tokens (Blinded GC)**: Learn how to shift deletion commands ($HMAC(SessionKey, BlockID)$) into the link-layer plaintext, allowing the relay to instantly purge RAM queues without needing to decrypt the E2E payload.
+*   **Token-Based Routing**: The server does not use User IDs. Understand how to use a basic `HashMap` in Rust/Go to map a 16-byte incoming Routing Token to a specific IP address and Port.
+*   **Offline Queuing**: If a token isn't currently active (the user's app is closed), understand how to append the incoming packets to an array in RAM (`Vec` or slice) so the user can query and download them when they come back online.
+*   **Zero-Knowledge Architecture**: Embrace the concept that the server is "dumb." It only sees encrypted noise and 16-byte tokens. It never decrypts the payload.
+
+---
+
+## 7. Stretch Goal: Ephemeral Multicast Group Chats
+
+If your team reaches Phase 5, you will need to understand the cryptographic and networking extensions required for group chats over 1-on-1 channels.
+*   **Signal Sender Keys**: Instead of doing a complex Double Ratchet for every member of a group, learn how a sender generates a single Symmetric Key and distributes it to group members via their existing 1-on-1 channels.
+*   **Server Fanout**: Understand how the server can take a single incoming QUIC datagram tagged with a "Multicast Token" and physically duplicate it into the egress queues of multiple recipients, saving the sender massive amounts of bandwidth.
