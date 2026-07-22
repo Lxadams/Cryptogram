@@ -8,9 +8,9 @@ The goal of this roadmap is to prove the core, novel concepts of the architectur
 
 ## 1. Scope Reductions (What We Cut)
 
-*   **Cryptography (Simplified PQ):** Cut ML-DSA (Dilithium) signatures and the complex Asynchronous PQ Session Healing. **Target:** Use standard Ed25519 for identity signatures, but implement a **Hybrid Post-Quantum Handshake** using ML-KEM (Kyber) alongside X25519 strictly for the initial session establishment. The active Double Ratchet will remain purely classical (X25519).
+*   **Cryptography (Simplified PQ):** Cut ML-DSA (Dilithium) signatures and the complex Asynchronous PQ Session Healing. **Target:** Use standard Ed25519 for identity signatures, but implement a **Hybrid Post-Quantum Handshake** using ML-KEM (Kyber) alongside X25519 strictly for the initial session establishment. The active Double Ratchet will remain purely classical (X25519), but we will implement a "Blunt Force" Cryptographic Session Reset (auto-triggered every 100 messages or manually via UI) to achieve PQ session healing.
 *   **Networking (Pure UDP for Extreme Environments):** Cut the complex QUIC integration. Use pure, raw UDP (`tokio::net::UdpSocket`) over port 443. *Justification:* In extreme deployment conditions (SATCOM, degraded 2G/3G), the stateful handshakes and congestion control overhead of QUIC actively degrade performance and fail entirely under 95% packet loss. Since advanced stateful DPI is not the primary threat over SATCOM or rural 3G, raw UDP maximizes bandwidth efficiency and reliability.
-*   **Hardening (Bug Fixes Integrated):** Mitigate architectural edge-cases by ensuring stateless DoS protection at the relay, handling link key rotation jitter smoothly, and hardening the RaptorQ FEC recovery logic to prevent deadlocks.
+*   **Hardening (Bug Fixes Integrated):** Mitigate architectural edge-cases by ensuring stateless DoS protection at the relay, handling link key rotation jitter smoothly, and hardening the RaptorQ FEC and Double Ratchet logic with a `MAX_SKIP` limit and 5-minute TTL to prevent OOM deadlocks.
 *   **Hardware APIs:** Cut Samsung Knox/TE integration. **Target:** Store the SQLite database and keys in standard Android Encrypted Shared Preferences or SQLCipher.
 *   **Server Hardening:** Cut Proof-of-Work (PoW) and NVMe disk spilling. **Target:** A simple RAM-only relay that queues and routes packets based on tokens.
 *   **Features:** Group Chats (Ephemeral Multicast) are moved to a **Stretch Goal**. Focus on strict 1-on-1 messaging first.
@@ -50,6 +50,7 @@ The MVP will demonstrate a Mobile-to-Mobile messenger built with a Rust core, ro
 
 ### Phase 2: The Network Metronome & Double Ratchet (Weeks 5-7)
 *   **Task 2.1 (Rust Crypto):** Implement the standard X25519 Double Ratchet state machine, seeded by the Master Key generated in Phase 1.
+*   **Task 2.1b (Rust Crypto):** Implement memory bounds on the Double Ratchet (e.g., `MAX_SKIP = 500` limit and a 5-minute Time-To-Live pruning for skipped message keys).
 *   **Task 2.2 (Rust Transport):** Integrate a raw `tokio::net::UdpSocket` to send datagrams over port 443. Build the 100ms `tokio` metronome thread in the Rust core, emitting Dummy packets when idle.
 *   **Task 2.2b (Rust Transport):** Implement outer Link Encryption (XChaCha20-Poly1305) so every UDP datagram looks like pure cryptographic noise to an outside observer. Ensure link key rotation handles network jitter correctly.
 *   **Task 2.3 (Mobile UI):** Wrap the Rust metronome execution in an Android **Foreground Service**. 
@@ -61,6 +62,7 @@ The MVP will demonstrate a Mobile-to-Mobile messenger built with a Rust core, ro
 
 ### Phase 4: Integration & Extreme Loss Testing (Weeks 10-12)
 *   **Task 4.1 (Mobile UI):** Connect the Chat UI to the Rust backend (Type -> Ratchet Encrypt -> RaptorQ slice -> Metronome Transmit).
+*   **Task 4.1b (Rust Crypto & UI):** Implement the "Session Reset" control packet to allow manual (UI button) or automated (every 100 messages) PQ session healing.
 *   **Task 4.2 (Mobile UI):** Polish the UX from QR scanning to chat window.
 *   **Task 4.3 (The Big Demo):** Demo two phones establishing a Hybrid Post-Quantum session and sending messages to each other over a network that is artificially dropping 90% of UDP packets.
 

@@ -26,6 +26,8 @@ The core messaging engine that provides Perfect Forward Secrecy (PFS).
 *   **Per-Message Symmetric Ratcheting**: Understand how Key Derivation Functions (KDFs) advance forward on *every single message*. A new Message Key is derived dynamically from the previous state, ensuring an attacker who steals today's key cannot read yesterday's messages.
 *   **Diffie-Hellman Ratcheting**: Understand how sending a new ephemeral X25519 public key occasionally forces the root chain to rotate, guaranteeing that if an attacker steals today's key, they lose access as soon as you exchange new DH keys.
 *   **Out-of-Order Execution**: UDP guarantees packet loss and reordering. You must understand how the Double Ratchet handles skipped messages (storing derived message keys in a dictionary for future late arrivals).
+*   **Memory Bounds (OOM Prevention)**: Understand why saving every skipped message key indefinitely will crash the app under 95% loss. You must implement a `MAX_SKIP` limit (e.g., 500) and a 5-minute Time-To-Live (TTL) pruning function for the skipped key dictionary.
+*   **PQ Session Healing**: Because modifying the internal ratchet for Post-Quantum mix-ins is too complex for an MVP, understand how to implement a "Blunt Force" Cryptographic Session Reset. This involves encapsulating a new Kyber secret, sending a control packet, and completely rebooting the Double Ratchet state on both ends.
 
 ---
 
