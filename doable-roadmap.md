@@ -30,7 +30,7 @@ The MVP will demonstrate a Mobile-to-Mobile messenger built with a Rust core, ro
 *   **Hybrid PQ Session Bootstrapping:** The very first handshake message utilizes a Rust crate like `pqcrypto-kyber` to encapsulate an ML-KEM secret against the peer's public key. This secret is fed into the HKDF alongside the X25519 secrets to seed the initial Double Ratchet.
 *   **E2E Encryption:** Basic X25519 Double Ratchet for ongoing messages (ignoring PQ session healing).
 *   **Transport (RaptorQ):** Use a Rust FEC crate (e.g., `raptorq`) to slice encrypted messages into redundant symbols.
-*   **Hop-by-Hop Link Encryption:** To prevent DPI from fingerprinting the RaptorQ symbols, you will wrap every packet in an outer layer of XChaCha20-Poly1305 encryption before sending it to the Relay.
+*   **Hop-by-Hop Link Encryption:** To prevent DPI from fingerprinting the RaptorQ symbols, you will wrap every packet in an outer layer of XChaCha20-Poly1305 encryption (using an ephemeral key established via X25519 DH handshake with the server's static public key) before sending it to the Relay.
 *   **The Metronome:** A background Rust thread running a `sleep(100ms)` loop. **Crucial Android Note:** The app *must* run as an Android "Foreground Service" with a persistent sticky notification to prevent Doze mode from killing the timer.
 
 ### B. The Server (Relay)
@@ -52,7 +52,7 @@ The MVP will demonstrate a Mobile-to-Mobile messenger built with a Rust core, ro
 *   **Task 2.1 (Rust Crypto):** Implement the standard X25519 Double Ratchet state machine, seeded by the Master Key generated in Phase 1.
 *   **Task 2.1b (Rust Crypto):** Implement memory bounds on the Double Ratchet (e.g., `MAX_SKIP = 500` limit and a 5-minute Time-To-Live pruning for skipped message keys).
 *   **Task 2.2 (Rust Transport):** Integrate a raw `tokio::net::UdpSocket` to send datagrams over port 443. Build the 100ms `tokio` metronome thread in the Rust core, emitting Dummy packets when idle.
-*   **Task 2.2b (Rust Transport):** Implement outer Link Encryption (XChaCha20-Poly1305) so every UDP datagram looks like pure cryptographic noise to an outside observer. Ensure link key rotation handles network jitter correctly.
+*   **Task 2.2b (Rust Transport):** Implement the X25519 Link Handshake and outer Link Encryption (XChaCha20-Poly1305). Ensure the app prepends the 4-byte unencrypted Session ID so the server can statelessly identify the correct ephemeral link key.
 *   **Task 2.3 (Mobile UI):** Wrap the Rust metronome execution in an Android **Foreground Service**. 
 
 ### Phase 3: The Blind Relay Server (Weeks 8-9)

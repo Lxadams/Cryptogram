@@ -7,7 +7,7 @@ This document describes the simplified, realistic cryptographic architecture of 
 ## 1. Architectural Role Summary
 
 *   **Clients (Alice & Bob)**: Generate all keys locally in memory (no Samsung Knox hardware APIs). Trust is established strictly in person via QR codes (no cloud prekey servers). The clients handle all asymmetric/symmetric cryptography, RaptorQ Forward Error Correction (FEC), and the Constant-Rate Tunnel (CRT) UDP metronome.
-*   **AWS Relay**: A "dumb" RAM-only router. It has zero knowledge of User IDs or E2E keys. To make this feasible for a university project, the relay uses a hardcoded universal Pre-Shared Key (PSK) to strip the outer link-encryption layer, read the routing token, and route or queue the raw UDP packet.
+*   **AWS Relay**: A "dumb" RAM-only router. It has zero knowledge of User IDs or E2E keys. The relay uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID to identify the link key, decrypts the outer shell, reads the routing token, and routes or queues the raw UDP packet.
 
 ---
 
@@ -51,7 +51,7 @@ Once the session is bootstrapped, ongoing messaging relies purely on the classic
 To evade traffic analysis and DPI, the symbols must be obfuscated.
 
 1.  **Link Encryption**: To hide the RaptorQ headers and the Routing Token from the ISP, Alice wraps the entire packet in an outer layer of **XChaCha20-Poly1305**.
-    *   *Uni Feasibility Note*: She encrypts this outer shell using the universal Pre-Shared Key (PSK) hardcoded into the app and the AWS Relay.
+    *   *Server Key-Pinning*: She encrypts this outer shell using an ephemeral Link Master Key established via an X25519 handshake with the server's hardcoded public key when the app boots. She prepends an unencrypted 4-byte Session ID to the outside of the packet so the server knows which key to use.
 2.  **The Metronome**: A Rust `tokio` thread running in an Android Foreground Service transmits exactly one UDP packet every 100ms. 
     *   If there are RaptorQ symbols in the queue, it sends one.
     *   If the user isn't typing, it generates and sends a random Dummy Packet of the exact same size to ensure the traffic rate never fluctuates.
@@ -64,10 +64,12 @@ To evade traffic analysis and DPI, the symbols must be obfuscated.
 2.  **Alice** slices it into 5 RaptorQ symbols.
 3.  **Alice's Metronome** wakes up (Tick 1):
     *   Takes Symbol 1, prepends the 16-byte Routing Token.
-    *   Encrypts the whole block with the Link PSK (XChaCha20).
+    *   Encrypts the block with the Link Master Key (XChaCha20).
+    *   Prepends the unencrypted 4-byte Link Session ID to the outside.
     *   Fires it over raw UDP to AWS Relay port 443.
 4.  **AWS Relay** receives the UDP packet.
-    *   Decrypts the outer layer using the Link PSK.
+    *   Reads the 4-byte Session ID and looks up Alice's Link Master Key in RAM.
+    *   Decrypts the outer layer using the Link Master Key.
     *   Reads the 16-byte Routing Token.
     *   Looks up the token in its RAM `HashMap`.
     *   Routes the inner payload to Bob's IP (or queues it if Bob hasn't pinged in 5 seconds).
@@ -82,9 +84,9 @@ To evade traffic analysis and DPI, the symbols must be obfuscated.
 
 Because this is a 12-week university scope, several production-grade security features were cut. These must be acknowledged as limitations:
 
-### A. The Universal PSK for Link Encryption
-*   **The Issue**: To allow the stateless AWS Relay to decrypt the outer shell and route the packets, a universal Pre-Shared Key (PSK) is hardcoded into the clients and the server.
-*   **The Vulnerability**: If anyone reverse-engineers the Android APK and extracts the PSK, they can decrypt the outer layer of *all* traffic on the network. While they still cannot read the E2E encrypted messages (protected by QR keys), they can read the Routing Tokens and completely de-anonymize the metadata graph (seeing who is talking to whom).
+### A. The X25519 Link Handshake (Replaces PSK)
+*   **The Upgrade**: Originally, a universal Pre-Shared Key (PSK) was planned for link encryption, which was a massive security vulnerability. This has been replaced by a "WireGuard-Lite" handshake. The AWS Relay's static X25519 public key is hardcoded into the app. When the app boots, it generates an ephemeral keypair and performs a DH exchange with the server's public key to establish a unique Link Master Key, receiving a 4-byte Session ID in return. 
+*   **The Result**: If someone extracts the hardcoded server public key from the APK, it is useless to them. They cannot decrypt other users' link traffic because they lack the server's private key. The 4-byte Session ID securely identifies incoming packets despite mobile IP roaming.
 
 ### B. Double Ratchet Memory Bounds (Resolved)
 *   **The Issue**: The standard Double Ratchet handles dropped messages by saving derived keys for "skipped" messages in a dictionary indefinitely. Under 95% UDP loss, the number of permanently lost messages is massive, which would cause an Out-Of-Memory (OOM) crash.

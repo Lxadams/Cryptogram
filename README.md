@@ -32,7 +32,7 @@ Instead, our Rust core uses **RaptorQ**, a Forward Error Correction (FEC) founta
 To prevent a passive observer from knowing *when* you are talking or *how much* you are saying, the app establishes a **Constant-Rate Tunnel (CRT)**.
 - A Rust timer loop runs in an Android Foreground Service, firing exactly one packet every **100ms** (10 pkts/sec).
 - If the user isn't typing, the client generates cryptographically secure random bytes (Dummy Packets) and sends them anyway.
-- For extreme deployment conditions (SATCOM, degraded 2G/3G), these packets are sent as **pure, raw UDP datagrams** (over port 443) wrapped in an outer layer of **XChaCha20-Poly1305** Link Encryption. This provides maximum bandwidth efficiency and reliability by eliminating connection handshakes and congestion control overhead, which would otherwise cripple performance under 95% packet loss.
+- For extreme deployment conditions (SATCOM, degraded 2G/3G), these packets are sent as **pure, raw UDP datagrams** (over port 443) wrapped in an outer layer of **XChaCha20-Poly1305** Link Encryption (secured statelessly via an ephemeral X25519 handshake against the server's pinned public key). This provides maximum bandwidth efficiency and reliability by eliminating connection handshakes and congestion control overhead, which would otherwise cripple performance under 95% packet loss.
 
 ### 6. The Blind Relay Server
 The backend is a highly concurrent, RAM-only cloud server. It acts purely as a dumb router.

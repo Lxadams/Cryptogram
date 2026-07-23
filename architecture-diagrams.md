@@ -23,12 +23,16 @@ sequenceDiagram
     B->>B: Perform standard X25519 DH Exchange
     B->>B: HKDF(Kyber + X25519) = Session Master Key
     
+    Note over B, S: Phase 3: Server Link Handshake (App Boot)
+    B->>S: Link Handshake (Ephemeral X25519 PubKey)
+    S->>B: 4-byte Session ID (Link Key Established)
+
     B->>B: Encrypt Msg 1 & Handshake with Master Key
     B->>B: Slice via RaptorQ & Apply XChaCha20 Link Encryption
     
     Note over B: 100ms Metronome Foreground Service Starts
-    B->>S: Raw UDP Packet (Routing Token + Encrypted Symbols)
-    Note over S: Server reads unencrypted Token, looks up Alice's IP.
+    B->>S: UDP Packet (Session ID + Encrypted Payload)
+    Note over S: Reads Session ID to find Link Key, decrypts to find Token.
     S->>A: Forwards Raw UDP Packet
     
     A->>A: Decrypt Link Encryption
@@ -51,18 +55,18 @@ sequenceDiagram
     Note over A, B: Both clients running 100ms Metronome Timer
     
     Note over A, B: Scenario A: Idle (No users typing)
-    A->>S: UDP Dummy (Token + Random Crypto Noise)
+    A->>S: UDP Dummy (Session ID + Encrypted Noise)
     S->>B: Forwarded blindly
-    B->>S: UDP Dummy (Token + Random Crypto Noise)
+    B->>S: UDP Dummy (Session ID + Encrypted Noise)
     S->>A: Forwarded blindly
     Note over A, B: To an observer, the link looks like a constant static stream.
 
     Note over A, B: Scenario B: Alice sends a real message
     A->>A: Encrypt Msg via X25519 Double Ratchet (Unique Key)
     A->>A: Slice into 3 Redundant Symbols (RaptorQ)
-    A->>S: Metronome Tick 1: UDP Packet (Symbol 1)
-    A->>S: Metronome Tick 2: UDP Packet (Symbol 2)
-    A->>S: Metronome Tick 3: UDP Packet (Symbol 3)
+    A->>S: Metronome Tick 1: UDP Packet (Session ID + Symbol 1)
+    A->>S: Metronome Tick 2: UDP Packet (Session ID + Symbol 2)
+    A->>S: Metronome Tick 3: UDP Packet (Session ID + Symbol 3)
     
     S->>B: Forwards Packet 1
     S-xB: Packet 2 DROPPED (Network Loss)
@@ -87,11 +91,11 @@ sequenceDiagram
     Note over A: Alice's phone dies or loses service.
     
     Note over B, S: Bob's Metronome continues firing at 100ms
-    B->>S: UDP Packet (Token + Dummy or Message)
-    Note over S: Reads Token. Alice's IP is not bound or active.
+    B->>S: UDP Packet (Session ID + Encrypted Dummy/Message)
+    Note over S: Decrypts via Session ID, reads Token. Alice's IP not active.
     S->>S: Store packet in RAM Offline Queue for Token
     
-    B->>S: UDP Packet (Token + Dummy or Message)
+    B->>S: UDP Packet (Session ID + Encrypted Dummy/Message)
     S->>S: Store packet in RAM Offline Queue for Token
     
     Note over A: Alice reconnects (App opens and binds IP)
