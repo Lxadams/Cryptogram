@@ -58,7 +58,71 @@ To evade traffic analysis and DPI, the symbols must be obfuscated.
 
 ---
 
-## 6. Detailed Step-by-Step Packet Walkthrough
+## 6. Detailed Cryptographic Diagrams & Walkthrough
+
+### A. Full Cryptographic Key Exchange Flow
+
+This diagram illustrates how all the disparate cryptographic primitives (Ed25519, X25519, ML-KEM) interact to establish the end-to-end trust, the stateless server link, and the session master key.
+
+```mermaid
+sequenceDiagram
+    participant A as Alice
+    participant S as AWS Relay
+    participant B as Bob
+
+    Note over A, B: 1. Out-of-Band Trust and Identity
+    A->>A: Generate Identity Key (Ed25519)
+    B->>B: Generate Identity Key (Ed25519)
+    A->>B: Scan QR: Exchange Ed25519, X25519, Kyber PubKeys
+    Note over A, B: Derive Unidirectional Routing Tokens: Token A and Token B
+
+    Note over A, S: 2. Server Link Handshake (App Boot)
+    A->>A: Generate Ephemeral Link Keypair (X25519)
+    A->>S: Handshake Packet (Alice Eph PubKey)
+    S->>S: DH(Server Static Priv, Alice Eph Pub) = Link Master Key
+    S->>A: Server Response (4-byte Session ID)
+    Note over A, S: Link Layer Secured via XChaCha20-Poly1305
+
+    Note over A, B: 3. Hybrid PQ E2E Session Bootstrapping
+    A->>A: Generate ML-KEM-768 Kyber Secret against Bob
+    A->>A: DH(Alice X25519 Priv, Bob X25519 Pub)
+    A->>A: HKDF(Kyber Secret and DH Secret) = E2E Master Key
+    A->>A: Initialize Double Ratchet with Master Key
+
+    Note over A, B: 4. Message Encapsulation and Transport
+    A->>A: Encrypt Msg with Double Ratchet Message Key
+    A->>A: Slice Msg via RaptorQ into Symbols
+    A->>S: UDP Packet (Session ID + Link Encrypted Payload)
+    S->>S: Decrypt Link Layer via Session ID Link Master Key
+    S->>S: Read Routing Token, Route to Bob
+    S->>B: UDP Packet (Bob's Session ID + Link Encrypted Payload)
+```
+
+### B. Nested Packet Encapsulation Structure
+
+This block diagram demonstrates exactly what a single UDP datagram looks like on the wire, showing how the routing IDs, Session IDs, and E2E layers are nested to prevent metadata leakage.
+
+```mermaid
+graph TD
+    UDP[Raw UDP Datagram on Port 443]
+    
+    UDP --> Header[Unencrypted Header]
+    Header --> SID(4-byte Link Session ID: Identifies Server Link Key)
+    
+    UDP --> Link[XChaCha20-Poly1305 Link Encrypted Envelope]
+    Link --> Token(16-byte Unidirectional Routing Token)
+    Link --> FEC(RaptorQ FEC Symbol Data)
+    
+    FEC --> E2E[ChaCha20-Poly1305 Double Ratchet Encryption]
+    E2E --> Key(Unique Per-Message Key)
+    E2E --> Plaintext(Actual Chat Text)
+    
+    style UDP fill:#f9f9f9,stroke:#666,stroke-width:2px
+    style Link fill:#d9edf7,stroke:#31708f,stroke-width:2px
+    style E2E fill:#dff0d8,stroke:#3c763d,stroke-width:2px
+```
+
+### C. Step-by-Step Packet Walkthrough
 
 1.  **Alice (Client)** encrypts a message via Double Ratchet.
 2.  **Alice** slices it into 5 RaptorQ symbols.
