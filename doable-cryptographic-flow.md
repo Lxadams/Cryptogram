@@ -122,7 +122,50 @@ graph TD
     style E2E fill:#dff0d8,stroke:#3c763d,stroke-width:2px
 ```
 
-### C. Step-by-Step Packet Walkthrough
+### C. Double Ratchet State Machine (MVP Implementation)
+
+This diagram visualizes the internal Double Ratchet engine used for ongoing end-to-end encryption. It specifically highlights the custom UDP hardening mechanisms required for this project—namely, the strict skipped-key bounds to prevent memory leaks under 95% packet loss, and the "Blunt Force" Session Reset used for Post-Quantum healing.
+
+```mermaid
+graph TD
+    Master(Session Master Key from Kyber and X25519) --> RootChain
+    
+    subgraph Root Chain: X25519 DH Ratchet
+        RootChain[Root KDF State] -->|New DH Shared Secret| NewRoot[Next Root Key]
+        RootChain -->|New DH Shared Secret| ChainKey[Sending or Receiving Chain Key]
+    end
+    
+    subgraph Symmetric Message Ratchet
+        ChainKey -->|One-Way KDF| MsgKey1(Message Key N)
+        ChainKey -->|One-Way KDF| NextChain[Next Chain Key]
+        
+        NextChain -->|One-Way KDF| MsgKey2(Message Key N+1)
+        NextChain -->|One-Way KDF| NextChain2(Next Chain Key...)
+    end
+    
+    MsgKey1 --> Crypt(ChaCha20-Poly1305 Encrypt/Decrypt)
+    Crypt --> Destroy(Permanently Destroy Key - PFS)
+    
+    MsgKey2 --> Missed{Packet Dropped?}
+    Missed -->|Yes| Dict(Store in Skipped Dictionary)
+    
+    subgraph Loss Mitigation: UDP Hardening
+        Dict -.-> Rule1(MAX_SKIP Limit: Max 500 skipped keys)
+        Dict -.-> Rule2(TTL Pruning: Auto-delete key after 5 Minutes)
+    end
+    
+    subgraph Post-Quantum Session Healing
+        Count[Message Count Reaches 100] --> Wipe(Wipe Entire Ratchet RAM State)
+        Wipe --> Restart(Trigger New Kyber Handshake for New Root)
+    end
+    
+    style Master fill:#f9f9f9,stroke:#666,stroke-width:2px
+    style RootChain fill:#d9edf7,stroke:#31708f,stroke-width:2px
+    style ChainKey fill:#dff0d8,stroke:#3c763d,stroke-width:2px
+    style Dict fill:#f2dede,stroke:#a94442,stroke-width:2px
+```
+
+### D. Step-by-Step Packet Walkthrough
 
 1.  **Alice (Client)** encrypts a message via Double Ratchet.
 2.  **Alice** slices it into 5 RaptorQ symbols.
