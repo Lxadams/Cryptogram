@@ -165,7 +165,48 @@ graph TD
     style Dict fill:#f2dede,stroke:#a94442,stroke-width:2px
 ```
 
-### D. Step-by-Step Packet Walkthrough
+### D. Double Ratchet Network Flow (Alice ↔ Server ↔ Bob)
+
+This sequence diagram illustrates the "ping-pong" nature of the Double Ratchet across the network. It shows how the Symmetric Ratchet handles consecutive messages, how the DH Ratchet creates new key chains when the conversation direction changes, and how the Server acts purely as a blind router completely unaware of the E2E key rotations.
+
+```mermaid
+sequenceDiagram
+    participant A as Alice's App
+    participant S as Blind Relay Server
+    participant B as Bob's App
+
+    Note over A, B: Session Bootstrapped: Both share the initial Root Key
+    
+    Note over A: Alice sends Message 1
+    A->>A: Symmetric Ratchet: Derive Message Key 1
+    A->>A: ChaCha20 Encrypt Message 1
+    A->>A: Attach Alice's current DH Public Key (PubKey A1)
+    A->>S: UDP Packet (Session ID + Msg 1 + PubKey A1)
+    Note over S: Server decrypts Link Layer, reads Routing Token, forwards blindly.
+    S->>B: UDP Packet (Session ID + Msg 1 + PubKey A1)
+    
+    B->>B: Extracts PubKey A1 (Matches current state)
+    B->>B: Symmetric Ratchet: Derive Message Key 1
+    B->>B: Decrypt Message 1
+    
+    Note over B: Bob replies with Message 2 (Triggers DH Ratchet Step)
+    B->>B: Generate NEW ephemeral DH Keypair (PubKey B1)
+    B->>B: DH Ratchet: Mix PubKey A1 and PrivKey B1 into Root Chain
+    B->>B: Derive new Receiving and Sending Chain Keys
+    B->>B: Symmetric Ratchet: Derive Message Key 2
+    B->>B: Encrypt Message 2
+    B->>B: Attach Bob's NEW DH Public Key (PubKey B1)
+    B->>S: UDP Packet (Session ID + Msg 2 + PubKey B1)
+    S->>A: UDP Packet (Session ID + Msg 2 + PubKey B1)
+    
+    A->>A: Extracts Bob's NEW PubKey B1
+    A->>A: DH Ratchet: Mix PubKey B1 and PrivKey A1 into Root Chain
+    A->>A: Derive new Receiving and Sending Chain Keys
+    A->>A: Symmetric Ratchet: Derive Message Key 2
+    A->>A: Decrypt Message 2
+```
+
+### E. Step-by-Step Packet Walkthrough
 
 1.  **Alice (Client)** encrypts a message via Double Ratchet.
 2.  **Alice** slices it into 5 RaptorQ symbols.
