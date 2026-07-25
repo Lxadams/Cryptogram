@@ -10,7 +10,7 @@ The architecture is explicitly designed to survive hostile network conditions, i
 Please visit the `documentations/` folder for more details.
 
 ## Conventions
-* For client-side or server-side code, please place all implementations in the `src/` folder.
+* For client-side or server-side code, please place all implementations in the `code/` folder.
 * Please create tasks for yourself (including non-coding tasks) by going to [GitHub Issues](https://github.com/Lxadams/E2E-Messanger/issues). Issue titles should follow the format **`Firstname - short task description`**. After creating an issue, assign it one of the following labels: [`priority-low`,`priority-medium`,`priority-high`], as well as any other applicable labels from the **Labels** list.
 * Please create your own branch before making any changes to the repository. Branch names should follow the format **`firstname/branch-name`**.
 * Please pull the latest changes from the `main` branch regularly (`git pull origin main`). When your work is ready, open a pull request. Pushing directly to the `main` branch is strictly prohibited.
