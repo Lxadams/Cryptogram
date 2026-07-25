@@ -35,3 +35,6 @@ sweep_metadata():
 main():
     Launch a thread that calls send_outbound_messages() every N seconds.
 ```
+
+## Other implementation details
+- Listens on port 8080
