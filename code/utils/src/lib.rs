@@ -31,3 +31,4 @@ pub fn send_udp(
         String::from_utf8_lossy(data)
     );
     Ok(())
+}
