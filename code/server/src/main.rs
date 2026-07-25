@@ -177,8 +177,8 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
 // --------------------- Unit tests ---------------------
 #[cfg(test)]
 mod tests {
-    use utils::prepare_udp_payload;
     use super::*;
+    use utils::prepare_udp_payload;
 
     #[test]
     fn test_sync_then_forward_themselves() {
