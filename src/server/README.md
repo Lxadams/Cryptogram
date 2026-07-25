@@ -2,7 +2,7 @@
 - Metadata: (sender_session_id, incoming IP, incoming port, expiry_timestamp)
 - Outbound Queue: (receiver_session_id, payload, expiry_timestamp)
 
-Storage-engine agnostic: for now lets go with in-memory hashmaps, Redis, etc...
+Storage-engine agnostic: for now lets go with in-memory hashmaps; Redis can be considered for later if needed
 
 
 ## Protocol
