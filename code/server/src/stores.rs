@@ -52,12 +52,7 @@ impl Tables {
         }
     }
 
-    pub fn update_metadata(
-        &mut self,
-        session_id: SessionId,
-        addr: SocketAddr,
-        ttl: Duration,
-    ) {
+    pub fn update_metadata(&mut self, session_id: SessionId, addr: SocketAddr, ttl: Duration) {
         self.metadata.insert(
             session_id,
             MetadataEntry {
@@ -67,12 +62,7 @@ impl Tables {
         );
     }
 
-    pub fn enqueue_message(
-        &mut self,
-        receiver: SessionId,
-        payload: Vec<u8>,
-        ttl: Duration,
-    ) {
+    pub fn enqueue_message(&mut self, receiver: SessionId, payload: Vec<u8>, ttl: Duration) {
         self.outbound_queue.push_back(OutboundMessage {
             receiver_session_id: receiver,
             payload,
@@ -94,16 +84,11 @@ impl Tables {
         self.outbound_queue.front().cloned()
     }
 
-    pub fn get_metadata(
-        &self,
-        session_id: &SessionId,
-    ) -> Option<&MetadataEntry> {
+    pub fn get_metadata(&self, session_id: &SessionId) -> Option<&MetadataEntry> {
         self.metadata.get(session_id)
     }
 
-    pub fn metadata_iter(
-        &self,
-    ) -> impl Iterator<Item = (&SessionId, &MetadataEntry)> {
+    pub fn metadata_iter(&self) -> impl Iterator<Item = (&SessionId, &MetadataEntry)> {
         self.metadata.iter()
     }
 
