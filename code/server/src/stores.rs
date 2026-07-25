@@ -32,7 +32,6 @@ impl Tables {
         }
     }
 
-    /// Sync request
     pub fn update_metadata(
         &mut self,
         session_id: SessionId,
@@ -48,7 +47,6 @@ impl Tables {
         );
     }
 
-    /// Forward request
     pub fn enqueue_message(
         &mut self,
         receiver: SessionId,
