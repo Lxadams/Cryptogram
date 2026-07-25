@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::{
     collections::HashSet,
     net::SocketAddr,
@@ -38,7 +38,9 @@ async fn main() -> Result<()> {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
                 info!("Received {} bytes from {}", len, addr);
-                handle_request(&tables, addr, &buffer[..len])?;
+                if let Err(e) = handle_request(&tables, addr, &buffer[..len]) {
+                    error!("Request handling error from {}: {}", addr, e);
+                }
             }
             Err(e) => {
                 error!("Receive error: {}", e);
@@ -56,34 +58,43 @@ fn handle_request(
     // Next two bytes are the session ID (for simplicity, we assume it's a string)
     // The rest of the payload is the actual message or data.
 
-    if payload.len() < 3 {
-        return Err(anyhow!("Invalid packet length"));
+    const SESSION_ID_LEN: usize = 2;
+
+    if payload.len() < 1 + SESSION_ID_LEN {
+        return Err(anyhow!(
+            "Invalid packet length: expected at least {} bytes, got {}",
+            1 + SESSION_ID_LEN,
+            payload.len()
+        ));
     }
 
-    let session_id = String::from_utf8_lossy(&payload[1..3]).to_string();
-    let blob = &payload[3..];
+    let peer_session_id = String::from_utf8_lossy(&payload[1..1 + SESSION_ID_LEN]).to_string();
+    let blob = &payload[1 + SESSION_ID_LEN..];
     info!(
         "First byte flag: {}, Session ID: {}, Blob: {}",
         payload[0],
-        session_id,
+        peer_session_id,
         String::from_utf8_lossy(blob)
     );
 
     match payload.first() {
         Some(0) => {
-            info!("Handling sync request for session ID: {}", session_id);
-            handle_sync_request(tables, socket_address, &session_id)?;
-        }
+            info!("Handling sync request for session ID: {}", peer_session_id);
+            handle_sync_request(tables, socket_address, &peer_session_id)?;
+        },
         Some(1) => {
-            info!("Handling forward request for session ID: {}", session_id);
-            handle_forward_request(tables, &session_id, blob.to_vec())?;
-        }
+            info!("Handling forward request for session ID: {}", peer_session_id);
+            handle_forward_request(tables, &peer_session_id, blob.to_vec())?;
+        },
         _ => {
             error!("Unknown request type");
         }
     }
 
-    tables.lock().unwrap().print_state();
+    match tables.lock() {
+        Ok(tables) => tables.print_state(),
+        Err(e) => error!("Tables mutex poisoned while printing state: {e}"),
+    }
     Ok(())
 }
 
@@ -103,7 +114,9 @@ fn handle_sync_request(
     socket_address: SocketAddr,
     sender_session_id: &SessionId,
 ) -> Result<()> {
-    let mut tables = tables.lock().unwrap();
+    let mut tables = tables
+        .lock()
+        .map_err(|e| anyhow!("Tables mutex poisoned: {e}"))?;
     tables.update_metadata(sender_session_id.to_string(), socket_address, METADATA_TTL);
 
     Ok(())
@@ -286,10 +299,9 @@ mod tests {
             tables.enqueue_message(
                 SessionId::from("01"),
                 b"Hello".to_vec(),
-                Duration::from_micros(1),
+                Duration::from_millis(1),
             );
-            std::thread::sleep(Duration::from_micros(10));
-
+            std::thread::sleep(Duration::from_millis(5));
             tables.sweep_expired_messages();
             let outbound_messages = tables.outbound_messages();
             assert!(outbound_messages.is_empty());
