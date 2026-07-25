@@ -90,8 +90,8 @@ impl Tables {
         self.outbound_queue.retain(|msg| msg.expiry > now);
     }
 
-    pub fn dequeue_message(&mut self) -> Option<OutboundMessage> {
-        self.outbound_queue.pop_front()
+    pub fn peak_message(&mut self) -> Option<OutboundMessage> {
+        self.outbound_queue.front().cloned()
     }
 
     pub fn get_metadata(
@@ -105,5 +105,9 @@ impl Tables {
         &self,
     ) -> impl Iterator<Item = (&SessionId, &MetadataEntry)> {
         self.metadata.iter()
+    }
+
+    pub fn outbound_messages(&self) -> Vec<OutboundMessage> {
+        self.outbound_queue.iter().cloned().collect()
     }
 }
