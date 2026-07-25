@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tokio::net::UdpSocket;
 use tracing::{error, info};
 use std::{
@@ -37,15 +37,8 @@ async fn main() -> Result<()> {
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
-                info!("Received {} bytes from {}", len, addr);
-
-                // Print payload as string
-                info!("Payload: {}", String::from_utf8_lossy(&buffer[..len]));
-                
-                // TODO: differentiate between sync and forward requests based on the payload content
-                // let session_id = String::from_utf8_lossy(&buffer[..len]).to_string();
-                // handle_sync_request(&tables, addr, &session_id)?;
-                // handle_forward_request(&tables, &session_id, buffer[..len].to_vec())?;
+                info!("Received {} bytes from {}", len, addr);                
+                handle_request(&tables, addr, &buffer[..len])?;
             }
             Err(e) => {
                 error!("Receive error: {}", e);
@@ -54,13 +47,47 @@ async fn main() -> Result<()> {
     }
 }
 
+fn handle_request(
+    tables: &Arc<Mutex<Tables>>,
+    socket_address: SocketAddr,
+    payload: &[u8],
+) -> Result<()> {
+    // For demonstration, let's assume the first byte indicates the type of request (0 for sync, 1 for forward)
+    // Next two bytes are the session ID (for simplicity, we assume it's a string)
+    // The rest of the payload is the actual message or data.
+
+    if payload.len() < 3 {
+        return Err(anyhow!("Invalid packet length"));
+    }
+    
+    let session_id = String::from_utf8_lossy(&payload[1..3]).to_string();
+    let blob = &payload[3..];
+    info!("First byte flag: {}, Session ID: {}, Blob: {}", payload[0], session_id, String::from_utf8_lossy(blob));
+
+    match payload.first() {
+        Some(0) => {
+            info!("Handling sync request for session ID: {}", session_id);
+            handle_sync_request(tables, socket_address, &session_id)?;
+        }
+        Some(1) => {
+            info!("Handling forward request for session ID: {}", session_id);
+            handle_forward_request(tables, &session_id, blob.to_vec())?;
+        }
+        _ => {
+            error!("Unknown request type");
+        }
+    }
+
+    tables.lock().unwrap().print_state();
+    Ok(())
+}
+
 fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>) {
     tokio::spawn(async move {
         loop {
             if let Err(e) = send_outbound_messages(&tables, &socket).await {
                 error!("Error sending outbound messages: {}", e);
             }
-            info!("Sent outbound messages and dummy packets");
             tokio::time::sleep(OUTBOUND_TASK_INTERVAL).await;
         }
     });
@@ -90,7 +117,7 @@ fn handle_forward_request(
 
 async fn send_udp_message(socket: &UdpSocket, addr: &str, message: &[u8]) -> Result<()> {
     let bytes_sent = socket.send_to(message, addr).await?;
-    info!("Sent {} bytes to {}", bytes_sent, addr);
+    info!("Sent message: {}, with {} bytes to {}", String::from_utf8_lossy(message), bytes_sent, addr);
     Ok(())
 }
 

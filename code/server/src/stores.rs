@@ -32,6 +32,26 @@ impl Tables {
         }
     }
 
+    pub fn print_state(&self) {
+        println!("Current state of Tables:");
+        println!("Metadata entries:");
+        for (session_id, entry) in &self.metadata {
+            println!(
+                "Session ID: {}, Incoming Addr: {}, Expiry: {:?}",
+                session_id, entry.incoming_addr, entry.expiry
+            );
+        }
+        println!("Outbound messages:");
+        for message in &self.outbound_queue {
+            println!(
+                "Receiver Session ID: {}, Payload: {}, Expiry: {:?}",
+                message.receiver_session_id,
+                String::from_utf8_lossy(&message.payload),
+                message.expiry
+            );
+        }
+    }
+
     pub fn update_metadata(
         &mut self,
         session_id: SessionId,
