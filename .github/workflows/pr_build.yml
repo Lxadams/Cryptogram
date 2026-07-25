@@ -1,0 +1,51 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+# Cancel in-progress runs for the same PR/branch when a new commit is pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-projects:
+    name: Build & Test (${{ matrix.project-path }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Add all your subfolder paths containing a Cargo.toml here
+        project-path:
+          - "code/server"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Enable Swatinem Rust Cargo Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check code formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy (Linter)
+        run: cargo clippy -- -D warnings
+
+      - name: Build project
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
