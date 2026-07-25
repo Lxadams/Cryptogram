@@ -11,7 +11,6 @@ mod stores;
 
 use crate::stores::SessionId;
 use stores::Tables;
-use utils::prepare_udp_payload;
 
 const DUMMY_PACKET: &[u8] = b"dummy";
 const METADATA_TTL: Duration = Duration::from_secs(1000);
@@ -165,11 +164,11 @@ fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> (Vec<(String, Vec<u
 async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket) -> Result<()> {
     let (messages, dummy_targets) = prepare_outbound_messages(tables);
     for (addr, payload) in &messages {
-        send_udp_message(socket, &addr, &payload).await?;
+        send_udp_message(socket, addr, payload).await?;
     }
 
     for addr in &dummy_targets {
-        send_udp_message(socket, &addr, DUMMY_PACKET).await?;
+        send_udp_message(socket, addr, DUMMY_PACKET).await?;
     }
 
     Ok(())
@@ -178,6 +177,7 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
 // --------------------- Unit tests ---------------------
 #[cfg(test)]
 mod tests {
+    use utils::prepare_udp_payload;
     use super::*;
 
     #[test]

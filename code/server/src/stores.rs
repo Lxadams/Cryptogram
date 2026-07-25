@@ -80,10 +80,6 @@ impl Tables {
         self.outbound_queue.retain(|msg| msg.expiry > now);
     }
 
-    pub fn peak_message(&mut self) -> Option<OutboundMessage> {
-        self.outbound_queue.front().cloned()
-    }
-
     pub fn get_metadata(&self, session_id: &SessionId) -> Option<&MetadataEntry> {
         self.metadata.get(session_id)
     }
