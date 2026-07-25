@@ -81,11 +81,14 @@ fn handle_request(
         Some(0) => {
             info!("Handling sync request for session ID: {}", peer_session_id);
             handle_sync_request(tables, socket_address, &peer_session_id)?;
-        },
+        }
         Some(1) => {
-            info!("Handling forward request for session ID: {}", peer_session_id);
+            info!(
+                "Handling forward request for session ID: {}",
+                peer_session_id
+            );
             handle_forward_request(tables, &peer_session_id, blob.to_vec())?;
-        },
+        }
         _ => {
             error!("Unknown request type");
         }
