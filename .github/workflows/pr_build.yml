@@ -25,6 +25,10 @@ jobs:
         # Add all your subfolder paths containing a Cargo.toml here
         project-path:
           - "code/server"
+    
+    defaults:
+      run:
+        working-directory: ${{ matrix.project-path }}
 
     steps:
       - name: Checkout repository
