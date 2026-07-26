@@ -1,0 +1,49 @@
+# .github/workflows/deploy.yml
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - production
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t server:latest -f code/server/Dockerfile code
+
+      - name: Save image to tar
+        run: docker save server:latest -o server.tar
+
+      - name: Copy image to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          source: "server.tar"
+          target: "/home/ubuntu/"
+
+      - name: Load and run container on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          script: |
+            docker load -i /home/ubuntu/server.tar
+            docker stop server || true
+            docker rm server || true
+            docker run -d \
+              --name server \
+              --restart unless-stopped \
+              -p 8080:8080/udp \
+              server:latest
+            rm /home/ubuntu/server.tar
