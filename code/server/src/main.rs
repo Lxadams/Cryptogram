@@ -24,8 +24,8 @@ async fn main() -> Result<()> {
 
     let mut buffer = [0u8; 1024]; // initialize every byte to zero for 1024 elements
 
-    // Bind to UDP port 8080 on all interfaces
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:8080").await?);
+    // Bind to UDP port 443 on all interfaces
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:443").await?);
     info!("UDP server listening on {}", socket.local_addr()?);
 
     let tables = Arc::new(Mutex::new(Tables::new()));
