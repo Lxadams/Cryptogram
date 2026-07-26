@@ -16,6 +16,7 @@ const DUMMY_PACKET: &[u8] = b"dummy";
 const METADATA_TTL: Duration = Duration::from_secs(1000);
 const MESSAGE_TTL: Duration = Duration::from_secs(1000);
 const OUTBOUND_TASK_INTERVAL: Duration = Duration::from_secs(1);
+const SWEEPING_TASK_INTERVAL: Duration = Duration::from_secs(120);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,6 +33,9 @@ async fn main() -> Result<()> {
 
     // Spawn a background task to handle outbound messages
     spawn_outbound_task(Arc::clone(&tables), Arc::clone(&socket));
+
+    // Spawn another background task to handle sweeping
+    spawn_sweeping_task(Arc::clone(&tables));
 
     // Main loop to receive incoming UDP packets
     loop {
@@ -112,6 +116,19 @@ fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>) {
     });
 }
 
+fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
+    tokio::spawn(async move {
+        loop {
+            {
+                let mut tables = tables.lock().unwrap();
+                tables.sweep_metadata();
+                tables.sweep_expired_messages();
+            }
+            tokio::time::sleep(SWEEPING_TASK_INTERVAL).await;
+        }
+    });
+}
+
 fn handle_sync_request(
     tables: &Arc<Mutex<Tables>>,
     socket_address: SocketAddr,
@@ -149,11 +166,7 @@ async fn send_udp_message(socket: &UdpSocket, addr: &str, message: &[u8]) -> Res
 
 fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
     let (messages, dummy_targets) = {
-        let mut tables = tables.lock().unwrap();
-
-        tables.sweep_metadata();
-        tables.sweep_expired_messages();
-
+        let tables = tables.lock().unwrap();
         let mut sent_sessions = HashSet::new();
         let mut messages = Vec::new();
 
