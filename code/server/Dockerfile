@@ -8,5 +8,5 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 COPY --from=builder /app/server/target/release/server /usr/local/bin/server
-EXPOSE 8080/udp
+EXPOSE 443/udp
 CMD ["server"]
