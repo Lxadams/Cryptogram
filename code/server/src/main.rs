@@ -15,7 +15,7 @@ use stores::Tables;
 const DUMMY_PACKET: &[u8] = b"dummy";
 const METADATA_TTL: Duration = Duration::from_secs(1000);
 const MESSAGE_TTL: Duration = Duration::from_secs(1000);
-const OUTBOUND_TASK_INTERVAL: Duration = Duration::from_secs(10);
+const OUTBOUND_TASK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[tokio::main]
 async fn main() -> Result<()> {
