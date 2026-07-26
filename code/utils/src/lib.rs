@@ -23,7 +23,7 @@ pub fn send_udp(
 
     let payload = prepare_udp_payload(request_type, session_id, data);
 
-    socket.send_to(&payload, "127.0.0.1:8080")?;
+    socket.send_to(&payload, "127.0.0.1:443")?;
     println!(
         "Sent UDP packet with request_type: {}, session_id: {}, data: {}",
         request_type,
