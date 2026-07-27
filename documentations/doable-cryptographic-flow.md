@@ -1,249 +1,200 @@
 # Doable Cryptographic Flow: MVP Architecture
 
-This document describes the simplified, realistic cryptographic architecture of the E2E Messenger MVP, as defined in the `doable-roadmap.md`. It explains the step-by-step flow from local key generation to metronomic transmission, highlighting the specific compromises and weaknesses inherent in a 12-week university scope.
+This document describes the cryptographic architecture of the E2E Messenger MVP as currently implemented in code. It covers the step-by-step flow from local key generation to active messaging, security patches applied during development, and the full unit test report.
 
 ---
 
 ## 1. Architectural Role Summary
 
-*   **Clients (Alice & Bob)**: Generate all keys locally in memory (no Samsung Knox hardware APIs). Trust is established strictly in person via QR codes (no cloud prekey servers). The clients handle all asymmetric/symmetric cryptography, RaptorQ Forward Error Correction (FEC), and the Constant-Rate Tunnel (CRT) UDP metronome.
-*   **AWS Relay**: A "dumb" RAM-only router. It has zero knowledge of User IDs or E2E keys. The relay uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID to identify the link key, decrypts the outer shell, reads the routing token, and routes or queues the raw UDP packet.
+*   **Clients (Alice & Bob)**: Generate all keys locally in memory. Trust is established strictly in person via Micro-QR codes (48 bytes). The clients handle all asymmetric/symmetric cryptography and the Deferred Key Exchange protocol.
+*   **Server Relay**: A blind RAM-only router. It has zero knowledge of User IDs or E2E keys. It uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID to identify the link key, decrypts the outer shell, reads the 16-byte Routing Token, re-encrypts the inner payload with the recipient's link key, and forwards it.
 
 ---
 
-## 2. Phase 1: Local Setup & In-Person Trust (QR Exchange)
+## 2. Phase 1: Local Setup & In-Person Trust (Micro-QR)
 
-Unlike production apps that use complex cloud key directories, this MVP establishes absolute trust out-of-band.
+Because ML-KEM-768 public keys are 1184 bytes (far too large for a reliable QR code), this MVP uses a **Deferred Key Exchange**: the camera scan only transfers a minimal identity payload, and the bulk cryptographic keys are exchanged in-band over the network.
 
-1.  **Local Key Generation**: The Rust core on Alice's device generates three long-term keypairs:
-    *   **Ed25519**: For identity signing.
-    *   **X25519**: For classical Diffie-Hellman key exchange.
-    *   **ML-KEM-768 (Kyber)**: For post-quantum key encapsulation.
-2.  **QR Code Display**: Alice's Kotlin UI displays a QR code containing her three public keys.
-3.  **Scanning & Trust**: Bob scans Alice's QR code (and Alice scans Bob's). 
-4.  **Routing Token Derivation**: Both devices hash the combined public keys (e.g., `SHA256(AlicePub || BobPub)`) to generate a unique 16-byte shared **Routing Token**. This token will be used to tell the AWS Relay where to route the packets.
-
----
-
-## 3. Phase 2: Session Initialization (Hybrid PQ Bootstrapping)
-
-The very first message Alice sends to Bob must bootstrap the secure session.
-
-1.  **Post-Quantum Encapsulation**: Alice uses the `pqcrypto-kyber` crate to encapsulate a random secret against Bob's public ML-KEM key (which she got from the QR code). This produces a shared secret ($SS_{pq}$) and an encapsulation ciphertext ($CT_{pq}$).
-2.  **Classical DH**: Alice computes the standard X25519 Diffie-Hellman shared secret ($SS_{dh}$) using her private X25519 key and Bob's public X25519 key.
-3.  **Hybrid Key Derivation (HKDF)**: Alice merges the classical and post-quantum secrets to create the unbreakable Master Key:
-    `Master Key = HKDF-SHA256( SS_{dh} || SS_{pq} )`
-4.  **Ratchet Initialization**: Alice uses this Master Key to initialize the root chain of her standard **X25519 Double Ratchet** state machine.
+1.  **Local Key Generation** (`UserIdentity::generate()`): The Rust core generates three long-term keypairs:
+    *   **Ed25519** (`ed25519-dalek`): For identity signing and payload authentication.
+    *   **X25519** (`x25519-dalek`): For classical Diffie-Hellman key exchange.
+    *   **ML-KEM-768** (`pqcrypto-kyber`): For post-quantum key encapsulation.
+    *   A random 16-byte **Routing Token** is also generated to identify this client on the relay.
+2.  **Micro-QR Code Display**: The UI displays a QR code containing only the 16-byte `RoutingToken` + 32-byte `Ed25519 VerifyingKey`. Total: **48 bytes**.
+3.  **Scanning & Trust**: Alice scans Bob's QR code. She now has a cryptographically authenticated binding between Bob's Routing Token and his Ed25519 identity.
 
 ---
 
-## 4. Phase 3: Active Messaging (E2E & RaptorQ)
+## 3. Phase 2: Server Link Handshake
 
-Once the session is bootstrapped, ongoing messaging relies purely on the classical Double Ratchet to save bandwidth.
+Before any E2E communication can occur, each client must establish a link-layer encrypted tunnel with the server.
 
-1.  **Message Encryption**: Alice types a message. The Double Ratchet advances and spits out a unique Message Key. The payload is encrypted using standard **ChaCha20-Poly1305**.
-2.  **RaptorQ FEC Slicing**: To survive 95% packet loss without ACKs, the encrypted ciphertext is fed into the Rust `raptorq` crate. It is padded to a fixed size and sliced into redundant mathematical repair symbols.
+1.  **Client Boot**: The client generates an ephemeral X25519 keypair and sends a Handshake packet `[TYPE_HANDSHAKE | SessionID | EphemeralPubKey]` to the server.
+2.  **Server Processing**: The server performs `DH(ServerStaticPriv, ClientEphPub)` and derives a Link Master Key via `HKDF-SHA256` with info string `"wireguard-lite-link"`. It stores the `SessionID → LinkKey` mapping in RAM.
+3.  **Client Completion**: The client performs the same DH with the server's hardcoded static public key and derives the identical Link Master Key.
+4.  **Sync Packet**: The client sends its Routing Token (link-encrypted) so the server can map `RoutingToken → (SocketAddr, SessionID)` for routing.
 
----
-
-## 5. Phase 4: Network Transport & Obfuscation
-
-To evade traffic analysis and DPI, the symbols must be obfuscated.
-
-1.  **Link Encryption**: To hide the RaptorQ headers and the Routing Token from the ISP, Alice wraps the entire packet in an outer layer of **XChaCha20-Poly1305**.
-    *   *Server Key-Pinning*: She encrypts this outer shell using an ephemeral Link Master Key established via an X25519 handshake with the server's hardcoded public key when the app boots. She prepends an unencrypted 4-byte Session ID to the outside of the packet so the server knows which key to use.
-2.  **The Metronome**: A Rust `tokio` thread running in an Android Foreground Service transmits exactly one UDP packet every 100ms. 
-    *   If there are RaptorQ symbols in the queue, it sends one.
-    *   If the user isn't typing, it generates and sends a random Dummy Packet of the exact same size to ensure the traffic rate never fluctuates.
+All subsequent packets are wrapped in `XChaCha20-Poly1305` link encryption using this key.
 
 ---
 
-## 6. Detailed Cryptographic Diagrams & Walkthrough
+## 4. Phase 3: Session Initialization (Deferred Key Exchange)
 
-### A. Full Cryptographic Key Exchange Flow
+The 3-way handshake exchanges the massive Post-Quantum keys in-band, authenticated by Ed25519 signatures.
 
-This diagram illustrates how all the disparate cryptographic primitives (Ed25519, X25519, ML-KEM) interact to establish the end-to-end trust, the stateless server link, and the session master key.
+1.  **KeyExchange Request (0x02)**: Alice sends a `KeyExchangePayload` (1352 bytes) to Bob's Routing Token containing: `[AliceRoutingToken | BobRoutingToken | Timestamp | Ed25519Pub | X25519Pub | KyberPub | Ed25519Signature]`. The signature covers all preceding fields, binding the payload to the intended recipient and preventing replay.
+2.  **KeyExchange Response (0x02)**: Bob receives Alice's request, verifies the Ed25519 signature, checks the `target_token` matches his own identity, and checks the timestamp is within ±300 seconds. He stores Alice's Ed25519 key in `pending_contacts`, then sends his own `KeyExchangePayload` back to Alice.
+3.  **Verification**: Alice receives Bob's response and **verifies his Ed25519 signature against the key she got from the physical QR scan**. This is the critical trust anchor — it mathematically proves the massive Kyber/X25519 keys were sent by the real Bob.
+4.  **SessionEstablish (0x04)**: Alice performs the Hybrid PQXDH handshake:
+    *   Generates an ephemeral X25519 keypair and computes `DH(AliceEphPriv, BobX25519Pub)`.
+    *   Encapsulates a secret against Bob's Kyber public key: `encapsulate(BobKyberPub) → (PQ_SharedSecret, KyberCiphertext)`.
+    *   Derives the Master Key: `HKDF-SHA256(DH_Secret || PQ_Secret, info="pqxdh-root-key")`.
+    *   Sends a `SessionEstablishPayload` (1224 bytes) containing: `[AliceToken | BobToken | Timestamp | KyberCT | EphX25519Pub | Ed25519Signature]`.
+5.  **Bob Accepts**: Bob verifies the signature against Alice's stored Ed25519 key, decapsulates the Kyber ciphertext, performs the same hybrid derivation, and arrives at the identical Master Key. The E2E tunnel is now established.
 
-```mermaid
-sequenceDiagram
-    participant A as Alice
-    participant S as AWS Relay
-    participant B as Bob
+---
 
-    Note over A, B: 1. Out-of-Band Trust and Identity
-    A->>A: Generate Identity Key (Ed25519)
-    B->>B: Generate Identity Key (Ed25519)
-    A->>B: Scan QR: Exchange Ed25519, X25519, Kyber PubKeys
-    Note over A, B: Derive Unidirectional Routing Tokens: Token A and Token B
+## 5. Phase 4: Active Messaging
 
-    Note over A, S: 2. Server Link Handshake (App Boot)
-    A->>A: Generate Ephemeral Link Keypair (X25519)
-    A->>S: Handshake Packet (Alice Eph PubKey)
-    S->>S: DH(Server Static Priv, Alice Eph Pub) = Link Master Key
-    S->>A: Server Response (4-byte Session ID)
-    Note over A, S: Link Layer Secured via XChaCha20-Poly1305
+Once the session is bootstrapped, ongoing messaging uses a **Symmetric Hash Ratchet** (HMAC-SHA256) — not the Signal Double Ratchet. This was a deliberate simplification.
 
-    Note over A, B: 3. Hybrid PQ E2E Session Bootstrapping
-    A->>A: Generate ML-KEM-768 Kyber Secret against Bob
-    A->>A: DH(Alice X25519 Priv, Bob X25519 Pub)
-    A->>A: HKDF(Kyber Secret and DH Secret) = E2E Master Key
-    A->>A: Initialize Double Ratchet with Master Key
+1.  **Symmetric Ratchet**: Each message derives a unique Message Key and advances the Chain Key:
+    *   `MessageKey = HMAC-SHA256(ChainKey, "message-key")`
+    *   `NextChainKey = HMAC-SHA256(ChainKey, "chain-key")`
+    *   The old Chain Key is permanently destroyed (Forward Secrecy).
+2.  **Message Encryption**: The plaintext is encrypted with `XChaCha20-Poly1305` using the Message Key. A fresh 24-byte random nonce is generated per message.
+3.  **Periodic KEM Injection (PQ Ratchet)**: To provide continuous Post-Quantum secrecy without full session resets, a new Kyber encapsulation is performed against the peer's stored Kyber public key every 5 messages. The new PQ shared secret is mixed into the Chain Key via HKDF. The Kyber ciphertext is sent as a `0x05 PQInjectPayload` (1192 bytes).
+4.  **Packet Structure**: `[0x01 | 24-byte Nonce | E2E Ciphertext]`, wrapped in link encryption.
+5.  **Decryption**: The receiver trial-decrypts against all active sessions using the *next expected* message key. On success, the ratchet advances.
 
-    Note over A, B: 4. Message Encapsulation and Transport
-    A->>A: Encrypt Msg with Double Ratchet Message Key
-    A->>A: Slice Msg via RaptorQ into Symbols
-    A->>S: UDP Packet (Session ID + Link Encrypted Payload)
-    S->>S: Decrypt Link Layer via Session ID Link Master Key
-    S->>S: Read Routing Token, Route to Bob
-    S->>B: UDP Packet (Bob's Session ID + Link Encrypted Payload)
-```
+---
 
-### B. Nested Packet Encapsulation Structure
-
-This block diagram demonstrates exactly what a single UDP datagram looks like on the wire, showing how the routing IDs, Session IDs, and E2E layers are nested to prevent metadata leakage.
-
-```mermaid
-graph TD
-    UDP[Raw UDP Datagram on Port 443]
-    
-    UDP --> Header[Unencrypted Header]
-    Header --> SID(4-byte Link Session ID: Identifies Server Link Key)
-    
-    UDP --> Link[XChaCha20-Poly1305 Link Encrypted Envelope]
-    Link --> Token(16-byte Unidirectional Routing Token)
-    Link --> FEC(RaptorQ FEC Symbol Data)
-    
-    FEC --> E2E[ChaCha20-Poly1305 Double Ratchet Encryption]
-    E2E --> Key(Unique Per-Message Key)
-    E2E --> Plaintext(Actual Chat Text)
-    
-    style UDP fill:#f9f9f9,stroke:#666,stroke-width:2px
-    style Link fill:#d9edf7,stroke:#31708f,stroke-width:2px
-    style E2E fill:#dff0d8,stroke:#3c763d,stroke-width:2px
-```
-
-### C. Double Ratchet State Machine (MVP Implementation)
-
-This diagram visualizes the internal Double Ratchet engine used for ongoing end-to-end encryption. It specifically highlights the custom UDP hardening mechanisms required for this project—namely, the strict skipped-key bounds to prevent memory leaks under 95% packet loss, and the "Blunt Force" Session Reset used for Post-Quantum healing.
-
-```mermaid
-graph TD
-    Master(Session Master Key from Kyber and X25519) --> RootChain
-    
-    subgraph Root Chain: X25519 DH Ratchet
-        RootChain[Root KDF State] -->|New DH Shared Secret| NewRoot[Next Root Key]
-        RootChain -->|New DH Shared Secret| ChainKey[Sending or Receiving Chain Key]
-    end
-    
-    subgraph Symmetric Message Ratchet
-        ChainKey -->|One-Way KDF| MsgKey1(Message Key N)
-        ChainKey -->|One-Way KDF| NextChain[Next Chain Key]
-        
-        NextChain -->|One-Way KDF| MsgKey2(Message Key N+1)
-        NextChain -->|One-Way KDF| NextChain2(Next Chain Key...)
-    end
-    
-    MsgKey1 --> Crypt(ChaCha20-Poly1305 Encrypt/Decrypt)
-    Crypt --> Destroy(Permanently Destroy Key - PFS)
-    
-    MsgKey2 --> Missed{Packet Dropped?}
-    Missed -->|Yes| Dict(Store in Skipped Dictionary)
-    
-    subgraph Loss Mitigation: UDP Hardening
-        Dict -.-> Rule1(MAX_SKIP Limit: Max 500 skipped keys)
-        Dict -.-> Rule2(TTL Pruning: Auto-delete key after 5 Minutes)
-    end
-    
-    subgraph Post-Quantum Session Healing
-        Count[Message Count Reaches 100] --> Wipe(Wipe Entire Ratchet RAM State)
-        Wipe --> Restart(Trigger New Kyber Handshake for New Root)
-    end
-    
-    style Master fill:#f9f9f9,stroke:#666,stroke-width:2px
-    style RootChain fill:#d9edf7,stroke:#31708f,stroke-width:2px
-    style ChainKey fill:#dff0d8,stroke:#3c763d,stroke-width:2px
-    style Dict fill:#f2dede,stroke:#a94442,stroke-width:2px
-```
-
-### D. Double Ratchet Network Flow (Alice ↔ Server ↔ Bob)
-
-This sequence diagram illustrates the "ping-pong" nature of the Double Ratchet across the network. It shows how the Symmetric Ratchet handles consecutive messages, how the DH Ratchet creates new key chains when the conversation direction changes, and how the Server acts purely as a blind router completely unaware of the E2E key rotations.
+## 6. Network Sequence Diagram
 
 ```mermaid
 sequenceDiagram
     participant A as Alice's App
-    participant S as Blind Relay Server
+    participant S as Blind Server Relay
     participant B as Bob's App
 
-    Note over A, B: Session Bootstrapped: Both share the initial Root Key
+    Note over A, B: 0. Out-of-band Micro-QR Scan (RoutingToken + Ed25519 Pub)
     
-    Note over A: Alice sends Message 1
-    A->>A: Symmetric Ratchet: Derive Message Key 1
-    A->>A: ChaCha20 Encrypt Message 1
-    A->>A: Attach Alice's current DH Public Key (PubKey A1)
-    A->>S: UDP Packet (Session ID + Msg 1 + PubKey A1)
-    Note over S: Server decrypts Link Layer, reads Routing Token, forwards blindly.
-    S->>B: UDP Packet (Session ID + Msg 1 + PubKey A1)
+    Note over A, S: 1. Server Link Handshake (both clients)
+    A->>S: [TYPE_HANDSHAKE | SessionID | EphPubKey]
+    S->>S: DH → HKDF → Link Master Key
+    A->>S: [TYPE_DATA | SessionID | Nonce | Encrypted(RoutingToken)]
+    S->>S: Map RoutingToken → (Addr, SessionID)
+
+    Note over A, B: 2. Deferred Key Exchange
+    A->>A: Sign KeyExchangePayload (1352 bytes)
+    A->>S: Link-Encrypted 0x02 → Bob's Token
+    S->>B: Re-encrypt with Bob's Link Key → Forward
     
-    B->>B: Extracts PubKey A1 (Matches current state)
-    B->>B: Symmetric Ratchet: Derive Message Key 1
-    B->>B: Decrypt Message 1
+    B->>B: Verify Signature, Timestamp, TargetToken
+    B->>B: Store Alice Ed25519, TOFU Accept
+    B->>B: Sign KeyExchangePayload (1352 bytes)
+    B->>S: Link-Encrypted 0x02 → Alice's Token
+    S->>A: Re-encrypt with Alice's Link Key → Forward
+
+    Note over A: Verify Bob's Ed25519 against QR scan!
     
-    Note over B: Bob replies with Message 2 (Triggers DH Ratchet Step)
-    B->>B: Generate NEW ephemeral DH Keypair (PubKey B1)
-    B->>B: DH Ratchet: Mix PubKey A1 and PrivKey B1 into Root Chain
-    B->>B: Derive new Receiving and Sending Chain Keys
-    B->>B: Symmetric Ratchet: Derive Message Key 2
-    B->>B: Encrypt Message 2
-    B->>B: Attach Bob's NEW DH Public Key (PubKey B1)
-    B->>S: UDP Packet (Session ID + Msg 2 + PubKey B1)
-    S->>A: UDP Packet (Session ID + Msg 2 + PubKey B1)
+    A->>A: Hybrid PQXDH (X25519 DH + Kyber KEM)
+    A->>A: HKDF → Master Key → Init Hash Ratchet
+    A->>A: Sign SessionEstablishPayload (1224 bytes)
+    A->>S: Link-Encrypted 0x04 → Bob's Token
+    S->>B: Re-encrypt → Forward
     
-    A->>A: Extracts Bob's NEW PubKey B1
-    A->>A: DH Ratchet: Mix PubKey B1 and PrivKey A1 into Root Chain
-    A->>A: Derive new Receiving and Sending Chain Keys
-    A->>A: Symmetric Ratchet: Derive Message Key 2
-    A->>A: Decrypt Message 2
+    B->>B: Verify Signature against stored Ed25519
+    B->>B: Decapsulate Kyber + DH → Same Master Key
+    Note over A, B: E2E Tunnel Established (Symmetric Hash Ratchet)
 ```
-
-### E. Step-by-Step Packet Walkthrough
-
-1.  **Alice (Client)** encrypts a message via Double Ratchet.
-2.  **Alice** slices it into 5 RaptorQ symbols.
-3.  **Alice's Metronome** wakes up (Tick 1):
-    *   Takes Symbol 1, prepends the 16-byte Routing Token.
-    *   Encrypts the block with the Link Master Key (XChaCha20).
-    *   Prepends the unencrypted 4-byte Link Session ID to the outside.
-    *   Fires it over raw UDP to AWS Relay port 443.
-4.  **AWS Relay** receives the UDP packet.
-    *   Reads the 4-byte Session ID and looks up Alice's Link Master Key in RAM.
-    *   Decrypts the outer layer using the Link Master Key.
-    *   Reads the 16-byte Routing Token.
-    *   Looks up the token in its RAM `HashMap`.
-    *   Routes the inner payload to Bob's IP (or queues it if Bob hasn't pinged in 5 seconds).
-5.  **Bob (Client)** receives the packet.
-    *   Passes it to the RaptorQ decoder.
-    *   Once enough symbols arrive (e.g., 3 out of 5), RaptorQ reconstructs the E2E ciphertext.
-    *   Bob's Double Ratchet derives the matching key and decrypts the message to the UI.
 
 ---
 
-## 7. Known Weaknesses & Architectural Compromises (The "MVP Issues")
+## 7. Nested Packet Structure
 
-Because this is a 12-week university scope, several production-grade security features were cut. These must be acknowledged as limitations:
+```
+Raw UDP Datagram
+├── [1 byte]  Packet Type (0=Handshake, 1=Data)
+├── [4 bytes] Link Session ID (unencrypted, identifies link key)
+├── [24 bytes] XChaCha20 Nonce
+└── XChaCha20-Poly1305 Link-Encrypted Envelope
+    ├── [16 bytes] Routing Token (read by server for forwarding)
+    └── Inner E2E Payload
+        ├── [1 byte] Inner Type (0x01=Msg, 0x02=KeyExchange, 0x04=SessionEstablish, 0x05=PQInject)
+        └── Type-specific payload (E2E encrypted or signed)
+```
 
-### A. The X25519 Link Handshake (Replaces PSK)
-*   **The Upgrade**: Originally, a universal Pre-Shared Key (PSK) was planned for link encryption, which was a massive security vulnerability. This has been replaced by a "WireGuard-Lite" handshake. The AWS Relay's static X25519 public key is hardcoded into the app. When the app boots, it generates an ephemeral keypair and performs a DH exchange with the server's public key to establish a unique Link Master Key, receiving a 4-byte Session ID in return. 
-*   **The Result**: If someone extracts the hardcoded server public key from the APK, it is useless to them. They cannot decrypt other users' link traffic because they lack the server's private key. The 4-byte Session ID securely identifies incoming packets despite mobile IP roaming.
+---
 
-### B. Double Ratchet Memory Bounds (Resolved)
-*   **The Issue**: The standard Double Ratchet handles dropped messages by saving derived keys for "skipped" messages in a dictionary indefinitely. Under 95% UDP loss, the number of permanently lost messages is massive, which would cause an Out-Of-Memory (OOM) crash.
-*   **The MVP Fix**: The MVP hardens the ratchet by implementing a strict `MAX_SKIP = 500` limit and a 5-minute Time-To-Live (TTL) on all skipped keys. Because UDP is connectionless and the app uses a strict 100ms metronome, if a RaptorQ symbol hasn't arrived within 5 minutes, it is physically impossible for it to arrive later (it was dropped by a router long ago). Thus, pruning it after 5 minutes is mathematically safe and permanently fixes the memory leak.
+## 8. Security & Vulnerabilities Report
 
-### C. Asynchronous PQ Session Healing (Resolved via Session Reset)
-*   **The Issue**: The MVP only uses Post-Quantum protection on the *initial* session handshake. If a quantum computer breaks the classical X25519 Double Ratchet, long-lived sessions could eventually become vulnerable.
-*   **The MVP Fix**: Modifying the internal ratchet for mid-stream Kyber mix-ins is too complex for a 12-week PoC. Instead, the MVP uses a "Blunt Force" Cryptographic Session Reset. Triggered either manually via a UI button or automatically every 100 messages, Alice encapsulates a new Kyber secret against Bob's long-term public key and sends a control packet. Both clients then completely wipe their current Double Ratchet state in RAM and reboot a brand new session, achieving PQ Forward Secrecy without complex internal ratchet surgery.
+### Vulnerabilities Discovered & Patched
 
-### D. The Multicast Bind Spoofing (Stretch Goal)
-*   **The Issue**: If Ephemeral Multicast is implemented, the server routes messages based on unauthenticated `MULTICAST_BIND` control packets.
-*   **The Vulnerability**: An attacker who guesses a group's Routing Token can inject a fake bind command to wiretap the metadata stream of the group chat. Without complex Zero-Knowledge Proofs (which are out of scope), the blind server has no way to verify if a user actually belongs to the group.
+| # | Vulnerability | Attack Vector | Fix Applied |
+|---|---|---|---|
+| 1 | **Replay Attack** | Compromised server records Alice's `KeyExchange` and replays it to Bob days later | Added 8-byte monotonic Unix timestamp to `KeyExchange` and `SessionEstablish`. Packets outside ±300s are dropped. |
+| 2 | **Identity Misbinding** | Mallory forwards Alice's signed `KeyExchange` to Bob (Alice intended it for Charlie) | Added `target_token` to all signed payloads. Signature binds sender's keys to recipient's Routing Token. |
+| 3 | **Unauthenticated KEM Hijacking** | Mallory encapsulates a Kyber secret against Bob's key and sends a fake `SessionEstablish` claiming to be Alice | `SessionEstablish` is now signed by sender's Ed25519 key. Bob verifies against Alice's stored key before accepting. |
+| 4 | **Server Forwarding Plaintext** | Server stored raw inner payloads and forwarded them without re-encrypting with recipient's link key | Server now re-encrypts all outbound messages with recipient's `XChaCha20-Poly1305` link key before sending. |
+| 5 | **Plaintext Dummy Packets** | Server sent cleartext dummy packets (`b"dummy_padding_to_look_real"`), making them trivially distinguishable from real traffic | Dummy packets are now random 64-byte payloads encrypted with recipient's link key, indistinguishable from real traffic. |
+
+### Unit Test Report (24 tests, all passing)
+
+#### Serialization & Signature Tests
+| Test | Description |
+|---|---|
+| `test_key_exchange_serialization` | Generates a `KeyExchangePayload`, serializes to 1352 bytes, deserializes, and verifies the Ed25519 signature round-trips correctly. Asserts `target_token` and `routing_token` are preserved. |
+| `test_session_est_serialization` | Generates a `SessionEstablishPayload`, serializes to 1224 bytes, deserializes, and verifies the Ed25519 signature. Asserts `routing_token` and `target_token` are preserved. |
+| `test_pq_inject_serialization` | Generates a `PQInjectPayload`, serializes to 1192 bytes, and verifies the Ed25519 signature correctly round-trips. |
+
+#### Edge Case: Malformed Packets
+| Test | Description |
+|---|---|
+| `test_edge_case_invalid_packet_sizes` | Feeds invalid byte arrays to deserialization for all payload types (`KeyExchange`, `SessionEstablish`, `PQInject`). All must return `Err` without panicking. |
+| `test_edge_case_empty_payload_handling` | Feeds empty payloads, unknown type bytes (`0xFF`), and undersized `0x01` payloads to `handle_incoming_packet`. Verifies graceful `Ok(None)` or `Err` without crashes. |
+
+#### Edge Case: Tampered Signatures
+| Test | Description |
+|---|---|
+| `test_edge_case_bad_kx_signature` | Flips a single bit in the Kyber key region of a serialized `KeyExchangePayload`. `verify()` must return `Err`. |
+| `test_edge_case_bad_est_signature` | Flips a single bit in the signature region of a serialized `SessionEstablishPayload`. `verify()` must return `Err`. |
+| `test_edge_case_bad_pq_inject_signature` | Corrupts a byte in a serialized `PQInjectPayload`. `verify()` must return `Err`. |
+| `test_edge_case_est_wrong_verifier_key` | Signs a `SessionEstablish` with Alice's key but attempts verification with Bob's key. Simulates Mallory forging a packet. Must return `Err`. |
+| `test_edge_case_pq_inject_wrong_verifier_key` | Simulates Mallory forging a `PQInject` packet. Must return `Err`. |
+
+#### Edge Case: Replay & Misbinding
+| Test | Description |
+|---|---|
+| `test_edge_case_timestamp_expiration` | Sets a payload's timestamp to 10 minutes in the past. Asserts the time differential exceeds the 300-second threshold. |
+| `test_edge_case_target_misbinding` | Generates a `KeyExchange` intended for Charlie (`0xCC`). Asserts that Bob (`0xBB`) correctly detects the `target_token` mismatch. |
+
+#### Symmetric Hash Ratchet
+| Test | Description |
+|---|---|
+| `test_symmetric_hash_ratchet_single_message` | Alice encrypts "Hello Bob!" with the ratchet, simulates server stripping link encryption, Bob decrypts. Asserts chain keys remain in sync. |
+| `test_symmetric_ratchet_multiple_messages` | Advances two independent ratchet states 10 times. Asserts every message key and chain key match at each step. |
+| `test_symmetric_ratchet_produces_unique_keys` | Advances a single ratchet 100 times. Asserts every message key is unique (no collisions in a HashSet). |
+
+#### PQ Ratchet Injection Tests
+| Test | Description |
+|---|---|
+| `test_pq_inject_triggers_at_interval` | Asserts a `PQInject` packet is generated exactly on every 5th message, and not otherwise. |
+| `test_pq_inject_no_trigger_without_kyber_key` | Asserts `PQInject` is not triggered if the peer's Kyber public key is missing from session state. |
+| `test_pq_inject_chain_sync` | Verifies that after a PQ injection, both sides' chain keys remain identical. |
+| `test_pq_inject_changes_chain_key` | Asserts that injecting PQ entropy actually changes the chain key from what a pure hash ratchet would produce. |
+
+#### Full Integration & Attack Simulation
+| Test | Description |
+|---|---|
+| `test_full_3way_handshake` | Simulates the complete Alice↔Bob handshake: QR scan → KeyExchange → KeyExchange reply → SessionEstablish. Verifies both clients derive identical root keys and chain keys. |
+| `test_full_handshake_then_pq_inject` | Full end-to-end integration: 3-way handshake followed by 5 messages and a PQ inject, verifying chain keys remain perfectly synchronized. |
+| `test_attack_session_overwrite_prevention` | Mallory creates a `SessionEstablish` signed with her own key but spoofs Alice's `routing_token`. Bob verifies the signature against Alice's stored Ed25519 key — verification fails, session is NOT established. |
+| `test_attack_no_session_without_pending` | A valid `SessionEstablish` arrives from an unknown sender (not in `pending_contacts`). Bob rejects it — no session is established. |
+| `test_attack_forged_pq_inject` | Mallory sends a `PQInject` spoofing Alice. Signature verification fails and Bob's chain key is not altered. |
+
+### Known Issues & Acceptable MVP Compromises
+
+1.  **TOFU (Trust On First Use) Vulnerability**: When Bob receives a `KeyExchange` from an unknown sender, the CLI auto-accepts it with a `[SECURITY WARNING]`. A real mobile app must implement a "Message Requests" inbox requiring explicit user acceptance.
+2.  **Hash Ratchet Out-Of-Sync**: The Symmetric Hash Ratchet has no "skip dictionary" for missed messages. If a message is completely dropped (even after RaptorQ FEC), the hash chains fall out of sync, requiring a session reset. The RaptorQ FEC layer (not yet implemented) is relied upon to prevent total message loss.
+3.  **Trial Decryption Scaling**: Message decryption currently iterates over all active E2E sessions attempting trial decryption. With many contacts, this is O(n) per message. A sender-identifier header (encrypted under the link layer) would reduce this to O(1).

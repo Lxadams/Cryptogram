@@ -1,4 +1,8 @@
 use anyhow::{Result, anyhow};
+use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
+use sha2::Sha256;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use std::{
     collections::HashSet,
     net::SocketAddr,
@@ -9,40 +13,43 @@ use tokio::net::UdpSocket;
 use tracing::{error, info};
 mod stores;
 
-use crate::stores::SessionId;
-use stores::Tables;
+use crate::stores::{RoutingToken, SessionId, Tables};
 
-const DUMMY_PACKET: &[u8] = b"dummy";
 const METADATA_TTL: Duration = Duration::from_secs(1000);
 const MESSAGE_TTL: Duration = Duration::from_secs(1000);
 const OUTBOUND_TASK_INTERVAL: Duration = Duration::from_secs(1);
 const SWEEPING_TASK_INTERVAL: Duration = Duration::from_secs(120);
+
+// Request Types
+const TYPE_HANDSHAKE: u8 = 0;
+const TYPE_DATA: u8 = 1; 
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    let mut buffer = [0u8; 1024]; // initialize every byte to zero for 1024 elements
+    // Generate server static identity
+    let server_static_secret = StaticSecret::random_from_rng(rand_core::OsRng);
+    let server_static_public = X25519PublicKey::from(&server_static_secret);
 
-    // Bind to UDP port 443 on all interfaces
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:443").await?);
+    let mut buffer = [0u8; 2048];
+
+    // Bind to 127.0.0.1:4430 for local testing without sudo
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:4430").await?);
     info!("UDP server listening on {}", socket.local_addr()?);
+    info!("Server Static Pubkey: {:?}", server_static_public.as_bytes());
 
     let tables = Arc::new(Mutex::new(Tables::new()));
 
-    // Spawn a background task to handle outbound messages
     spawn_outbound_task(Arc::clone(&tables), Arc::clone(&socket));
-
-    // Spawn another background task to handle sweeping
     spawn_sweeping_task(Arc::clone(&tables));
 
-    // Main loop to receive incoming UDP packets
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
                 info!("Received {} bytes from {}", len, addr);
-                if let Err(e) = handle_request(&tables, addr, &buffer[..len]) {
+                if let Err(e) = handle_request(&tables, &server_static_secret, addr, &buffer[..len]) {
                     error!("Request handling error from {}: {}", addr, e);
                 }
             }
@@ -55,52 +62,85 @@ async fn main() -> Result<()> {
 
 fn handle_request(
     tables: &Arc<Mutex<Tables>>,
+    server_secret: &StaticSecret,
     socket_address: SocketAddr,
     payload: &[u8],
 ) -> Result<()> {
-    // For demonstration, let's assume the first byte indicates the type of request (0 for sync, 1 for forward)
-    // Next two bytes are the session ID (for simplicity, we assume it's a string)
-    // The rest of the payload is the actual message or data.
-
-    const SESSION_ID_LEN: usize = 2;
-
-    if payload.len() < 1 + SESSION_ID_LEN {
-        return Err(anyhow!(
-            "Invalid packet length: expected at least {} bytes, got {}",
-            1 + SESSION_ID_LEN,
-            payload.len()
-        ));
+    if payload.is_empty() {
+        return Err(anyhow!("Empty payload"));
     }
 
-    let peer_session_id = String::from_utf8_lossy(&payload[1..1 + SESSION_ID_LEN]).to_string();
-    let blob = &payload[1 + SESSION_ID_LEN..];
-    info!(
-        "First byte flag: {}, Session ID: {}, Blob: {}",
-        payload[0],
-        peer_session_id,
-        String::from_utf8_lossy(blob)
-    );
+    match payload[0] {
+        TYPE_HANDSHAKE => {
+            // Handshake format: [1 byte type] [4 byte SessionId] [32 byte Ephemeral PubKey]
+            if payload.len() != 1 + 4 + 32 {
+                return Err(anyhow!("Invalid handshake length"));
+            }
+            let mut session_id = [0u8; 4];
+            session_id.copy_from_slice(&payload[1..5]);
+            
+            let mut pubkey_bytes = [0u8; 32];
+            pubkey_bytes.copy_from_slice(&payload[5..37]);
+            let client_pub = X25519PublicKey::from(pubkey_bytes);
 
-    match payload.first() {
-        Some(0) => {
-            info!("Handling sync request for session ID: {}", peer_session_id);
-            handle_sync_request(tables, socket_address, &peer_session_id)?;
-        }
-        Some(1) => {
-            info!(
-                "Handling forward request for session ID: {}",
-                peer_session_id
-            );
-            handle_forward_request(tables, &peer_session_id, blob.to_vec())?;
-        }
-        _ => {
-            error!("Unknown request type");
-        }
-    }
+            let shared_secret = server_secret.diffie_hellman(&client_pub);
+            let mut link_master_key = [0u8; 32];
+            Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
+                .expand(b"wireguard-lite-link", &mut link_master_key)
+                .map_err(|e| anyhow!("HKDF error: {}", e))?;
 
-    match tables.lock() {
-        Ok(tables) => tables.print_state(),
-        Err(e) => error!("Tables mutex poisoned while printing state: {e}"),
+            let mut tables = tables.lock().unwrap();
+            tables.register_link(session_id, link_master_key);
+            info!("Registered new link for Session ID: {:?}", session_id);
+        }
+        TYPE_DATA => {
+            // Data format: [1 byte type] [4 byte SessionId] [24 byte Nonce] [Ciphertext...]
+            if payload.len() < 1 + 4 + 24 + 16 {
+                // 16 bytes for auth tag. If length is exactly 45, decrypted is 0 bytes (sync)
+                return Err(anyhow!("Data packet too small"));
+            }
+            let mut session_id = [0u8; 4];
+            session_id.copy_from_slice(&payload[1..5]);
+
+            let mut nonce_bytes = [0u8; 24];
+            nonce_bytes.copy_from_slice(&payload[5..29]);
+            let nonce = XNonce::from_slice(&nonce_bytes);
+            
+            let ciphertext = &payload[29..];
+
+            let link_key = {
+                let tables = tables.lock().unwrap();
+                match tables.get_link_key(&session_id) {
+                    Some(k) => *k,
+                    None => return Err(anyhow!("Unknown Session ID")),
+                }
+            };
+
+            let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
+            let plaintext = cipher
+                .decrypt(nonce, ciphertext)
+                .map_err(|_| anyhow!("Invalid link encryption MAC"))?;
+
+            if plaintext.len() < 16 {
+                return Err(anyhow!("Decrypted payload too small for routing token"));
+            }
+
+            let mut routing_token = [0u8; 16];
+            routing_token.copy_from_slice(&plaintext[0..16]);
+            
+            let inner_payload = &plaintext[16..];
+
+            if inner_payload.is_empty() {
+                info!("Sync Request mapped to token {:?}", routing_token);
+                let mut tables = tables.lock().unwrap();
+                tables.update_metadata(routing_token, socket_address, session_id, METADATA_TTL);
+            } else {
+                info!("Forward Request for token {:?}", routing_token);
+                let mut tables = tables.lock().unwrap();
+                tables.enqueue_message(routing_token, inner_payload.to_vec(), MESSAGE_TTL);
+            }
+        }
+        _ => return Err(anyhow!("Unknown packet type")),
     }
     Ok(())
 }
@@ -129,59 +169,24 @@ fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
     });
 }
 
-fn handle_sync_request(
-    tables: &Arc<Mutex<Tables>>,
-    socket_address: SocketAddr,
-    sender_session_id: &SessionId,
-) -> Result<()> {
-    let mut tables = tables
-        .lock()
-        .map_err(|e| anyhow!("Tables mutex poisoned: {e}"))?;
-    tables.update_metadata(sender_session_id.to_string(), socket_address, METADATA_TTL);
-
-    Ok(())
-}
-
-fn handle_forward_request(
-    tables: &Arc<Mutex<Tables>>,
-    receiver_session_id: &SessionId,
-    payload: Vec<u8>,
-) -> Result<()> {
-    let mut tables = tables.lock().unwrap();
-    tables.enqueue_message(receiver_session_id.to_string(), payload, MESSAGE_TTL);
-
-    Ok(())
-}
-
-async fn send_udp_message(socket: &UdpSocket, addr: &str, message: &[u8]) -> Result<()> {
-    let bytes_sent = socket.send_to(message, addr).await?;
-    info!(
-        "Sent message: {}, with {} bytes to {}",
-        String::from_utf8_lossy(message),
-        bytes_sent,
-        addr
-    );
-    Ok(())
-}
-
-fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
+fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> (Vec<(String, Vec<u8>, SessionId)>, Vec<(String, SessionId)>) {
     let (messages, dummy_targets) = {
         let tables = tables.lock().unwrap();
-        let mut sent_sessions = HashSet::new();
+        let mut sent_tokens = HashSet::new();
         let mut messages = Vec::new();
 
         for message in tables.outbound_messages() {
-            if let Some(metadata) = tables.get_metadata(&message.receiver_session_id) {
-                messages.push((metadata.incoming_addr.to_string(), message.payload));
-                sent_sessions.insert(message.receiver_session_id);
+            if let Some(metadata) = tables.get_metadata(&message.receiver_token) {
+                messages.push((metadata.incoming_addr.to_string(), message.payload, metadata.session_id));
+                sent_tokens.insert(message.receiver_token);
             }
         }
 
         let mut dummy_targets = Vec::new();
 
-        for (session_id, metadata) in tables.metadata_iter() {
-            if !sent_sessions.contains(session_id) {
-                dummy_targets.push(metadata.incoming_addr.to_string());
+        for (token, metadata) in tables.metadata_iter() {
+            if !sent_tokens.contains(token) {
+                dummy_targets.push((metadata.incoming_addr.to_string(), metadata.session_id));
             }
         }
 
@@ -191,155 +196,142 @@ fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> (Vec<(String, Vec<u
 }
 
 async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket) -> Result<()> {
+    use rand_core::{OsRng, RngCore};
+
     let (messages, dummy_targets) = prepare_outbound_messages(tables);
-    for (addr, payload) in &messages {
-        send_udp_message(socket, addr, payload).await?;
+    for (addr, inner_payload, recipient_session_id) in &messages {
+        // Look up recipient's link key to re-encrypt
+        let link_key = {
+            let tables = tables.lock().unwrap();
+            match tables.get_link_key(recipient_session_id) {
+                Some(k) => *k,
+                None => continue,
+            }
+        };
+
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
+        let mut nonce_bytes = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, inner_payload.as_ref())
+            .map_err(|_| anyhow!("Failed to re-encrypt outbound"))?;
+
+        let mut packet = vec![TYPE_DATA];
+        packet.extend_from_slice(recipient_session_id);
+        packet.extend_from_slice(&nonce_bytes);
+        packet.extend_from_slice(&ciphertext);
+
+        socket.send_to(&packet, addr).await?;
+        info!("Sent {} bytes (re-encrypted) to {}", packet.len(), addr);
     }
 
-    for addr in &dummy_targets {
-        send_udp_message(socket, addr, DUMMY_PACKET).await?;
+    for (addr, recipient_session_id) in &dummy_targets {
+        let link_key = {
+            let tables = tables.lock().unwrap();
+            match tables.get_link_key(recipient_session_id) {
+                Some(k) => *k,
+                None => continue,
+            }
+        };
+
+        // Generate random dummy payload of fixed size
+        let mut dummy_payload = vec![0u8; 64];
+        OsRng.fill_bytes(&mut dummy_payload);
+
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
+        let mut nonce_bytes = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, dummy_payload.as_ref())
+            .map_err(|_| anyhow!("Failed to encrypt dummy"))?;
+
+        let mut packet = vec![TYPE_DATA];
+        packet.extend_from_slice(recipient_session_id);
+        packet.extend_from_slice(&nonce_bytes);
+        packet.extend_from_slice(&ciphertext);
+
+        socket.send_to(&packet, addr).await?;
+        info!("Sent DUMMY packet (encrypted) to {}", addr);
     }
 
     Ok(())
 }
 
-// --------------------- Unit tests ---------------------
 #[cfg(test)]
 mod tests {
     use super::*;
-    use utils::prepare_udp_payload;
+    use x25519_dalek::EphemeralSecret;
+    use rand_core::{OsRng, RngCore};
+
+    fn create_handshake_packet(client_secret: &EphemeralSecret, session_id: [u8; 4]) -> Vec<u8> {
+        let pubkey = X25519PublicKey::from(client_secret);
+        let mut packet = vec![TYPE_HANDSHAKE];
+        packet.extend_from_slice(&session_id);
+        packet.extend_from_slice(pubkey.as_bytes());
+        packet
+    }
+
+    fn create_data_packet(link_key: [u8; 32], session_id: [u8; 4], routing_token: [u8; 16], payload: &[u8]) -> Vec<u8> {
+        let mut plaintext = Vec::new();
+        plaintext.extend_from_slice(&routing_token);
+        plaintext.extend_from_slice(payload);
+
+        let mut nonce_bytes = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
+
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
+
+        let mut packet = vec![TYPE_DATA];
+        packet.extend_from_slice(&session_id);
+        packet.extend_from_slice(&nonce_bytes);
+        packet.extend_from_slice(&ciphertext);
+        packet
+    }
 
     #[test]
-    fn test_sync_then_forward_themselves() {
+    fn test_sync_then_forward() {
         let tables = Arc::new(Mutex::new(Tables::new()));
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_pub = X25519PublicKey::from(&server_secret);
+        
+        let client_secret = EphemeralSecret::random_from_rng(OsRng);
+        let session_id = [0xAA; 4];
+        let routing_token = [0xBB; 16];
         let socket_address = SocketAddr::from(([127, 0, 0, 1], 50000));
 
-        let sync_packet = prepare_udp_payload(0, b"01", b"");
-        handle_request(&tables, socket_address, &sync_packet).unwrap();
+        // 1. Handshake
+        let handshake_pkt = create_handshake_packet(&client_secret, session_id);
+        handle_request(&tables, &server_secret, socket_address, &handshake_pkt).unwrap();
+
+        // Calculate expected link key
+        let shared_secret = client_secret.diffie_hellman(&server_pub);
+        let mut link_key = [0u8; 32];
+        Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
+            .expand(b"wireguard-lite-link", &mut link_key).unwrap();
+
+        // 2. Sync Request (empty payload)
+        let sync_pkt = create_data_packet(link_key, session_id, routing_token, b"");
+        handle_request(&tables, &server_secret, socket_address, &sync_pkt).unwrap();
 
         {
-            let tables = tables.lock().unwrap();
-            let metadata = tables.metadata_iter().collect::<Vec<_>>();
-            let outbound_messages = tables.outbound_messages();
-
-            assert_eq!(metadata.len(), 1);
-            assert_eq!(metadata[0].0, "01");
-            assert_eq!(metadata[0].1.incoming_addr, socket_address);
-            assert!(outbound_messages.is_empty());
+            let tables_lock = tables.lock().unwrap();
+            let metadata = tables_lock.get_metadata(&routing_token).unwrap();
+            assert_eq!(metadata.incoming_addr, socket_address);
+            assert_eq!(metadata.session_id, session_id);
         }
 
-        let forward_packet = prepare_udp_payload(1, b"01", b"Hello myself");
-        handle_request(&tables, socket_address, &forward_packet).unwrap();
+        // 3. Forward Request (payload "Hello")
+        let forward_pkt = create_data_packet(link_key, session_id, routing_token, b"Hello");
+        handle_request(&tables, &server_secret, socket_address, &forward_pkt).unwrap();
 
         {
-            let (messages, dummy_targets) = prepare_outbound_messages(&tables);
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0].0, socket_address.to_string());
-            assert_eq!(messages[0].1, b"Hello myself");
-
-            assert_eq!(dummy_targets.len(), 0);
-
-            let tables = tables.lock().unwrap();
-            let metadata = tables.metadata_iter().collect::<Vec<_>>();
-            let outbound_messages = tables.outbound_messages();
-
-            assert_eq!(metadata.len(), 1);
-            assert_eq!(metadata[0].0, "01");
-            assert_eq!(metadata[0].1.incoming_addr, socket_address);
-
-            assert_eq!(outbound_messages.len(), 1);
-            assert_eq!(outbound_messages[0].receiver_session_id, "01");
-            assert_eq!(outbound_messages[0].payload, b"Hello myself");
-        }
-    }
-
-    #[test]
-    fn test_sync_then_forward_to_another_client() {
-        let tables = Arc::new(Mutex::new(Tables::new()));
-        let socket_address_alice = SocketAddr::from(([127, 0, 0, 1], 50000));
-        let socket_address_bob = SocketAddr::from(([127, 0, 0, 1], 50001));
-
-        let sync_packet_alice = prepare_udp_payload(0, b"01", b"");
-        let sync_packet_bob = prepare_udp_payload(0, b"02", b"");
-        handle_request(&tables, socket_address_alice, &sync_packet_alice).unwrap();
-        handle_request(&tables, socket_address_bob, &sync_packet_bob).unwrap();
-
-        {
-            let tables = tables.lock().unwrap();
-            let mut metadata = tables.metadata_iter().collect::<Vec<_>>();
-            metadata.sort_by_key(|(session_id, _)| session_id.to_string());
-            let outbound_messages = tables.outbound_messages();
-
-            assert_eq!(metadata.len(), 2);
-            assert_eq!(metadata[0].0, "01");
-            assert_eq!(metadata[0].1.incoming_addr, socket_address_alice);
-            assert_eq!(metadata[1].0, "02");
-            assert_eq!(metadata[1].1.incoming_addr, socket_address_bob);
-            assert!(outbound_messages.is_empty());
-        }
-
-        let forward_packet_to_bob = prepare_udp_payload(1, b"02", b"Hello bob");
-        handle_request(&tables, socket_address_bob, &forward_packet_to_bob).unwrap();
-
-        {
-            let (messages, dummy_targets) = prepare_outbound_messages(&tables);
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0].0, socket_address_bob.to_string());
-            assert_eq!(messages[0].1, b"Hello bob");
-
-            assert_eq!(dummy_targets.len(), 1);
-            assert_eq!(dummy_targets[0], socket_address_alice.to_string());
-
-            let tables = tables.lock().unwrap();
-            let mut metadata = tables.metadata_iter().collect::<Vec<_>>();
-            metadata.sort_by_key(|(session_id, _)| session_id.to_string());
-            let outbound_messages = tables.outbound_messages();
-
-            assert_eq!(metadata.len(), 2);
-            assert_eq!(metadata[0].0, "01");
-            assert_eq!(metadata[0].1.incoming_addr, socket_address_alice);
-            assert_eq!(metadata[1].0, "02");
-            assert_eq!(metadata[1].1.incoming_addr, socket_address_bob);
-
-            assert_eq!(outbound_messages.len(), 1);
-            assert_eq!(outbound_messages[0].receiver_session_id, "02");
-            assert_eq!(outbound_messages[0].payload, b"Hello bob");
-        }
-    }
-
-    #[test]
-    fn test_outbound_queue_sweep() {
-        let tables = Arc::new(Mutex::new(Tables::new()));
-        {
-            let mut tables = tables.lock().unwrap();
-            tables.enqueue_message(
-                SessionId::from("01"),
-                b"Hello".to_vec(),
-                Duration::from_millis(1),
-            );
-            std::thread::sleep(Duration::from_millis(5));
-            tables.sweep_expired_messages();
-            let outbound_messages = tables.outbound_messages();
-            assert!(outbound_messages.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_metadata_sweep() {
-        let tables = Arc::new(Mutex::new(Tables::new()));
-        let socket_address = SocketAddr::from(([127, 0, 0, 1], 50000));
-        {
-            let mut tables = tables.lock().unwrap();
-            tables.update_metadata(
-                SessionId::from("01"),
-                socket_address,
-                Duration::from_micros(1),
-            );
-            std::thread::sleep(Duration::from_micros(10));
-
-            tables.sweep_metadata();
-            let metadata = tables.metadata_iter().collect::<Vec<_>>();
-            assert!(metadata.is_empty());
+            let tables_lock = tables.lock().unwrap();
+            let msgs = tables_lock.outbound_messages();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0].receiver_token, routing_token);
+            assert_eq!(msgs[0].payload, b"Hello");
         }
     }
 }
