@@ -58,14 +58,14 @@ The 3-way handshake exchanges the massive Post-Quantum keys in-band, authenticat
 
 Once the session is bootstrapped, ongoing messaging uses a **Symmetric Hash Ratchet** (HMAC-SHA256) — not the Signal Double Ratchet. This was a deliberate simplification.
 
-1.  **Symmetric Ratchet**: Each message derives a unique Message Key and advances the Chain Key:
+1.  **Symmetric Ratchet & Skip Dictionary**: Each message derives a unique Message Key and advances the Chain Key:
     *   `MessageKey = HMAC-SHA256(ChainKey, "message-key")`
     *   `NextChainKey = HMAC-SHA256(ChainKey, "chain-key")`
-    *   The old Chain Key is permanently destroyed (Forward Secrecy).
-2.  **Message Encryption**: The plaintext is encrypted with `XChaCha20-Poly1305` using the Message Key. A fresh 24-byte random nonce is generated per message.
+    *   The old Chain Key is destroyed, but unused Message Keys are temporarily stored in a **Skip Dictionary** (up to 100 keys ahead) to handle out-of-order delivery gracefully.
+2.  **Message Encryption**: The plaintext is encrypted with `XChaCha20-Poly1305` using the Message Key. A fresh 24-byte random nonce is generated per message. The sender's 8-byte sequence number (`seq_no`) is included in the E2E payload structure.
 3.  **Periodic KEM Injection (PQ Ratchet)**: To provide continuous Post-Quantum secrecy without full session resets, a new Kyber encapsulation is performed against the peer's stored Kyber public key every 5 messages. The new PQ shared secret is mixed into the Chain Key via HKDF. The Kyber ciphertext is sent as a `0x05 PQInjectPayload` (1192 bytes).
-4.  **Packet Structure**: `[0x01 | 24-byte Nonce | E2E Ciphertext]`, wrapped in link encryption.
-5.  **Decryption**: The receiver trial-decrypts against all active sessions using the *next expected* message key. On success, the ratchet advances.
+4.  **Packet Structure**: `[0x01 | 8-byte SeqNo | 24-byte Nonce | E2E Ciphertext]`, wrapped in link encryption.
+5.  **Decryption**: The receiver extracts the `seq_no`. If it's a previously skipped message, it retrieves the key from the Skip Dictionary. If it's a future message, it fast-forwards the chain key (up to 100 steps) and stores the intermediate skipped keys.
 
 ---
 
@@ -138,6 +138,7 @@ Raw UDP Datagram
 | 3 | **Unauthenticated KEM Hijacking** | Mallory encapsulates a Kyber secret against Bob's key and sends a fake `SessionEstablish` claiming to be Alice | `SessionEstablish` is now signed by sender's Ed25519 key. Bob verifies against Alice's stored key before accepting. |
 | 4 | **Server Forwarding Plaintext** | Server stored raw inner payloads and forwarded them without re-encrypting with recipient's link key | Server now re-encrypts all outbound messages with recipient's `XChaCha20-Poly1305` link key before sending. |
 | 5 | **Plaintext Dummy Packets** | Server sent cleartext dummy packets (`b"dummy_padding_to_look_real"`), making them trivially distinguishable from real traffic | Dummy packets are now random 64-byte payloads encrypted with recipient's link key, indistinguishable from real traffic. |
+| 6 | **Session Reset DoS** | Attacker replays intercepted `SessionEstablish` packets to force redundant derivations | Added a `seen_session_keys` cache to drop previously processed ephemeral X25519 keys silently. |
 
 ### Unit Test Report (24 tests, all passing)
 
@@ -196,5 +197,4 @@ Raw UDP Datagram
 ### Known Issues & Acceptable MVP Compromises
 
 1.  **TOFU (Trust On First Use) Vulnerability**: When Bob receives a `KeyExchange` from an unknown sender, the CLI auto-accepts it with a `[SECURITY WARNING]`. A real mobile app must implement a "Message Requests" inbox requiring explicit user acceptance.
-2.  **Hash Ratchet Out-Of-Sync**: The Symmetric Hash Ratchet has no "skip dictionary" for missed messages. If a message is completely dropped (even after RaptorQ FEC), the hash chains fall out of sync, requiring a session reset. The RaptorQ FEC layer (not yet implemented) is relied upon to prevent total message loss.
-3.  **Trial Decryption Scaling**: Message decryption currently iterates over all active E2E sessions attempting trial decryption. With many contacts, this is O(n) per message. A sender-identifier header (encrypted under the link layer) would reduce this to O(1).
+2.  **Trial Decryption Scaling**: Message decryption currently iterates over all active E2E sessions attempting trial decryption. With many contacts, this is O(n) per message. A sender-identifier header (encrypted under the link layer) would reduce this to O(1).

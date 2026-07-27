@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey, Verifier};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use pqcrypto_kyber::kyber768::*;
@@ -14,6 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod packets;
 use packets::*;
+mod storage;
+use storage::ClientStateDto;
+use std::collections::HashSet;
 
 type HmacSha256 = Hmac<Sha256>;
 pub type SessionId = [u8; 4];
@@ -23,8 +26,9 @@ pub type RoutingToken = [u8; 16];
 const PQ_INJECT_INTERVAL: u64 = 5;
 
 // Request Types for Server
-const TYPE_HANDSHAKE: u8 = 0;
+const TYPE_HANDSHAKE_INIT: u8 = 0;
 const TYPE_DATA: u8 = 1;
+const TYPE_HANDSHAKE_RESP: u8 = 2;
 
 pub struct UserIdentity {
     pub routing_token: RoutingToken,
@@ -53,7 +57,9 @@ pub struct SymmetricSessionState {
     pub root_key: [u8; 32],
     pub chain_key: [u8; 32],
     pub send_count: u64,
+    pub recv_count: u64,
     pub peer_kyber_pub: Option<PublicKey>,
+    pub skip_dict: HashMap<u64, [u8; 32]>,
 }
 
 impl SymmetricSessionState {
@@ -67,6 +73,54 @@ impl SymmetricSessionState {
         self.chain_key = mac_chain.finalize().into_bytes().into();
 
         message_key
+    }
+
+    /// Try decrypting using skip dictionary or fast-forwarding the ratchet
+    pub fn try_decrypt(&mut self, seq_no: u64, nonce: &XNonce, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        if seq_no < self.recv_count {
+            if let Some(key) = self.skip_dict.remove(&seq_no) {
+                let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+                if let Ok(pt) = cipher.decrypt(nonce, ciphertext) {
+                    return Some(pt);
+                }
+            }
+            return None;
+        }
+
+        if seq_no - self.recv_count > 100 {
+            return None;
+        }
+
+        let mut test_chain = self.chain_key;
+        let mut skipped_keys = Vec::new();
+        
+        let mut msg_key = [0u8; 32];
+        for _ in self.recv_count..=seq_no {
+            let mut mac = <HmacSha256 as Mac>::new_from_slice(&test_chain).unwrap();
+            mac.update(b"message-key");
+            msg_key = mac.finalize().into_bytes().into();
+
+            let mut mac_chain = <HmacSha256 as Mac>::new_from_slice(&test_chain).unwrap();
+            mac_chain.update(b"chain-key");
+            test_chain = mac_chain.finalize().into_bytes().into();
+
+            skipped_keys.push(msg_key);
+        }
+
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&msg_key));
+        if let Ok(pt) = cipher.decrypt(nonce, ciphertext) {
+            self.chain_key = test_chain;
+            for (i, key) in skipped_keys.into_iter().enumerate() {
+                let s = self.recv_count + i as u64;
+                if s < seq_no {
+                    self.skip_dict.insert(s, key);
+                }
+            }
+            self.recv_count = seq_no + 1;
+            Some(pt)
+        } else {
+            None
+        }
     }
 
     /// Mix fresh PQ shared secret into the chain key via HKDF
@@ -87,6 +141,7 @@ pub struct Client {
     pub e2e_sessions: HashMap<RoutingToken, SymmetricSessionState>,
     pub pending_contacts: HashMap<RoutingToken, VerifyingKey>,
     pub peer_kyber_keys: HashMap<RoutingToken, PublicKey>,
+    pub seen_session_keys: HashSet<[u8; 32]>,
 }
 
 impl Client {
@@ -102,23 +157,49 @@ impl Client {
             e2e_sessions: HashMap::new(),
             pending_contacts: HashMap::new(),
             peer_kyber_keys: HashMap::new(),
+            seen_session_keys: HashSet::new(),
+        }
+    }
+
+    pub fn save(&self) {
+        if let Err(e) = ClientStateDto::save(self, "client_state.json") {
+            tracing::error!("Failed to save state: {}", e);
         }
     }
 
     pub fn generate_handshake_packet(&self) -> (EphemeralSecret, Vec<u8>) {
         let client_ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
         let client_ephemeral_public = X25519PublicKey::from(&client_ephemeral_secret);
-        let mut packet = vec![TYPE_HANDSHAKE];
+        let mut packet = vec![TYPE_HANDSHAKE_INIT];
         packet.extend_from_slice(&self.session_id);
         packet.extend_from_slice(client_ephemeral_public.as_bytes());
         (client_ephemeral_secret, packet)
     }
 
-    pub fn complete_handshake(&mut self, client_secret: EphemeralSecret, server_pub: &X25519PublicKey) {
-        let shared_secret = client_secret.diffie_hellman(server_pub);
+    pub fn complete_handshake(&mut self, client_secret: EphemeralSecret, server_ed25519_pub: &VerifyingKey, response: &[u8]) -> Result<()> {
+        if response.len() < 1 + 4 + 32 + 64 || response[0] != TYPE_HANDSHAKE_RESP {
+            return Err(anyhow!("Invalid handshake response"));
+        }
+        let mut server_eph_pub_bytes = [0u8; 32];
+        server_eph_pub_bytes.copy_from_slice(&response[5..37]);
+        let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
+        
+        let mut signature_bytes = [0u8; 64];
+        signature_bytes.copy_from_slice(&response[37..101]);
+        let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+        
+        let client_pub = X25519PublicKey::from(&client_secret);
+        let mut msg = Vec::new();
+        msg.extend_from_slice(client_pub.as_bytes());
+        msg.extend_from_slice(server_eph_pub.as_bytes());
+        
+        server_ed25519_pub.verify(&msg, &signature)?;
+
+        let shared_secret = client_secret.diffie_hellman(&server_eph_pub);
         Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
             .expand(b"wireguard-lite-link", &mut self.link_master_key)
             .unwrap();
+        Ok(())
     }
 
     pub fn generate_sync_packet(&self) -> Vec<u8> {
@@ -185,7 +266,9 @@ impl Client {
             root_key,
             chain_key: root_key,
             send_count: 0,
+            recv_count: 0,
             peer_kyber_pub: Some(peer_kyber_copy),
+            skip_dict: std::collections::HashMap::new(),
         };
 
         let est_payload = SessionEstablishPayload::generate(
@@ -219,9 +302,12 @@ impl Client {
             root_key,
             chain_key: root_key,
             send_count: 0,
+            recv_count: 0,
             peer_kyber_pub: peer_kyber,
+            skip_dict: std::collections::HashMap::new(),
         };
         self.e2e_sessions.insert(est.routing_token, session_state);
+        self.save();
         println!(">> E2E Session established with {}!", hex::encode(&est.routing_token[0..4]));
     }
 
@@ -240,11 +326,14 @@ impl Client {
             let e2e_nonce = XNonce::from_slice(&e2e_nonce_bytes);
 
             let mut full_e2e_payload = vec![0x01];
+            full_e2e_payload.extend_from_slice(&session.send_count.to_be_bytes());
             full_e2e_payload.extend_from_slice(&e2e_nonce_bytes);
             let e2e_ciphertext = e2e_cipher.encrypt(e2e_nonce, plaintext).unwrap();
             full_e2e_payload.extend_from_slice(&e2e_ciphertext);
 
             session.send_count += 1;
+            // The state is mutated, but save() needs immutable ref.
+            // We'll call self.save() after the mutable borrow block.
 
             // Check if PQ injection is needed
             let pq_ct = if session.send_count % PQ_INJECT_INTERVAL == 0 {
@@ -263,6 +352,7 @@ impl Client {
             (full_e2e_payload, pq_ct)
         };
         // mutable borrow on self.e2e_sessions released
+        self.save();
 
         // Phase 2: link-encrypt everything (immutable borrow on self)
         let msg_packet = self.wrap_link_encryption(target_token, &full_e2e_payload);
@@ -284,30 +374,25 @@ impl Client {
 
         match pkt_type {
             0x01 => { // Msg
-                if pkt_data.len() < 24 {
+                if pkt_data.len() < 32 {
                     return Err(anyhow!("Msg payload too small"));
                 }
+                let seq_no = u64::from_be_bytes(pkt_data[0..8].try_into().unwrap());
                 let mut nonce_bytes = [0u8; 24];
-                nonce_bytes.copy_from_slice(&pkt_data[0..24]);
+                nonce_bytes.copy_from_slice(&pkt_data[8..32]);
                 let nonce = XNonce::from_slice(&nonce_bytes);
-                let ciphertext = &pkt_data[24..];
+                let ciphertext = &pkt_data[32..];
 
                 let mut decrypted = None;
                 for (token, session) in self.e2e_sessions.iter_mut() {
-                    let test_chain = session.chain_key;
-                    let mut mac = <HmacSha256 as Mac>::new_from_slice(&test_chain).unwrap();
-                    mac.update(b"message-key");
-                    let message_key = mac.finalize().into_bytes();
-
-                    let e2e_cipher = XChaCha20Poly1305::new(Key::from_slice(&message_key));
-                    if let Ok(plaintext) = e2e_cipher.decrypt(nonce, ciphertext) {
-                        session.symmetric_ratchet();
-                        decrypted = Some((token.clone(), plaintext));
+                    if let Some(pt) = session.try_decrypt(seq_no, nonce, ciphertext) {
+                        decrypted = Some((token.clone(), pt));
                         break;
                     }
                 }
 
                 if let Some((token, pt)) = decrypted {
+                    self.save();
                     println!(">> [From {}]: {}", hex::encode(&token[0..4]), String::from_utf8_lossy(&pt));
                 } else {
                     println!(">> Received packet but couldn't decrypt. E2E session not found or out of sync.");
@@ -359,6 +444,10 @@ impl Client {
             },
             0x04 => { // SessionEstablish
                 if let Ok(est) = SessionEstablishPayload::from_bytes(pkt_data) {
+                    if !self.seen_session_keys.insert(est.eph_x25519_pub.to_bytes()) {
+                        println!(">> [SECURITY ALERT] Dropped SessionEstablish! Replay detected (key already seen).");
+                        return Ok(None);
+                    }
                     if est.target_token != self.identity.routing_token {
                         println!(">> [SECURITY ALERT] Dropped SessionEstablish! Bound to different target.");
                         return Ok(None);
@@ -421,7 +510,7 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: {} <server_x25519_pubkey_hex>", args[0]);
+        eprintln!("Usage: {} <server_ed25519_pubkey_hex>", args[0]);
         std::process::exit(1);
     }
 
@@ -429,10 +518,19 @@ async fn main() -> Result<()> {
     let server_pub_bytes = hex::decode(server_pub_hex).expect("Invalid hex for server pubkey");
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&server_pub_bytes);
-    let server_pub = X25519PublicKey::from(arr);
+    let server_pub = VerifyingKey::from_bytes(&arr).expect("Invalid server verifying key");
 
     let server_addr: SocketAddr = "127.0.0.1:4430".parse()?;
-    let client = Arc::new(Mutex::new(Client::new(server_addr)));
+    
+    let client_obj = match ClientStateDto::load("client_state.json") {
+        Ok(c) => {
+            println!("Loaded client state from disk.");
+            c
+        }
+        Err(_) => Client::new(server_addr),
+    };
+    
+    let client = Arc::new(Mutex::new(client_obj));
 
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
@@ -441,8 +539,12 @@ async fn main() -> Result<()> {
         let mut c = client.lock().await;
         let (client_secret, hs_packet) = c.generate_handshake_packet();
         socket.send_to(&hs_packet, server_addr).await?;
-        c.complete_handshake(client_secret, &server_pub);
+        
+        let mut resp_buf = [0u8; 1024];
+        let (len, _) = socket.recv_from(&mut resp_buf).await?;
+        c.complete_handshake(client_secret, &server_pub, &resp_buf[..len])?;
         println!("Completed Server Link Handshake! Session ID: {}", hex::encode(c.session_id));
+        c.save();
 
         let sync_packet = c.generate_sync_packet();
         socket.send_to(&sync_packet, server_addr).await?;
@@ -722,8 +824,8 @@ mod tests {
 
     #[test]
     fn test_symmetric_ratchet_multiple_messages() {
-        let mut alice_state = SymmetricSessionState { root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, peer_kyber_pub: None };
-        let mut bob_state = SymmetricSessionState { root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, peer_kyber_pub: None };
+        let mut alice_state = SymmetricSessionState { root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() };
+        let mut bob_state = SymmetricSessionState { root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() };
         for i in 0..10 {
             let alice_mk = alice_state.symmetric_ratchet();
             let bob_mk = bob_state.symmetric_ratchet();
@@ -734,7 +836,7 @@ mod tests {
 
     #[test]
     fn test_symmetric_ratchet_produces_unique_keys() {
-        let mut state = SymmetricSessionState { root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, peer_kyber_pub: None };
+        let mut state = SymmetricSessionState { root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() };
         let mut seen_keys = std::collections::HashSet::new();
         for _ in 0..100 {
             let mk = state.symmetric_ratchet();
@@ -748,8 +850,8 @@ mod tests {
         let mut alice = Client::new(server_addr);
         let mut bob = Client::new(server_addr);
         let root_key = [0x42u8; 32];
-        alice.e2e_sessions.insert(bob.identity.routing_token, SymmetricSessionState { root_key, chain_key: root_key, send_count: 0, peer_kyber_pub: None });
-        bob.e2e_sessions.insert(alice.identity.routing_token, SymmetricSessionState { root_key, chain_key: root_key, send_count: 0, peer_kyber_pub: None });
+        alice.e2e_sessions.insert(bob.identity.routing_token, SymmetricSessionState { root_key, chain_key: root_key, send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() });
+        bob.e2e_sessions.insert(alice.identity.routing_token, SymmetricSessionState { root_key, chain_key: root_key, send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() });
         let (packet, _pq) = alice.create_encrypted_packet(bob.identity.routing_token, b"Hello Bob!").unwrap();
         let inner = strip_link(&packet, &alice.link_master_key);
         bob.handle_incoming_packet(&inner).unwrap();
@@ -769,7 +871,7 @@ mod tests {
         let bob_id = UserIdentity::generate();
         let bob_kyber_copy = PublicKey::from_bytes(bob_id.kyber_public.as_bytes()).unwrap();
         alice.e2e_sessions.insert(bob_id.routing_token, SymmetricSessionState {
-            root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0,
+            root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, recv_count: 0, skip_dict: std::collections::HashMap::new(),
             peer_kyber_pub: Some(bob_kyber_copy),
         });
 
@@ -800,7 +902,7 @@ mod tests {
         let mut alice = Client::new(server_addr);
         let bob_token = [0xBB; 16];
         alice.e2e_sessions.insert(bob_token, SymmetricSessionState {
-            root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0,
+            root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, recv_count: 0, skip_dict: std::collections::HashMap::new(),
             peer_kyber_pub: None, // No Kyber key!
         });
 
@@ -824,11 +926,11 @@ mod tests {
         let root_key = [0x42u8; 32];
 
         alice.e2e_sessions.insert(bob.identity.routing_token, SymmetricSessionState {
-            root_key, chain_key: root_key, send_count: 0,
+            root_key, chain_key: root_key, send_count: 0, recv_count: 0, skip_dict: std::collections::HashMap::new(),
             peer_kyber_pub: Some(bob_kyber_copy),
         });
         bob.e2e_sessions.insert(alice.identity.routing_token, SymmetricSessionState {
-            root_key, chain_key: root_key, send_count: 0,
+            root_key, chain_key: root_key, send_count: 0, recv_count: 0, skip_dict: std::collections::HashMap::new(),
             peer_kyber_pub: Some(alice_kyber_copy),
         });
         // Bob needs Alice in pending_contacts for PQ inject verification
@@ -865,7 +967,7 @@ mod tests {
         let root_key = [0x42u8; 32];
 
         alice.e2e_sessions.insert(bob_id.routing_token, SymmetricSessionState {
-            root_key, chain_key: root_key, send_count: 0,
+            root_key, chain_key: root_key, send_count: 0, recv_count: 0, skip_dict: std::collections::HashMap::new(),
             peer_kyber_pub: Some(bob_kyber_copy),
         });
 
@@ -886,7 +988,7 @@ mod tests {
         assert_ne!(chain_before_pq, chain_after_pq, "PQ inject must change the chain key");
 
         // Also verify it's not just a normal ratchet step by comparing to a no-PQ ratchet
-        let mut no_pq_state = SymmetricSessionState { root_key, chain_key: root_key, send_count: 0, peer_kyber_pub: None };
+        let mut no_pq_state = SymmetricSessionState { root_key, chain_key: root_key, send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() };
         for _ in 0..5 {
             no_pq_state.symmetric_ratchet();
         }
@@ -1031,7 +1133,7 @@ mod tests {
         // Bob has Alice in pending contacts and an active session
         bob.pending_contacts.insert(alice_id.routing_token, alice_id.ed25519_public);
         bob.e2e_sessions.insert(alice_id.routing_token, SymmetricSessionState {
-            root_key: [0x42; 32], chain_key: [0x42; 32], send_count: 0, peer_kyber_pub: None,
+            root_key: [0x42; 32], chain_key: [0x42; 32], send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new()
         });
         let chain_before = bob.e2e_sessions.get(&alice_id.routing_token).unwrap().chain_key;
 

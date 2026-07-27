@@ -2,7 +2,8 @@ use anyhow::{Result, anyhow};
 use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use ed25519_dalek::{SigningKey, Signer};
+use x25519_dalek::PublicKey as X25519PublicKey;
 use std::{
     collections::HashSet,
     net::SocketAddr,
@@ -21,8 +22,9 @@ const OUTBOUND_TASK_INTERVAL: Duration = Duration::from_secs(1);
 const SWEEPING_TASK_INTERVAL: Duration = Duration::from_secs(120);
 
 // Request Types
-const TYPE_HANDSHAKE: u8 = 0;
-const TYPE_DATA: u8 = 1; 
+const TYPE_HANDSHAKE_INIT: u8 = 0;
+const TYPE_DATA: u8 = 1;
+const TYPE_HANDSHAKE_RESP: u8 = 2; 
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,15 +32,17 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     // Generate server static identity
-    let server_static_secret = StaticSecret::random_from_rng(rand_core::OsRng);
-    let server_static_public = X25519PublicKey::from(&server_static_secret);
+    let mut identity_bytes = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut identity_bytes);
+    let server_identity = SigningKey::from_bytes(&identity_bytes);
+    let server_pub = server_identity.verifying_key();
 
     let mut buffer = [0u8; 2048];
 
     // Bind to 127.0.0.1:4430 for local testing without sudo
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:4430").await?);
     info!("UDP server listening on {}", socket.local_addr()?);
-    info!("Server Static Pubkey: {:?}", server_static_public.as_bytes());
+    info!("Server Static Pubkey: {}", hex::encode(server_pub.as_bytes()));
 
     let tables = Arc::new(Mutex::new(Tables::new()));
 
@@ -49,7 +53,16 @@ async fn main() -> Result<()> {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
                 info!("Received {} bytes from {}", len, addr);
-                if let Err(e) = handle_request(&tables, &server_static_secret, addr, &buffer[..len]) {
+                if let Err(e) = match handle_request(&tables, &server_identity, addr, &buffer[..len]) {
+                    Ok(Some(resp)) => {
+                        if let Err(send_err) = socket.send_to(&resp, addr).await {
+                            error!("Failed to send response: {}", send_err);
+                        }
+                        Ok(())
+                    },
+                    Ok(None) => Ok(()),
+                    Err(e) => Err(e),
+                } {
                     error!("Request handling error from {}: {}", addr, e);
                 }
             }
@@ -62,16 +75,16 @@ async fn main() -> Result<()> {
 
 fn handle_request(
     tables: &Arc<Mutex<Tables>>,
-    server_secret: &StaticSecret,
+    server_identity: &SigningKey,
     socket_address: SocketAddr,
     payload: &[u8],
-) -> Result<()> {
+) -> Result<Option<Vec<u8>>> {
     if payload.is_empty() {
         return Err(anyhow!("Empty payload"));
     }
 
     match payload[0] {
-        TYPE_HANDSHAKE => {
+        TYPE_HANDSHAKE_INIT => {
             // Handshake format: [1 byte type] [4 byte SessionId] [32 byte Ephemeral PubKey]
             if payload.len() != 1 + 4 + 32 {
                 return Err(anyhow!("Invalid handshake length"));
@@ -83,15 +96,30 @@ fn handle_request(
             pubkey_bytes.copy_from_slice(&payload[5..37]);
             let client_pub = X25519PublicKey::from(pubkey_bytes);
 
-            let shared_secret = server_secret.diffie_hellman(&client_pub);
+            let server_eph_secret = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
+            let server_eph_pub = X25519PublicKey::from(&server_eph_secret);
+
+            let shared_secret = server_eph_secret.diffie_hellman(&client_pub);
             let mut link_master_key = [0u8; 32];
             Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
                 .expand(b"wireguard-lite-link", &mut link_master_key)
                 .map_err(|e| anyhow!("HKDF error: {}", e))?;
 
+            let mut msg = Vec::new();
+            msg.extend_from_slice(client_pub.as_bytes());
+            msg.extend_from_slice(server_eph_pub.as_bytes());
+            let signature = server_identity.sign(&msg);
+
+            let mut resp = vec![TYPE_HANDSHAKE_RESP];
+            resp.extend_from_slice(&session_id);
+            resp.extend_from_slice(server_eph_pub.as_bytes());
+            resp.extend_from_slice(&signature.to_bytes());
+
             let mut tables = tables.lock().unwrap();
             tables.register_link(session_id, link_master_key);
             info!("Registered new link for Session ID: {:?}", session_id);
+            
+            return Ok(Some(resp));
         }
         TYPE_DATA => {
             // Data format: [1 byte type] [4 byte SessionId] [24 byte Nonce] [Ciphertext...]
@@ -142,7 +170,7 @@ fn handle_request(
         }
         _ => return Err(anyhow!("Unknown packet type")),
     }
-    Ok(())
+    Ok(None)
 }
 
 fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>) {
@@ -265,7 +293,7 @@ mod tests {
 
     fn create_handshake_packet(client_secret: &EphemeralSecret, session_id: [u8; 4]) -> Vec<u8> {
         let pubkey = X25519PublicKey::from(client_secret);
-        let mut packet = vec![TYPE_HANDSHAKE];
+        let mut packet = vec![TYPE_HANDSHAKE_INIT];
         packet.extend_from_slice(&session_id);
         packet.extend_from_slice(pubkey.as_bytes());
         packet
@@ -293,8 +321,9 @@ mod tests {
     #[test]
     fn test_sync_then_forward() {
         let tables = Arc::new(Mutex::new(Tables::new()));
-        let server_secret = StaticSecret::random_from_rng(OsRng);
-        let server_pub = X25519PublicKey::from(&server_secret);
+        let mut identity_bytes = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
+        let server_identity = SigningKey::from_bytes(&identity_bytes);
         
         let client_secret = EphemeralSecret::random_from_rng(OsRng);
         let session_id = [0xAA; 4];
@@ -303,17 +332,21 @@ mod tests {
 
         // 1. Handshake
         let handshake_pkt = create_handshake_packet(&client_secret, session_id);
-        handle_request(&tables, &server_secret, socket_address, &handshake_pkt).unwrap();
+        let resp = handle_request(&tables, &server_identity, socket_address, &handshake_pkt).unwrap().unwrap();
 
         // Calculate expected link key
-        let shared_secret = client_secret.diffie_hellman(&server_pub);
+        let mut server_eph_pub_bytes = [0u8; 32];
+        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
+        let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
+        
+        let shared_secret = client_secret.diffie_hellman(&server_eph_pub);
         let mut link_key = [0u8; 32];
         Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
             .expand(b"wireguard-lite-link", &mut link_key).unwrap();
 
         // 2. Sync Request (empty payload)
         let sync_pkt = create_data_packet(link_key, session_id, routing_token, b"");
-        handle_request(&tables, &server_secret, socket_address, &sync_pkt).unwrap();
+        handle_request(&tables, &server_identity, socket_address, &sync_pkt).unwrap();
 
         {
             let tables_lock = tables.lock().unwrap();
@@ -324,7 +357,7 @@ mod tests {
 
         // 3. Forward Request (payload "Hello")
         let forward_pkt = create_data_packet(link_key, session_id, routing_token, b"Hello");
-        handle_request(&tables, &server_secret, socket_address, &forward_pkt).unwrap();
+        handle_request(&tables, &server_identity, socket_address, &forward_pkt).unwrap();
 
         {
             let tables_lock = tables.lock().unwrap();
