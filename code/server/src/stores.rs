@@ -36,26 +36,7 @@ impl Tables {
         }
     }
 
-    pub fn print_state(&self) {
-        println!("Current state of Tables:");
-        println!("Active Links: {}", self.active_links.len());
-        println!("Metadata entries:");
-        for (token, entry) in &self.metadata {
-            println!(
-                "Routing Token: {:?}, Incoming Addr: {}, Expiry: {:?}",
-                token, entry.incoming_addr, entry.expiry
-            );
-        }
-        println!("Outbound messages:");
-        for message in &self.outbound_queue {
-            println!(
-                "Receiver Token: {:?}, Payload len: {}, Expiry: {:?}",
-                message.receiver_token,
-                message.payload.len(),
-                message.expiry
-            );
-        }
-    }
+
 
     pub fn register_link(&mut self, session_id: SessionId, link_key: [u8; 32]) {
         self.active_links.insert(session_id, link_key);

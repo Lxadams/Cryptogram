@@ -14,7 +14,7 @@ use tracing::{error, info};
 use x25519_dalek::PublicKey as X25519PublicKey;
 mod stores;
 
-use crate::stores::{RoutingToken, SessionId, Tables};
+use crate::stores::{SessionId, Tables};
 
 const METADATA_TTL: Duration = Duration::from_secs(1000);
 const MESSAGE_TTL: Duration = Duration::from_secs(1000);
@@ -203,9 +203,11 @@ fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
     });
 }
 
+type OutboundMessages = (Vec<(String, Vec<u8>, SessionId)>, Vec<(String, SessionId)>);
+
 fn prepare_outbound_messages(
     tables: &Arc<Mutex<Tables>>,
-) -> (Vec<(String, Vec<u8>, SessionId)>, Vec<(String, SessionId)>) {
+) -> OutboundMessages {
     let (messages, dummy_targets) = {
         let tables = tables.lock().unwrap();
         let mut sent_tokens = HashSet::new();
