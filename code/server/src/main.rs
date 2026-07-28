@@ -205,9 +205,7 @@ fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
 
 type OutboundMessages = (Vec<(String, Vec<u8>, SessionId)>, Vec<(String, SessionId)>);
 
-fn prepare_outbound_messages(
-    tables: &Arc<Mutex<Tables>>,
-) -> OutboundMessages {
+fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> OutboundMessages {
     let (messages, dummy_targets) = {
         let tables = tables.lock().unwrap();
         let mut sent_tokens = HashSet::new();

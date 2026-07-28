@@ -36,8 +36,6 @@ impl Tables {
         }
     }
 
-
-
     pub fn register_link(&mut self, session_id: SessionId, link_key: [u8; 32]) {
         self.active_links.insert(session_id, link_key);
     }
