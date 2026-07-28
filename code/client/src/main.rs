@@ -1,22 +1,22 @@
 use anyhow::{Result, anyhow};
-use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
-use ed25519_dalek::{SigningKey, VerifyingKey, Verifier};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+use ed25519_dalek::{SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use pqcrypto_kyber::kyber768::*;
-use pqcrypto_traits::kem::{SharedSecret as _, PublicKey as _};
+use pqcrypto_traits::kem::{PublicKey as _, SharedSecret as _};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{io::AsyncBufReadExt, net::UdpSocket, sync::Mutex};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod packets;
 use packets::*;
 mod storage;
-use storage::ClientStateDto;
 use std::collections::HashSet;
+use storage::ClientStateDto;
 
 type HmacSha256 = Hmac<Sha256>;
 pub type SessionId = [u8; 4];
@@ -49,7 +49,15 @@ impl UserIdentity {
         let x25519_secret = StaticSecret::random_from_rng(OsRng);
         let x25519_public = X25519PublicKey::from(&x25519_secret);
         let (kyber_public, kyber_secret) = keypair();
-        Self { routing_token, ed25519_secret, ed25519_public, x25519_secret, x25519_public, kyber_public, kyber_secret }
+        Self {
+            routing_token,
+            ed25519_secret,
+            ed25519_public,
+            x25519_secret,
+            x25519_public,
+            kyber_public,
+            kyber_secret,
+        }
     }
 }
 
@@ -76,7 +84,12 @@ impl SymmetricSessionState {
     }
 
     /// Try decrypting using skip dictionary or fast-forwarding the ratchet
-    pub fn try_decrypt(&mut self, seq_no: u64, nonce: &XNonce, ciphertext: &[u8]) -> Option<Vec<u8>> {
+    pub fn try_decrypt(
+        &mut self,
+        seq_no: u64,
+        nonce: &XNonce,
+        ciphertext: &[u8],
+    ) -> Option<Vec<u8>> {
         if seq_no < self.recv_count {
             if let Some(key) = self.skip_dict.remove(&seq_no) {
                 let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
@@ -93,7 +106,7 @@ impl SymmetricSessionState {
 
         let mut test_chain = self.chain_key;
         let mut skipped_keys = Vec::new();
-        
+
         let mut msg_key = [0u8; 32];
         for _ in self.recv_count..=seq_no {
             let mut mac = <HmacSha256 as Mac>::new_from_slice(&test_chain).unwrap();
@@ -129,7 +142,8 @@ impl SymmetricSessionState {
         inject_input.extend_from_slice(&self.chain_key);
         inject_input.extend_from_slice(pq_secret_bytes);
         let hkdf = Hkdf::<Sha256>::new(None, &inject_input);
-        hkdf.expand(b"pq-ratchet-inject", &mut self.chain_key).unwrap();
+        hkdf.expand(b"pq-ratchet-inject", &mut self.chain_key)
+            .unwrap();
     }
 }
 
@@ -176,23 +190,28 @@ impl Client {
         (client_ephemeral_secret, packet)
     }
 
-    pub fn complete_handshake(&mut self, client_secret: EphemeralSecret, server_ed25519_pub: &VerifyingKey, response: &[u8]) -> Result<()> {
+    pub fn complete_handshake(
+        &mut self,
+        client_secret: EphemeralSecret,
+        server_ed25519_pub: &VerifyingKey,
+        response: &[u8],
+    ) -> Result<()> {
         if response.len() < 1 + 4 + 32 + 64 || response[0] != TYPE_HANDSHAKE_RESP {
             return Err(anyhow!("Invalid handshake response"));
         }
         let mut server_eph_pub_bytes = [0u8; 32];
         server_eph_pub_bytes.copy_from_slice(&response[5..37]);
         let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
-        
+
         let mut signature_bytes = [0u8; 64];
         signature_bytes.copy_from_slice(&response[37..101]);
         let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-        
+
         let client_pub = X25519PublicKey::from(&client_secret);
         let mut msg = Vec::new();
         msg.extend_from_slice(client_pub.as_bytes());
         msg.extend_from_slice(server_eph_pub.as_bytes());
-        
+
         server_ed25519_pub.verify(&msg, &signature)?;
 
         let shared_secret = client_secret.diffie_hellman(&server_eph_pub);
@@ -226,7 +245,9 @@ impl Client {
         let mut link_nonce_bytes = [0u8; 24];
         OsRng.fill_bytes(&mut link_nonce_bytes);
         let link_nonce = XNonce::from_slice(&link_nonce_bytes);
-        let link_ciphertext = link_cipher.encrypt(link_nonce, raw_udp_payload.as_ref()).unwrap();
+        let link_ciphertext = link_cipher
+            .encrypt(link_nonce, raw_udp_payload.as_ref())
+            .unwrap();
 
         let mut final_packet = vec![TYPE_DATA];
         final_packet.extend_from_slice(&self.session_id);
@@ -242,7 +263,12 @@ impl Client {
         self.wrap_link_encryption(target_token, &inner)
     }
 
-    pub fn create_session_est_packet(&self, target_token: RoutingToken, bob_x25519: &X25519PublicKey, bob_kyber: &PublicKey) -> (Vec<u8>, SymmetricSessionState) {
+    pub fn create_session_est_packet(
+        &self,
+        target_token: RoutingToken,
+        bob_x25519: &X25519PublicKey,
+        bob_kyber: &PublicKey,
+    ) -> (Vec<u8>, SymmetricSessionState) {
         // 1. Classical X25519 DH
         let alice_e2e_secret = EphemeralSecret::random_from_rng(OsRng);
         let alice_e2e_pub = X25519PublicKey::from(&alice_e2e_secret);
@@ -272,7 +298,10 @@ impl Client {
         };
 
         let est_payload = SessionEstablishPayload::generate(
-            &self.identity, target_token, kyber_ct, alice_e2e_pub,
+            &self.identity,
+            target_token,
+            kyber_ct,
+            alice_e2e_pub,
         );
         let mut inner = vec![0x04];
         inner.extend_from_slice(&est_payload.to_bytes());
@@ -284,7 +313,10 @@ impl Client {
         let alice_x25519_pub = est.eph_x25519_pub;
         let kyber_ciphertext = &est.kyber_ct;
 
-        let classical_shared_secret = self.identity.x25519_secret.diffie_hellman(&alice_x25519_pub);
+        let classical_shared_secret = self
+            .identity
+            .x25519_secret
+            .diffie_hellman(&alice_x25519_pub);
         let pq_shared_secret = decapsulate(kyber_ciphertext, &self.identity.kyber_secret);
 
         let mut hybrid_input = Vec::new();
@@ -295,7 +327,9 @@ impl Client {
         hkdf.expand(b"pqxdh-root-key", &mut root_key).unwrap();
 
         // Get peer's Kyber public key (stored during KeyExchange phase)
-        let peer_kyber = self.peer_kyber_keys.get(&est.routing_token)
+        let peer_kyber = self
+            .peer_kyber_keys
+            .get(&est.routing_token)
             .map(|k| PublicKey::from_bytes(k.as_bytes()).unwrap());
 
         let session_state = SymmetricSessionState {
@@ -308,15 +342,24 @@ impl Client {
         };
         self.e2e_sessions.insert(est.routing_token, session_state);
         self.save();
-        println!(">> E2E Session established with {}!", hex::encode(&est.routing_token[0..4]));
+        println!(
+            ">> E2E Session established with {}!",
+            hex::encode(&est.routing_token[0..4])
+        );
     }
 
     /// Encrypt a message. Returns (message_packet, optional_pq_inject_packet).
     /// Every PQ_INJECT_INTERVAL messages, a PQ inject packet is generated automatically.
-    pub fn create_encrypted_packet(&mut self, target_token: RoutingToken, plaintext: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    pub fn create_encrypted_packet(
+        &mut self,
+        target_token: RoutingToken,
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
         // Phase 1: encrypt the message and check if PQ inject is needed (mutable borrow on session)
         let (full_e2e_payload, pq_ct) = {
-            let session = self.e2e_sessions.get_mut(&target_token)
+            let session = self
+                .e2e_sessions
+                .get_mut(&target_token)
                 .ok_or(anyhow!("No E2E session established!"))?;
 
             let message_key = session.symmetric_ratchet();
@@ -340,7 +383,10 @@ impl Client {
                 if let Some(ref peer_kyber) = session.peer_kyber_pub {
                     let (pq_secret, kyber_ct) = encapsulate(peer_kyber);
                     session.inject_pq_secret(pq_secret.as_bytes());
-                    println!(">> [PQ] Injected post-quantum entropy after {} messages", session.send_count);
+                    println!(
+                        ">> [PQ] Injected post-quantum entropy after {} messages",
+                        session.send_count
+                    );
                     Some(kyber_ct)
                 } else {
                     None
@@ -368,12 +414,15 @@ impl Client {
     }
 
     pub fn handle_incoming_packet(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>> {
-        if payload.is_empty() { return Ok(None); }
+        if payload.is_empty() {
+            return Ok(None);
+        }
         let pkt_type = payload[0];
         let pkt_data = &payload[1..];
 
         match pkt_type {
-            0x01 => { // Msg
+            0x01 => {
+                // Msg
                 if pkt_data.len() < 32 {
                     return Err(anyhow!("Msg payload too small"));
                 }
@@ -393,22 +442,36 @@ impl Client {
 
                 if let Some((token, pt)) = decrypted {
                     self.save();
-                    println!(">> [From {}]: {}", hex::encode(&token[0..4]), String::from_utf8_lossy(&pt));
+                    println!(
+                        ">> [From {}]: {}",
+                        hex::encode(&token[0..4]),
+                        String::from_utf8_lossy(&pt)
+                    );
                 } else {
-                    println!(">> Received packet but couldn't decrypt. E2E session not found or out of sync.");
+                    println!(
+                        ">> Received packet but couldn't decrypt. E2E session not found or out of sync."
+                    );
                 }
                 Ok(None)
-            },
-            0x02 => { // KeyExchange
+            }
+            0x02 => {
+                // KeyExchange
                 if let Ok(kx) = KeyExchangePayload::from_bytes(pkt_data) {
                     if kx.verify().is_ok() {
                         if kx.target_token != self.identity.routing_token {
-                            println!(">> [SECURITY ALERT] Dropped KeyExchange! It was bound to a different target.");
+                            println!(
+                                ">> [SECURITY ALERT] Dropped KeyExchange! It was bound to a different target."
+                            );
                             return Ok(None);
                         }
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
                         if (now as i64 - kx.timestamp as i64).abs() > 300 {
-                            println!(">> [SECURITY ALERT] Dropped KeyExchange! Timestamp is stale or from the future.");
+                            println!(
+                                ">> [SECURITY ALERT] Dropped KeyExchange! Timestamp is stale or from the future."
+                            );
                             return Ok(None);
                         }
 
@@ -416,22 +479,38 @@ impl Client {
                         let is_initiator = self.pending_contacts.contains_key(&peer_token);
 
                         // Store peer's Kyber key for future PQ injections
-                        self.peer_kyber_keys.insert(peer_token, PublicKey::from_bytes(kx.kyber_public.as_bytes()).unwrap());
+                        self.peer_kyber_keys.insert(
+                            peer_token,
+                            PublicKey::from_bytes(kx.kyber_public.as_bytes()).unwrap(),
+                        );
 
                         if is_initiator {
                             let expected_ed25519 = self.pending_contacts.get(&peer_token).unwrap();
                             if kx.ed25519_public.as_bytes() != expected_ed25519.as_bytes() {
-                                println!(">> [SECURITY ALERT] KeyExchange from {} failed QR code verification!", hex::encode(&peer_token[0..4]));
+                                println!(
+                                    ">> [SECURITY ALERT] KeyExchange from {} failed QR code verification!",
+                                    hex::encode(&peer_token[0..4])
+                                );
                                 return Ok(None);
                             }
                             println!(">> Verified Bob's keys against QR code!");
 
-                            let (est_packet, session) = self.create_session_est_packet(peer_token, &kx.x25519_public, &kx.kyber_public);
+                            let (est_packet, session) = self.create_session_est_packet(
+                                peer_token,
+                                &kx.x25519_public,
+                                &kx.kyber_public,
+                            );
                             self.e2e_sessions.insert(peer_token, session);
-                            println!(">> E2E Session established with {}!", hex::encode(&peer_token[0..4]));
+                            println!(
+                                ">> E2E Session established with {}!",
+                                hex::encode(&peer_token[0..4])
+                            );
                             return Ok(Some(est_packet));
                         } else {
-                            println!(">> [SECURITY WARNING: Unverified Contact] Received connection request from {}. Auto-accepting for demo...", hex::encode(&peer_token[0..4]));
+                            println!(
+                                ">> [SECURITY WARNING: Unverified Contact] Received connection request from {}. Auto-accepting for demo...",
+                                hex::encode(&peer_token[0..4])
+                            );
                             self.pending_contacts.insert(peer_token, kx.ed25519_public);
                             let reply_packet = self.create_kx_request(peer_token);
                             return Ok(Some(reply_packet));
@@ -441,20 +520,30 @@ impl Client {
                     }
                 }
                 Ok(None)
-            },
-            0x04 => { // SessionEstablish
+            }
+            0x04 => {
+                // SessionEstablish
                 if let Ok(est) = SessionEstablishPayload::from_bytes(pkt_data) {
                     if !self.seen_session_keys.insert(est.eph_x25519_pub.to_bytes()) {
-                        println!(">> [SECURITY ALERT] Dropped SessionEstablish! Replay detected (key already seen).");
+                        println!(
+                            ">> [SECURITY ALERT] Dropped SessionEstablish! Replay detected (key already seen)."
+                        );
                         return Ok(None);
                     }
                     if est.target_token != self.identity.routing_token {
-                        println!(">> [SECURITY ALERT] Dropped SessionEstablish! Bound to different target.");
+                        println!(
+                            ">> [SECURITY ALERT] Dropped SessionEstablish! Bound to different target."
+                        );
                         return Ok(None);
                     }
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
                     if (now as i64 - est.timestamp as i64).abs() > 300 {
-                        println!(">> [SECURITY ALERT] Dropped SessionEstablish! Timestamp is stale.");
+                        println!(
+                            ">> [SECURITY ALERT] Dropped SessionEstablish! Timestamp is stale."
+                        );
                         return Ok(None);
                     }
                     if let Some(alice_pub) = self.pending_contacts.get(&est.routing_token) {
@@ -464,18 +553,24 @@ impl Client {
                             println!(">> [SECURITY ALERT] SessionEstablish signature invalid!");
                         }
                     } else {
-                         println!(">> Received SessionEstablish but no pending contact found.");
+                        println!(">> Received SessionEstablish but no pending contact found.");
                     }
                 }
                 Ok(None)
-            },
-            0x05 => { // PQ Inject
+            }
+            0x05 => {
+                // PQ Inject
                 if let Ok(pqi) = PQInjectPayload::from_bytes(pkt_data) {
                     if pqi.target_token != self.identity.routing_token {
-                        println!(">> [SECURITY ALERT] Dropped PQInject! Bound to different target.");
+                        println!(
+                            ">> [SECURITY ALERT] Dropped PQInject! Bound to different target."
+                        );
                         return Ok(None);
                     }
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
                     if (now as i64 - pqi.timestamp as i64).abs() > 300 {
                         println!(">> [SECURITY ALERT] Dropped PQInject! Timestamp is stale.");
                         return Ok(None);
@@ -486,9 +581,14 @@ impl Client {
                             let pq_secret = decapsulate(&pqi.kyber_ct, &self.identity.kyber_secret);
                             if let Some(session) = self.e2e_sessions.get_mut(&pqi.routing_token) {
                                 session.inject_pq_secret(pq_secret.as_bytes());
-                                println!(">> [PQ] Received and injected post-quantum entropy from {}!", hex::encode(&pqi.routing_token[0..4]));
+                                println!(
+                                    ">> [PQ] Received and injected post-quantum entropy from {}!",
+                                    hex::encode(&pqi.routing_token[0..4])
+                                );
                             } else {
-                                println!(">> PQInject received but no active session for this peer.");
+                                println!(
+                                    ">> PQInject received but no active session for this peer."
+                                );
                             }
                         } else {
                             println!(">> [SECURITY ALERT] PQInject signature invalid!");
@@ -498,8 +598,8 @@ impl Client {
                     }
                 }
                 Ok(None)
-            },
-            _ => Ok(None)
+            }
+            _ => Ok(None),
         }
     }
 }
@@ -521,7 +621,7 @@ async fn main() -> Result<()> {
     let server_pub = VerifyingKey::from_bytes(&arr).expect("Invalid server verifying key");
 
     let server_addr: SocketAddr = "127.0.0.1:4430".parse()?;
-    
+
     let client_obj = match ClientStateDto::load("client_state.json") {
         Ok(c) => {
             println!("Loaded client state from disk.");
@@ -529,7 +629,7 @@ async fn main() -> Result<()> {
         }
         Err(_) => Client::new(server_addr),
     };
-    
+
     let client = Arc::new(Mutex::new(client_obj));
 
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -539,11 +639,14 @@ async fn main() -> Result<()> {
         let mut c = client.lock().await;
         let (client_secret, hs_packet) = c.generate_handshake_packet();
         socket.send_to(&hs_packet, server_addr).await?;
-        
+
         let mut resp_buf = [0u8; 1024];
         let (len, _) = socket.recv_from(&mut resp_buf).await?;
         c.complete_handshake(client_secret, &server_pub, &resp_buf[..len])?;
-        println!("Completed Server Link Handshake! Session ID: {}", hex::encode(c.session_id));
+        println!(
+            "Completed Server Link Handshake! Session ID: {}",
+            hex::encode(c.session_id)
+        );
         c.save();
 
         let sync_packet = c.generate_sync_packet();
@@ -552,7 +655,10 @@ async fn main() -> Result<()> {
 
         println!("=== MY IDENTITY ===");
         println!("Token:   {}", hex::encode(c.identity.routing_token));
-        println!("Ed25519: {}", hex::encode(c.identity.ed25519_public.as_bytes()));
+        println!(
+            "Ed25519: {}",
+            hex::encode(c.identity.ed25519_public.as_bytes())
+        );
         println!("===================");
     }
 
@@ -587,7 +693,9 @@ async fn main() -> Result<()> {
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = stdin.next_line().await {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() { continue; }
+        if parts.is_empty() {
+            continue;
+        }
 
         match parts[0] {
             "connect" => {
@@ -607,7 +715,7 @@ async fn main() -> Result<()> {
                 let req_packet = c.create_kx_request(token);
                 socket.send_to(&req_packet, server_addr).await.unwrap();
                 println!("Sent connection request! Waiting for Bob...");
-            },
+            }
             "msg" => {
                 if parts.len() < 3 {
                     println!("Usage: msg <token> <text...>");
@@ -626,10 +734,10 @@ async fn main() -> Result<()> {
                             socket.send_to(&pq_pkt, server_addr).await.unwrap();
                             println!("Sent PQ ratchet injection packet!");
                         }
-                    },
+                    }
                     Err(e) => println!("Error: {}", e),
                 }
-            },
+            }
             _ => println!("Unknown command"),
         }
     }
@@ -680,7 +788,8 @@ mod tests {
         let eph_sec = EphemeralSecret::random_from_rng(OsRng);
         let eph_pub = X25519PublicKey::from(&eph_sec);
         let (_ks, kyber_ct) = encapsulate(&bob_id.kyber_public);
-        let est = SessionEstablishPayload::generate(&alice_id, bob_id.routing_token, kyber_ct, eph_pub);
+        let est =
+            SessionEstablishPayload::generate(&alice_id, bob_id.routing_token, kyber_ct, eph_pub);
         let bytes = est.to_bytes();
         assert_eq!(bytes.len(), 1224);
         let parsed = SessionEstablishPayload::from_bytes(&bytes).unwrap();
@@ -749,7 +858,8 @@ mod tests {
         let eph_sec = EphemeralSecret::random_from_rng(OsRng);
         let eph_pub = X25519PublicKey::from(&eph_sec);
         let (_, kyber_ct) = encapsulate(&bob_id.kyber_public);
-        let est = SessionEstablishPayload::generate(&alice_id, bob_id.routing_token, kyber_ct, eph_pub);
+        let est =
+            SessionEstablishPayload::generate(&alice_id, bob_id.routing_token, kyber_ct, eph_pub);
         let mut bytes = est.to_bytes();
         bytes[1200] ^= 0x01;
         let parsed = SessionEstablishPayload::from_bytes(&bytes).unwrap();
@@ -775,7 +885,8 @@ mod tests {
         let eph_sec = EphemeralSecret::random_from_rng(OsRng);
         let eph_pub = X25519PublicKey::from(&eph_sec);
         let (_, kyber_ct) = encapsulate(&bob_id.kyber_public);
-        let est = SessionEstablishPayload::generate(&alice_id, bob_id.routing_token, kyber_ct, eph_pub);
+        let est =
+            SessionEstablishPayload::generate(&alice_id, bob_id.routing_token, kyber_ct, eph_pub);
         let bytes = est.to_bytes();
         let parsed = SessionEstablishPayload::from_bytes(&bytes).unwrap();
         assert!(parsed.verify(&bob_id.ed25519_public).is_err());
@@ -801,7 +912,10 @@ mod tests {
     fn test_edge_case_timestamp_expiration() {
         let alice_id = UserIdentity::generate();
         let mut payload = KeyExchangePayload::generate(&alice_id, [0u8; 16]);
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         payload.timestamp = now - 600;
         let time_diff = (now as i64 - payload.timestamp as i64).abs();
         assert!(time_diff > 300);
@@ -824,8 +938,22 @@ mod tests {
 
     #[test]
     fn test_symmetric_ratchet_multiple_messages() {
-        let mut alice_state = SymmetricSessionState { root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() };
-        let mut bob_state = SymmetricSessionState { root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() };
+        let mut alice_state = SymmetricSessionState {
+            root_key: [0x42u8; 32],
+            chain_key: [0x42u8; 32],
+            send_count: 0,
+            peer_kyber_pub: None,
+            recv_count: 0,
+            skip_dict: std::collections::HashMap::new(),
+        };
+        let mut bob_state = SymmetricSessionState {
+            root_key: [0x42u8; 32],
+            chain_key: [0x42u8; 32],
+            send_count: 0,
+            peer_kyber_pub: None,
+            recv_count: 0,
+            skip_dict: std::collections::HashMap::new(),
+        };
         for i in 0..10 {
             let alice_mk = alice_state.symmetric_ratchet();
             let bob_mk = bob_state.symmetric_ratchet();
@@ -836,7 +964,14 @@ mod tests {
 
     #[test]
     fn test_symmetric_ratchet_produces_unique_keys() {
-        let mut state = SymmetricSessionState { root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() };
+        let mut state = SymmetricSessionState {
+            root_key: [0x42u8; 32],
+            chain_key: [0x42u8; 32],
+            send_count: 0,
+            peer_kyber_pub: None,
+            recv_count: 0,
+            skip_dict: std::collections::HashMap::new(),
+        };
         let mut seen_keys = std::collections::HashSet::new();
         for _ in 0..100 {
             let mk = state.symmetric_ratchet();
@@ -850,13 +985,43 @@ mod tests {
         let mut alice = Client::new(server_addr);
         let mut bob = Client::new(server_addr);
         let root_key = [0x42u8; 32];
-        alice.e2e_sessions.insert(bob.identity.routing_token, SymmetricSessionState { root_key, chain_key: root_key, send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() });
-        bob.e2e_sessions.insert(alice.identity.routing_token, SymmetricSessionState { root_key, chain_key: root_key, send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() });
-        let (packet, _pq) = alice.create_encrypted_packet(bob.identity.routing_token, b"Hello Bob!").unwrap();
+        alice.e2e_sessions.insert(
+            bob.identity.routing_token,
+            SymmetricSessionState {
+                root_key,
+                chain_key: root_key,
+                send_count: 0,
+                peer_kyber_pub: None,
+                recv_count: 0,
+                skip_dict: std::collections::HashMap::new(),
+            },
+        );
+        bob.e2e_sessions.insert(
+            alice.identity.routing_token,
+            SymmetricSessionState {
+                root_key,
+                chain_key: root_key,
+                send_count: 0,
+                peer_kyber_pub: None,
+                recv_count: 0,
+                skip_dict: std::collections::HashMap::new(),
+            },
+        );
+        let (packet, _pq) = alice
+            .create_encrypted_packet(bob.identity.routing_token, b"Hello Bob!")
+            .unwrap();
         let inner = strip_link(&packet, &alice.link_master_key);
         bob.handle_incoming_packet(&inner).unwrap();
-        let a_ck = alice.e2e_sessions.get(&bob.identity.routing_token).unwrap().chain_key;
-        let b_ck = bob.e2e_sessions.get(&alice.identity.routing_token).unwrap().chain_key;
+        let a_ck = alice
+            .e2e_sessions
+            .get(&bob.identity.routing_token)
+            .unwrap()
+            .chain_key;
+        let b_ck = bob
+            .e2e_sessions
+            .get(&alice.identity.routing_token)
+            .unwrap()
+            .chain_key;
         assert_eq!(a_ck, b_ck);
     }
 
@@ -870,29 +1035,52 @@ mod tests {
         let mut alice = Client::new(server_addr);
         let bob_id = UserIdentity::generate();
         let bob_kyber_copy = PublicKey::from_bytes(bob_id.kyber_public.as_bytes()).unwrap();
-        alice.e2e_sessions.insert(bob_id.routing_token, SymmetricSessionState {
-            root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, recv_count: 0, skip_dict: std::collections::HashMap::new(),
-            peer_kyber_pub: Some(bob_kyber_copy),
-        });
+        alice.e2e_sessions.insert(
+            bob_id.routing_token,
+            SymmetricSessionState {
+                root_key: [0x42u8; 32],
+                chain_key: [0x42u8; 32],
+                send_count: 0,
+                recv_count: 0,
+                skip_dict: std::collections::HashMap::new(),
+                peer_kyber_pub: Some(bob_kyber_copy),
+            },
+        );
 
         // Messages 1-4: no PQ inject
         for i in 0..4 {
-            let (_, pq) = alice.create_encrypted_packet(bob_id.routing_token, b"test").unwrap();
-            assert!(pq.is_none(), "PQ inject should NOT trigger at message {}", i + 1);
+            let (_, pq) = alice
+                .create_encrypted_packet(bob_id.routing_token, b"test")
+                .unwrap();
+            assert!(
+                pq.is_none(),
+                "PQ inject should NOT trigger at message {}",
+                i + 1
+            );
         }
 
         // Message 5: PQ inject triggers!
-        let (_, pq) = alice.create_encrypted_packet(bob_id.routing_token, b"test").unwrap();
+        let (_, pq) = alice
+            .create_encrypted_packet(bob_id.routing_token, b"test")
+            .unwrap();
         assert!(pq.is_some(), "PQ inject MUST trigger at message 5");
 
         // Messages 6-9: no PQ inject
         for i in 5..9 {
-            let (_, pq) = alice.create_encrypted_packet(bob_id.routing_token, b"test").unwrap();
-            assert!(pq.is_none(), "PQ inject should NOT trigger at message {}", i + 1);
+            let (_, pq) = alice
+                .create_encrypted_packet(bob_id.routing_token, b"test")
+                .unwrap();
+            assert!(
+                pq.is_none(),
+                "PQ inject should NOT trigger at message {}",
+                i + 1
+            );
         }
 
         // Message 10: PQ inject triggers again!
-        let (_, pq) = alice.create_encrypted_packet(bob_id.routing_token, b"test").unwrap();
+        let (_, pq) = alice
+            .create_encrypted_packet(bob_id.routing_token, b"test")
+            .unwrap();
         assert!(pq.is_some(), "PQ inject MUST trigger at message 10");
     }
 
@@ -901,15 +1089,25 @@ mod tests {
         let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
         let mut alice = Client::new(server_addr);
         let bob_token = [0xBB; 16];
-        alice.e2e_sessions.insert(bob_token, SymmetricSessionState {
-            root_key: [0x42u8; 32], chain_key: [0x42u8; 32], send_count: 0, recv_count: 0, skip_dict: std::collections::HashMap::new(),
-            peer_kyber_pub: None, // No Kyber key!
-        });
+        alice.e2e_sessions.insert(
+            bob_token,
+            SymmetricSessionState {
+                root_key: [0x42u8; 32],
+                chain_key: [0x42u8; 32],
+                send_count: 0,
+                recv_count: 0,
+                skip_dict: std::collections::HashMap::new(),
+                peer_kyber_pub: None, // No Kyber key!
+            },
+        );
 
         // Even at message 5, no PQ inject because no peer Kyber key
         for _ in 0..10 {
             let (_, pq) = alice.create_encrypted_packet(bob_token, b"test").unwrap();
-            assert!(pq.is_none(), "PQ inject must NOT trigger without peer Kyber key");
+            assert!(
+                pq.is_none(),
+                "PQ inject must NOT trigger without peer Kyber key"
+            );
         }
     }
 
@@ -921,24 +1119,45 @@ mod tests {
         let mut bob = Client::new(server_addr);
 
         // Set up sessions with each other's Kyber keys
-        let alice_kyber_copy = PublicKey::from_bytes(alice.identity.kyber_public.as_bytes()).unwrap();
+        let alice_kyber_copy =
+            PublicKey::from_bytes(alice.identity.kyber_public.as_bytes()).unwrap();
         let bob_kyber_copy = PublicKey::from_bytes(bob.identity.kyber_public.as_bytes()).unwrap();
         let root_key = [0x42u8; 32];
 
-        alice.e2e_sessions.insert(bob.identity.routing_token, SymmetricSessionState {
-            root_key, chain_key: root_key, send_count: 0, recv_count: 0, skip_dict: std::collections::HashMap::new(),
-            peer_kyber_pub: Some(bob_kyber_copy),
-        });
-        bob.e2e_sessions.insert(alice.identity.routing_token, SymmetricSessionState {
-            root_key, chain_key: root_key, send_count: 0, recv_count: 0, skip_dict: std::collections::HashMap::new(),
-            peer_kyber_pub: Some(alice_kyber_copy),
-        });
+        alice.e2e_sessions.insert(
+            bob.identity.routing_token,
+            SymmetricSessionState {
+                root_key,
+                chain_key: root_key,
+                send_count: 0,
+                recv_count: 0,
+                skip_dict: std::collections::HashMap::new(),
+                peer_kyber_pub: Some(bob_kyber_copy),
+            },
+        );
+        bob.e2e_sessions.insert(
+            alice.identity.routing_token,
+            SymmetricSessionState {
+                root_key,
+                chain_key: root_key,
+                send_count: 0,
+                recv_count: 0,
+                skip_dict: std::collections::HashMap::new(),
+                peer_kyber_pub: Some(alice_kyber_copy),
+            },
+        );
         // Bob needs Alice in pending_contacts for PQ inject verification
-        bob.pending_contacts.insert(alice.identity.routing_token, alice.identity.ed25519_public);
+        bob.pending_contacts
+            .insert(alice.identity.routing_token, alice.identity.ed25519_public);
 
         // Alice sends 5 messages (triggers PQ inject on 5th)
         for i in 0..5 {
-            let (msg_pkt, pq_pkt) = alice.create_encrypted_packet(bob.identity.routing_token, format!("msg {}", i+1).as_bytes()).unwrap();
+            let (msg_pkt, pq_pkt) = alice
+                .create_encrypted_packet(
+                    bob.identity.routing_token,
+                    format!("msg {}", i + 1).as_bytes(),
+                )
+                .unwrap();
 
             // Bob receives the message
             let inner = strip_link(&msg_pkt, &alice.link_master_key);
@@ -952,8 +1171,16 @@ mod tests {
         }
 
         // Chain keys MUST still be in sync after the PQ injection
-        let a_ck = alice.e2e_sessions.get(&bob.identity.routing_token).unwrap().chain_key;
-        let b_ck = bob.e2e_sessions.get(&alice.identity.routing_token).unwrap().chain_key;
+        let a_ck = alice
+            .e2e_sessions
+            .get(&bob.identity.routing_token)
+            .unwrap()
+            .chain_key;
+        let b_ck = bob
+            .e2e_sessions
+            .get(&alice.identity.routing_token)
+            .unwrap()
+            .chain_key;
         assert_eq!(a_ck, b_ck, "Chain keys must be in sync after PQ injection!");
     }
 
@@ -966,33 +1193,65 @@ mod tests {
         let bob_kyber_copy = PublicKey::from_bytes(bob_id.kyber_public.as_bytes()).unwrap();
         let root_key = [0x42u8; 32];
 
-        alice.e2e_sessions.insert(bob_id.routing_token, SymmetricSessionState {
-            root_key, chain_key: root_key, send_count: 0, recv_count: 0, skip_dict: std::collections::HashMap::new(),
-            peer_kyber_pub: Some(bob_kyber_copy),
-        });
+        alice.e2e_sessions.insert(
+            bob_id.routing_token,
+            SymmetricSessionState {
+                root_key,
+                chain_key: root_key,
+                send_count: 0,
+                recv_count: 0,
+                skip_dict: std::collections::HashMap::new(),
+                peer_kyber_pub: Some(bob_kyber_copy),
+            },
+        );
 
         // Record chain key after 4th message (before PQ inject)
         for _ in 0..4 {
-            alice.create_encrypted_packet(bob_id.routing_token, b"test").unwrap();
+            alice
+                .create_encrypted_packet(bob_id.routing_token, b"test")
+                .unwrap();
         }
-        let chain_before_pq = alice.e2e_sessions.get(&bob_id.routing_token).unwrap().chain_key;
+        let chain_before_pq = alice
+            .e2e_sessions
+            .get(&bob_id.routing_token)
+            .unwrap()
+            .chain_key;
 
         // Send 5th message (triggers PQ inject)
-        let (_, pq) = alice.create_encrypted_packet(bob_id.routing_token, b"test").unwrap();
+        let (_, pq) = alice
+            .create_encrypted_packet(bob_id.routing_token, b"test")
+            .unwrap();
         assert!(pq.is_some());
 
-        let chain_after_pq = alice.e2e_sessions.get(&bob_id.routing_token).unwrap().chain_key;
+        let chain_after_pq = alice
+            .e2e_sessions
+            .get(&bob_id.routing_token)
+            .unwrap()
+            .chain_key;
 
         // The chain key must be different from what a pure hash ratchet would produce
         // (because the PQ secret was mixed in)
-        assert_ne!(chain_before_pq, chain_after_pq, "PQ inject must change the chain key");
+        assert_ne!(
+            chain_before_pq, chain_after_pq,
+            "PQ inject must change the chain key"
+        );
 
         // Also verify it's not just a normal ratchet step by comparing to a no-PQ ratchet
-        let mut no_pq_state = SymmetricSessionState { root_key, chain_key: root_key, send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new() };
+        let mut no_pq_state = SymmetricSessionState {
+            root_key,
+            chain_key: root_key,
+            send_count: 0,
+            peer_kyber_pub: None,
+            recv_count: 0,
+            skip_dict: std::collections::HashMap::new(),
+        };
         for _ in 0..5 {
             no_pq_state.symmetric_ratchet();
         }
-        assert_ne!(chain_after_pq, no_pq_state.chain_key, "PQ-injected chain must differ from non-PQ chain");
+        assert_ne!(
+            chain_after_pq, no_pq_state.chain_key,
+            "PQ-injected chain must differ from non-PQ chain"
+        );
     }
 
     // ==========================================
@@ -1006,7 +1265,9 @@ mod tests {
         let mut bob = Client::new(server_addr);
 
         // Step 0: Alice "scans" Bob's QR code
-        alice.pending_contacts.insert(bob.identity.routing_token, bob.identity.ed25519_public);
+        alice
+            .pending_contacts
+            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
 
         // Step 1: Alice sends KeyExchange to Bob
         let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token);
@@ -1014,7 +1275,10 @@ mod tests {
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap();
         assert!(bob_reply.is_some());
-        assert!(bob.pending_contacts.contains_key(&alice.identity.routing_token));
+        assert!(
+            bob.pending_contacts
+                .contains_key(&alice.identity.routing_token)
+        );
 
         // Step 2: Alice receives Bob's KeyExchange reply
         let inner = strip_link(&bob_reply.unwrap(), &bob.link_master_key);
@@ -1035,8 +1299,14 @@ mod tests {
         assert_eq!(a_sess.chain_key, b_sess.chain_key);
 
         // Verify both sessions have peer Kyber keys for future PQ injections
-        assert!(a_sess.peer_kyber_pub.is_some(), "Alice must have Bob's Kyber key");
-        assert!(b_sess.peer_kyber_pub.is_some(), "Bob must have Alice's Kyber key");
+        assert!(
+            a_sess.peer_kyber_pub.is_some(),
+            "Alice must have Bob's Kyber key"
+        );
+        assert!(
+            b_sess.peer_kyber_pub.is_some(),
+            "Bob must have Alice's Kyber key"
+        );
     }
 
     #[test]
@@ -1047,7 +1317,9 @@ mod tests {
         let mut bob = Client::new(server_addr);
 
         // Handshake
-        alice.pending_contacts.insert(bob.identity.routing_token, bob.identity.ed25519_public);
+        alice
+            .pending_contacts
+            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
         let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token);
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
@@ -1059,7 +1331,12 @@ mod tests {
 
         // Send 5 messages with PQ inject at #5
         for i in 0..5 {
-            let (msg_pkt, pq_pkt) = alice.create_encrypted_packet(bob.identity.routing_token, format!("Hello {}", i+1).as_bytes()).unwrap();
+            let (msg_pkt, pq_pkt) = alice
+                .create_encrypted_packet(
+                    bob.identity.routing_token,
+                    format!("Hello {}", i + 1).as_bytes(),
+                )
+                .unwrap();
             let msg_inner = strip_link(&msg_pkt, &alice.link_master_key);
             bob.handle_incoming_packet(&msg_inner).unwrap();
             if let Some(pq) = pq_pkt {
@@ -1070,17 +1347,35 @@ mod tests {
         }
 
         // Verify chain keys still in sync
-        let a_ck = alice.e2e_sessions.get(&bob.identity.routing_token).unwrap().chain_key;
-        let b_ck = bob.e2e_sessions.get(&alice.identity.routing_token).unwrap().chain_key;
+        let a_ck = alice
+            .e2e_sessions
+            .get(&bob.identity.routing_token)
+            .unwrap()
+            .chain_key;
+        let b_ck = bob
+            .e2e_sessions
+            .get(&alice.identity.routing_token)
+            .unwrap()
+            .chain_key;
         assert_eq!(a_ck, b_ck, "Chain keys must match after 5 msgs + PQ inject");
 
         // Send message 6 to prove the session still works
-        let (msg6, _) = alice.create_encrypted_packet(bob.identity.routing_token, b"Post-PQ message").unwrap();
+        let (msg6, _) = alice
+            .create_encrypted_packet(bob.identity.routing_token, b"Post-PQ message")
+            .unwrap();
         let msg6_inner = strip_link(&msg6, &alice.link_master_key);
         bob.handle_incoming_packet(&msg6_inner).unwrap();
 
-        let a_ck2 = alice.e2e_sessions.get(&bob.identity.routing_token).unwrap().chain_key;
-        let b_ck2 = bob.e2e_sessions.get(&alice.identity.routing_token).unwrap().chain_key;
+        let a_ck2 = alice
+            .e2e_sessions
+            .get(&bob.identity.routing_token)
+            .unwrap()
+            .chain_key;
+        let b_ck2 = bob
+            .e2e_sessions
+            .get(&alice.identity.routing_token)
+            .unwrap()
+            .chain_key;
         assert_eq!(a_ck2, b_ck2, "Chain keys must match after post-PQ message");
     }
 
@@ -1094,12 +1389,18 @@ mod tests {
         let mut bob = Client::new(server_addr);
         let alice_id = UserIdentity::generate();
         let mallory_id = UserIdentity::generate();
-        bob.pending_contacts.insert(alice_id.routing_token, alice_id.ed25519_public);
+        bob.pending_contacts
+            .insert(alice_id.routing_token, alice_id.ed25519_public);
 
         let eph_sec = EphemeralSecret::random_from_rng(OsRng);
         let eph_pub = X25519PublicKey::from(&eph_sec);
         let (_, kyber_ct) = encapsulate(&bob.identity.kyber_public);
-        let mut est = SessionEstablishPayload::generate(&mallory_id, bob.identity.routing_token, kyber_ct, eph_pub);
+        let mut est = SessionEstablishPayload::generate(
+            &mallory_id,
+            bob.identity.routing_token,
+            kyber_ct,
+            eph_pub,
+        );
         est.routing_token = alice_id.routing_token;
         let mut inner = vec![0x04];
         inner.extend_from_slice(&est.to_bytes());
@@ -1115,7 +1416,12 @@ mod tests {
         let eph_sec = EphemeralSecret::random_from_rng(OsRng);
         let eph_pub = X25519PublicKey::from(&eph_sec);
         let (_, kyber_ct) = encapsulate(&bob.identity.kyber_public);
-        let est = SessionEstablishPayload::generate(&alice_id, bob.identity.routing_token, kyber_ct, eph_pub);
+        let est = SessionEstablishPayload::generate(
+            &alice_id,
+            bob.identity.routing_token,
+            kyber_ct,
+            eph_pub,
+        );
         let mut inner = vec![0x04];
         inner.extend_from_slice(&est.to_bytes());
         bob.handle_incoming_packet(&inner).unwrap();
@@ -1131,11 +1437,24 @@ mod tests {
         let mallory_id = UserIdentity::generate();
 
         // Bob has Alice in pending contacts and an active session
-        bob.pending_contacts.insert(alice_id.routing_token, alice_id.ed25519_public);
-        bob.e2e_sessions.insert(alice_id.routing_token, SymmetricSessionState {
-            root_key: [0x42; 32], chain_key: [0x42; 32], send_count: 0, peer_kyber_pub: None, recv_count: 0, skip_dict: std::collections::HashMap::new()
-        });
-        let chain_before = bob.e2e_sessions.get(&alice_id.routing_token).unwrap().chain_key;
+        bob.pending_contacts
+            .insert(alice_id.routing_token, alice_id.ed25519_public);
+        bob.e2e_sessions.insert(
+            alice_id.routing_token,
+            SymmetricSessionState {
+                root_key: [0x42; 32],
+                chain_key: [0x42; 32],
+                send_count: 0,
+                peer_kyber_pub: None,
+                recv_count: 0,
+                skip_dict: std::collections::HashMap::new(),
+            },
+        );
+        let chain_before = bob
+            .e2e_sessions
+            .get(&alice_id.routing_token)
+            .unwrap()
+            .chain_key;
 
         // Mallory signs PQ inject with her own key but spoofs Alice's routing token
         let (_, kyber_ct) = encapsulate(&bob.identity.kyber_public);
@@ -1147,7 +1466,14 @@ mod tests {
         bob.handle_incoming_packet(&inner).unwrap();
 
         // Chain key must NOT have changed
-        let chain_after = bob.e2e_sessions.get(&alice_id.routing_token).unwrap().chain_key;
-        assert_eq!(chain_before, chain_after, "Forged PQ inject must NOT modify chain key");
+        let chain_after = bob
+            .e2e_sessions
+            .get(&alice_id.routing_token)
+            .unwrap()
+            .chain_key;
+        assert_eq!(
+            chain_before, chain_after,
+            "Forged PQ inject must NOT modify chain key"
+        );
     }
 }

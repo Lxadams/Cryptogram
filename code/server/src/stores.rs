@@ -65,7 +65,13 @@ impl Tables {
         self.active_links.get(session_id)
     }
 
-    pub fn update_metadata(&mut self, token: RoutingToken, addr: SocketAddr, session_id: SessionId, ttl: Duration) {
+    pub fn update_metadata(
+        &mut self,
+        token: RoutingToken,
+        addr: SocketAddr,
+        session_id: SessionId,
+        ttl: Duration,
+    ) {
         self.metadata.insert(
             token,
             MetadataEntry {
@@ -76,7 +82,12 @@ impl Tables {
         );
     }
 
-    pub fn enqueue_message(&mut self, receiver_token: RoutingToken, payload: Vec<u8>, ttl: Duration) {
+    pub fn enqueue_message(
+        &mut self,
+        receiver_token: RoutingToken,
+        payload: Vec<u8>,
+        ttl: Duration,
+    ) {
         self.outbound_queue.push_back(OutboundMessage {
             receiver_token,
             payload,

@@ -1,9 +1,8 @@
 use anyhow::{Result, anyhow};
-use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use ed25519_dalek::{SigningKey, Signer};
-use x25519_dalek::PublicKey as X25519PublicKey;
 use std::{
     collections::HashSet,
     net::SocketAddr,
@@ -12,6 +11,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 use tracing::{error, info};
+use x25519_dalek::PublicKey as X25519PublicKey;
 mod stores;
 
 use crate::stores::{RoutingToken, SessionId, Tables};
@@ -24,7 +24,7 @@ const SWEEPING_TASK_INTERVAL: Duration = Duration::from_secs(120);
 // Request Types
 const TYPE_HANDSHAKE_INIT: u8 = 0;
 const TYPE_DATA: u8 = 1;
-const TYPE_HANDSHAKE_RESP: u8 = 2; 
+const TYPE_HANDSHAKE_RESP: u8 = 2;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,7 +42,10 @@ async fn main() -> Result<()> {
     // Bind to 127.0.0.1:4430 for local testing without sudo
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:4430").await?);
     info!("UDP server listening on {}", socket.local_addr()?);
-    info!("Server Static Pubkey: {}", hex::encode(server_pub.as_bytes()));
+    info!(
+        "Server Static Pubkey: {}",
+        hex::encode(server_pub.as_bytes())
+    );
 
     let tables = Arc::new(Mutex::new(Tables::new()));
 
@@ -53,16 +56,18 @@ async fn main() -> Result<()> {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
                 info!("Received {} bytes from {}", len, addr);
-                if let Err(e) = match handle_request(&tables, &server_identity, addr, &buffer[..len]) {
-                    Ok(Some(resp)) => {
-                        if let Err(send_err) = socket.send_to(&resp, addr).await {
-                            error!("Failed to send response: {}", send_err);
+                if let Err(e) =
+                    match handle_request(&tables, &server_identity, addr, &buffer[..len]) {
+                        Ok(Some(resp)) => {
+                            if let Err(send_err) = socket.send_to(&resp, addr).await {
+                                error!("Failed to send response: {}", send_err);
+                            }
+                            Ok(())
                         }
-                        Ok(())
-                    },
-                    Ok(None) => Ok(()),
-                    Err(e) => Err(e),
-                } {
+                        Ok(None) => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                {
                     error!("Request handling error from {}: {}", addr, e);
                 }
             }
@@ -91,12 +96,13 @@ fn handle_request(
             }
             let mut session_id = [0u8; 4];
             session_id.copy_from_slice(&payload[1..5]);
-            
+
             let mut pubkey_bytes = [0u8; 32];
             pubkey_bytes.copy_from_slice(&payload[5..37]);
             let client_pub = X25519PublicKey::from(pubkey_bytes);
 
-            let server_eph_secret = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
+            let server_eph_secret =
+                x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
             let server_eph_pub = X25519PublicKey::from(&server_eph_secret);
 
             let shared_secret = server_eph_secret.diffie_hellman(&client_pub);
@@ -118,7 +124,7 @@ fn handle_request(
             let mut tables = tables.lock().unwrap();
             tables.register_link(session_id, link_master_key);
             info!("Registered new link for Session ID: {:?}", session_id);
-            
+
             return Ok(Some(resp));
         }
         TYPE_DATA => {
@@ -133,7 +139,7 @@ fn handle_request(
             let mut nonce_bytes = [0u8; 24];
             nonce_bytes.copy_from_slice(&payload[5..29]);
             let nonce = XNonce::from_slice(&nonce_bytes);
-            
+
             let ciphertext = &payload[29..];
 
             let link_key = {
@@ -155,7 +161,7 @@ fn handle_request(
 
             let mut routing_token = [0u8; 16];
             routing_token.copy_from_slice(&plaintext[0..16]);
-            
+
             let inner_payload = &plaintext[16..];
 
             if inner_payload.is_empty() {
@@ -197,7 +203,9 @@ fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
     });
 }
 
-fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> (Vec<(String, Vec<u8>, SessionId)>, Vec<(String, SessionId)>) {
+fn prepare_outbound_messages(
+    tables: &Arc<Mutex<Tables>>,
+) -> (Vec<(String, Vec<u8>, SessionId)>, Vec<(String, SessionId)>) {
     let (messages, dummy_targets) = {
         let tables = tables.lock().unwrap();
         let mut sent_tokens = HashSet::new();
@@ -205,7 +213,11 @@ fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> (Vec<(String, Vec<u
 
         for message in tables.outbound_messages() {
             if let Some(metadata) = tables.get_metadata(&message.receiver_token) {
-                messages.push((metadata.incoming_addr.to_string(), message.payload, metadata.session_id));
+                messages.push((
+                    metadata.incoming_addr.to_string(),
+                    message.payload,
+                    metadata.session_id,
+                ));
                 sent_tokens.insert(message.receiver_token);
             }
         }
@@ -241,7 +253,8 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
         let mut nonce_bytes = [0u8; 24];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher.encrypt(nonce, inner_payload.as_ref())
+        let ciphertext = cipher
+            .encrypt(nonce, inner_payload.as_ref())
             .map_err(|_| anyhow!("Failed to re-encrypt outbound"))?;
 
         let mut packet = vec![TYPE_DATA];
@@ -270,7 +283,8 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
         let mut nonce_bytes = [0u8; 24];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher.encrypt(nonce, dummy_payload.as_ref())
+        let ciphertext = cipher
+            .encrypt(nonce, dummy_payload.as_ref())
             .map_err(|_| anyhow!("Failed to encrypt dummy"))?;
 
         let mut packet = vec![TYPE_DATA];
@@ -288,8 +302,8 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use x25519_dalek::EphemeralSecret;
     use rand_core::{OsRng, RngCore};
+    use x25519_dalek::EphemeralSecret;
 
     fn create_handshake_packet(client_secret: &EphemeralSecret, session_id: [u8; 4]) -> Vec<u8> {
         let pubkey = X25519PublicKey::from(client_secret);
@@ -299,7 +313,12 @@ mod tests {
         packet
     }
 
-    fn create_data_packet(link_key: [u8; 32], session_id: [u8; 4], routing_token: [u8; 16], payload: &[u8]) -> Vec<u8> {
+    fn create_data_packet(
+        link_key: [u8; 32],
+        session_id: [u8; 4],
+        routing_token: [u8; 16],
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut plaintext = Vec::new();
         plaintext.extend_from_slice(&routing_token);
         plaintext.extend_from_slice(payload);
@@ -324,7 +343,7 @@ mod tests {
         let mut identity_bytes = [0u8; 32];
         rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
         let server_identity = SigningKey::from_bytes(&identity_bytes);
-        
+
         let client_secret = EphemeralSecret::random_from_rng(OsRng);
         let session_id = [0xAA; 4];
         let routing_token = [0xBB; 16];
@@ -332,17 +351,20 @@ mod tests {
 
         // 1. Handshake
         let handshake_pkt = create_handshake_packet(&client_secret, session_id);
-        let resp = handle_request(&tables, &server_identity, socket_address, &handshake_pkt).unwrap().unwrap();
+        let resp = handle_request(&tables, &server_identity, socket_address, &handshake_pkt)
+            .unwrap()
+            .unwrap();
 
         // Calculate expected link key
         let mut server_eph_pub_bytes = [0u8; 32];
         server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
         let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
-        
+
         let shared_secret = client_secret.diffie_hellman(&server_eph_pub);
         let mut link_key = [0u8; 32];
         Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
-            .expand(b"wireguard-lite-link", &mut link_key).unwrap();
+            .expand(b"wireguard-lite-link", &mut link_key)
+            .unwrap();
 
         // 2. Sync Request (empty payload)
         let sync_pkt = create_data_packet(link_key, session_id, routing_token, b"");

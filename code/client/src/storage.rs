@@ -1,13 +1,13 @@
 use crate::{Client, SymmetricSessionState, UserIdentity};
+use anyhow::Result;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use pqcrypto_kyber::kyber768::{PublicKey, SecretKey};
 use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
-use anyhow::Result;
 use std::net::SocketAddr;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 #[derive(Serialize, Deserialize)]
 pub struct ClientStateDto {
@@ -79,7 +79,10 @@ impl ClientStateDto {
                     chain_key: hex::encode(state.chain_key),
                     send_count: state.send_count,
                     recv_count: state.recv_count,
-                    peer_kyber_pub: state.peer_kyber_pub.as_ref().map(|k| hex::encode(k.as_bytes())),
+                    peer_kyber_pub: state
+                        .peer_kyber_pub
+                        .as_ref()
+                        .map(|k| hex::encode(k.as_bytes())),
                     skip_dict,
                 },
             );
@@ -111,25 +114,27 @@ impl ClientStateDto {
     fn to_client(self) -> Result<Client> {
         let mut r_token = [0u8; 16];
         hex::decode_to_slice(&self.identity.routing_token, &mut r_token)?;
-        
+
         let mut ed_sec = [0u8; 32];
         hex::decode_to_slice(&self.identity.ed25519_secret, &mut ed_sec)?;
         let ed25519_secret = SigningKey::from_bytes(&ed_sec);
-        
+
         let mut ed_pub = [0u8; 32];
         hex::decode_to_slice(&self.identity.ed25519_public, &mut ed_pub)?;
         let ed25519_public = VerifyingKey::from_bytes(&ed_pub)?;
-        
+
         let mut x_sec = [0u8; 32];
         hex::decode_to_slice(&self.identity.x25519_secret, &mut x_sec)?;
         let x25519_secret = StaticSecret::from(x_sec);
-        
+
         let mut x_pub = [0u8; 32];
         hex::decode_to_slice(&self.identity.x25519_public, &mut x_pub)?;
         let x25519_public = X25519PublicKey::from(x_pub);
 
-        let kyber_pub = PublicKey::from_bytes(&hex::decode(&self.identity.kyber_public)?).map_err(|_| anyhow::anyhow!("Kyber pub err"))?;
-        let kyber_sec = SecretKey::from_bytes(&hex::decode(&self.identity.kyber_secret)?).map_err(|_| anyhow::anyhow!("Kyber sec err"))?;
+        let kyber_pub = PublicKey::from_bytes(&hex::decode(&self.identity.kyber_public)?)
+            .map_err(|_| anyhow::anyhow!("Kyber pub err"))?;
+        let kyber_sec = SecretKey::from_bytes(&hex::decode(&self.identity.kyber_secret)?)
+            .map_err(|_| anyhow::anyhow!("Kyber sec err"))?;
 
         let identity = UserIdentity {
             routing_token: r_token,
@@ -142,7 +147,7 @@ impl ClientStateDto {
         };
 
         let server_addr: SocketAddr = self.server_addr.parse()?;
-        
+
         let mut session_id = [0u8; 4];
         hex::decode_to_slice(&self.session_id, &mut session_id)?;
 
@@ -150,15 +155,18 @@ impl ClientStateDto {
         for (hex_tok, dto_state) in self.e2e_sessions {
             let mut tok = [0u8; 16];
             hex::decode_to_slice(&hex_tok, &mut tok)?;
-            
+
             let mut r_key = [0u8; 32];
             hex::decode_to_slice(&dto_state.root_key, &mut r_key)?;
-            
+
             let mut c_key = [0u8; 32];
             hex::decode_to_slice(&dto_state.chain_key, &mut c_key)?;
 
             let pkp = if let Some(pk_hex) = dto_state.peer_kyber_pub {
-                Some(PublicKey::from_bytes(&hex::decode(&pk_hex)?).map_err(|_| anyhow::anyhow!("Kyber err"))?)
+                Some(
+                    PublicKey::from_bytes(&hex::decode(&pk_hex)?)
+                        .map_err(|_| anyhow::anyhow!("Kyber err"))?,
+                )
             } else {
                 None
             };
@@ -170,14 +178,17 @@ impl ClientStateDto {
                 skip_dict.insert(k, mk);
             }
 
-            e2e_sessions.insert(tok, SymmetricSessionState {
-                root_key: r_key,
-                chain_key: c_key,
-                send_count: dto_state.send_count,
-                recv_count: dto_state.recv_count,
-                peer_kyber_pub: pkp,
-                skip_dict,
-            });
+            e2e_sessions.insert(
+                tok,
+                SymmetricSessionState {
+                    root_key: r_key,
+                    chain_key: c_key,
+                    send_count: dto_state.send_count,
+                    recv_count: dto_state.recv_count,
+                    peer_kyber_pub: pkp,
+                    skip_dict,
+                },
+            );
         }
 
         let mut pending_contacts = HashMap::new();
@@ -193,7 +204,11 @@ impl ClientStateDto {
         for (hex_tok, hex_key) in self.peer_kyber_keys {
             let mut tok = [0u8; 16];
             hex::decode_to_slice(&hex_tok, &mut tok)?;
-            peer_kyber_keys.insert(tok, PublicKey::from_bytes(&hex::decode(&hex_key)?).map_err(|_| anyhow::anyhow!("Kyber err"))?);
+            peer_kyber_keys.insert(
+                tok,
+                PublicKey::from_bytes(&hex::decode(&hex_key)?)
+                    .map_err(|_| anyhow::anyhow!("Kyber err"))?,
+            );
         }
 
         let mut seen_session_keys = HashSet::new();
@@ -207,7 +222,7 @@ impl ClientStateDto {
             identity,
             server_addr,
             link_master_key: [0u8; 32], // re-negotiated on boot
-            session_id, // can reuse the stored session id, or generate new
+            session_id,                 // can reuse the stored session id, or generate new
             e2e_sessions,
             pending_contacts,
             peer_kyber_keys,
