@@ -53,7 +53,7 @@ impl ClientStateDto {
     pub fn load(path: &str) -> Result<Client> {
         let json = fs::read_to_string(path)?;
         let dto: ClientStateDto = serde_json::from_str(&json)?;
-        Ok(dto.to_client()?)
+        dto.into_client()
     }
 
     fn from_client(client: &Client) -> Self {
@@ -119,7 +119,7 @@ impl ClientStateDto {
         }
     }
 
-    fn to_client(self) -> Result<Client> {
+    fn into_client(self) -> Result<Client> {
         let mut r_token = [0u8; 16];
         hex::decode_to_slice(&self.identity.routing_token, &mut r_token)?;
 

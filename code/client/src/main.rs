@@ -466,7 +466,7 @@ impl Client {
                 let mut decrypted = None;
                 for (token, session) in self.e2e_sessions.iter_mut() {
                     if let Some(pt) = session.try_decrypt(seq_no, nonce, ciphertext) {
-                        decrypted = Some((token.clone(), pt));
+                        decrypted = Some((*token, pt));
                         break;
                     }
                 }
@@ -728,12 +728,12 @@ async fn main() -> Result<()> {
                 let link_nonce = XNonce::from_slice(&nonce_bytes);
                 let ciphertext = &buf[29..len];
                 let link_cipher = XChaCha20Poly1305::new(Key::from_slice(&c.link_master_key));
-                if let Ok(decrypted) = link_cipher.decrypt(link_nonce, ciphertext) {
-                    if decrypted.len() >= 16 {
-                        let e2e_payload = &decrypted[16..];
-                        if let Ok(Some(reply)) = c.handle_incoming_packet(e2e_payload) {
-                            let _ = socket_clone.send_to(&reply, c.server_addr).await;
-                        }
+                if let Ok(decrypted) = link_cipher.decrypt(link_nonce, ciphertext)
+                    && decrypted.len() >= 16
+                {
+                    let e2e_payload = &decrypted[16..];
+                    if let Ok(Some(reply)) = c.handle_incoming_packet(e2e_payload) {
+                        let _ = socket_clone.send_to(&reply, c.server_addr).await;
                     }
                 }
             }

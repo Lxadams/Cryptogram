@@ -73,7 +73,7 @@ impl Tables {
         let queue = self
             .message_queues
             .entry(receiver_token)
-            .or_insert_with(VecDeque::new);
+            .or_default();
         queue.push_back(OutboundMessage {
             receiver_token,
             payload,
@@ -108,10 +108,12 @@ impl Tables {
         self.metadata.get(token)
     }
 
+    #[allow(dead_code)]
     pub fn metadata_iter(&self) -> impl Iterator<Item = (&RoutingToken, &MetadataEntry)> {
         self.metadata.iter()
     }
 
+    #[allow(dead_code)]
     pub fn get_queued_packets(&self, token: &RoutingToken) -> Option<&VecDeque<OutboundMessage>> {
         self.message_queues.get(token)
     }
