@@ -70,10 +70,7 @@ impl Tables {
         payload: Vec<u8>,
         ttl: Duration,
     ) {
-        let queue = self
-            .message_queues
-            .entry(receiver_token)
-            .or_default();
+        let queue = self.message_queues.entry(receiver_token).or_default();
         queue.push_back(OutboundMessage {
             receiver_token,
             payload,
