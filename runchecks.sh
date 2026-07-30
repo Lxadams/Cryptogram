@@ -1,17 +1,15 @@
-cd code/server
-echo "Linting server code..."
-cargo clippy
-echo "Formatting server code..."
-cargo fmt
+#!/usr/bin/env bash
+set -euo pipefail
 
-# cd ../client
-# echo "Linting client code..."
-# cargo clippy
-# echo "Formatting client code..."
-# cargo fmt
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-cd ../utils
-echo "Linting utils code..."
-cargo clippy
-echo "Formatting utils code..."
-cargo fmt
+run_rust_checks() {
+  local rel_dir="$1"
+  echo "Linting ${rel_dir}..."
+  (cd "${ROOT_DIR}/${rel_dir}" && cargo clippy)
+  echo "Formatting ${rel_dir}..."
+  (cd "${ROOT_DIR}/${rel_dir}" && cargo fmt)
+}
+
+run_rust_checks "code/server"
+run_rust_checks "code/utils"
