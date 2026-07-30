@@ -37,7 +37,10 @@ impl Tables {
     }
 
     pub fn register_link(&mut self, session_id: SessionId, link_key: [u8; 32]) {
-        self.active_links.insert(session_id, (link_key, Instant::now() + Duration::from_secs(3600)));
+        self.active_links.insert(
+            session_id,
+            (link_key, Instant::now() + Duration::from_secs(3600)),
+        );
     }
 
     pub fn get_link_key(&self, session_id: &SessionId) -> Option<&[u8; 32]> {
@@ -67,7 +70,10 @@ impl Tables {
         payload: Vec<u8>,
         ttl: Duration,
     ) {
-        let queue = self.message_queues.entry(receiver_token).or_insert_with(VecDeque::new);
+        let queue = self
+            .message_queues
+            .entry(receiver_token)
+            .or_insert_with(VecDeque::new);
         queue.push_back(OutboundMessage {
             receiver_token,
             payload,
@@ -80,14 +86,12 @@ impl Tables {
         }
     }
 
-
     pub fn sweep_active_links(&mut self) {
         let now = Instant::now();
         self.active_links.retain(|_, (_, expiry)| *expiry > now);
     }
 
     pub fn sweep_metadata(&mut self) {
-
         let now = Instant::now();
         self.metadata.retain(|_, entry| entry.expiry > now);
     }

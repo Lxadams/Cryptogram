@@ -5,10 +5,10 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use std::{
     collections::HashSet,
+    fs,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
-    fs,
 };
 use tokio::net::UdpSocket;
 use tracing::{error, info};
@@ -37,7 +37,6 @@ struct ServerIdentityDto {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-
     // Initialize logging
     tracing_subscriber::fmt().with_env_filter("info").init();
 
@@ -115,7 +114,6 @@ fn handle_request(
     }
 
     match payload[0] {
-
         TYPE_HANDSHAKE_INIT => {
             // Handshake format: [1 byte type] [4 byte SessionId] [32 byte Ephemeral PubKey] [32 byte Client Ed25519 Pub] [64 byte Signature]
             if payload.len() != 1 + 4 + 32 + 32 + 64 {
@@ -130,17 +128,19 @@ fn handle_request(
 
             let mut client_ed_bytes = [0u8; 32];
             client_ed_bytes.copy_from_slice(&payload[37..69]);
-            let client_ed_pub = ed25519_dalek::VerifyingKey::from_bytes(&client_ed_bytes).map_err(|_| anyhow!("Invalid client ed25519 key"))?;
+            let client_ed_pub = ed25519_dalek::VerifyingKey::from_bytes(&client_ed_bytes)
+                .map_err(|_| anyhow!("Invalid client ed25519 key"))?;
 
             let mut sig_bytes = [0u8; 64];
             sig_bytes.copy_from_slice(&payload[69..133]);
             let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
             use ed25519_dalek::Verifier;
-            client_ed_pub.verify(&pubkey_bytes, &signature).map_err(|_| anyhow!("Invalid client signature"))?;
+            client_ed_pub
+                .verify(&pubkey_bytes, &signature)
+                .map_err(|_| anyhow!("Invalid client signature"))?;
 
             let server_eph_secret =
-
                 x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
             let server_eph_pub = X25519PublicKey::from(&server_eph_secret);
 
@@ -283,19 +283,17 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
             }
         };
 
-
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
         let mut nonce_bytes = [0u8; 24];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
-        
+
         let mut full_inner = vec![0u8; 16]; // Dummy routing token prefix
         full_inner.extend_from_slice(inner_payload.as_ref());
 
         let ciphertext = cipher
             .encrypt(nonce, full_inner.as_slice())
             .map_err(|_| anyhow!("Failed to re-encrypt outbound"))?;
-
 
         let mut packet = vec![TYPE_DATA];
         packet.extend_from_slice(recipient_session_id);
@@ -455,7 +453,12 @@ mod tests {
         let res = handle_request(&tables, &server_identity, socket_address, &[]);
         assert!(res.is_err(), "Empty packet should fail");
 
-        let res = handle_request(&tables, &server_identity, socket_address, &[TYPE_HANDSHAKE_INIT, 0x01]);
+        let res = handle_request(
+            &tables,
+            &server_identity,
+            socket_address,
+            &[TYPE_HANDSHAKE_INIT, 0x01],
+        );
         assert!(res.is_err(), "Invalid handshake length should fail");
     }
 
@@ -469,7 +472,7 @@ mod tests {
 
         let client_secret = EphemeralSecret::random_from_rng(OsRng);
         let mut hs_pkt = create_handshake_packet(&client_secret, [0xAA; 4]);
-        
+
         // Corrupt the client's signature
         let len = hs_pkt.len();
         hs_pkt[len - 1] ^= 0x01;
@@ -495,8 +498,10 @@ mod tests {
 
         // 1. Sender does handshake
         let hs_pkt = create_handshake_packet(&sender_secret, sender_session);
-        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt).unwrap().unwrap();
-        
+        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt)
+            .unwrap()
+            .unwrap();
+
         let mut server_eph_pub_bytes = [0u8; 32];
         server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
         let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
@@ -507,7 +512,12 @@ mod tests {
             .unwrap();
 
         // 2. Sender sends message to receiver (receiver is OFFLINE, not synced)
-        let forward_pkt = create_data_packet(sender_link_key, sender_session, receiver_token, b"QueuedMsg");
+        let forward_pkt = create_data_packet(
+            sender_link_key,
+            sender_session,
+            receiver_token,
+            b"QueuedMsg",
+        );
         handle_request(&tables, &server_identity, sender_addr, &forward_pkt).unwrap();
 
         // Ensure it's in the offline queue, NOT the outbound queue
@@ -515,13 +525,21 @@ mod tests {
             let mut tables_lock = tables.lock().unwrap();
             let msgs = tables_lock.outbound_messages();
             assert_eq!(msgs.len(), 0, "Should not be outbound yet");
-            assert_eq!(tables_lock.get_queued_packets(&receiver_token).unwrap().len(), 1);
+            assert_eq!(
+                tables_lock
+                    .get_queued_packets(&receiver_token)
+                    .unwrap()
+                    .len(),
+                1
+            );
         }
 
         // 3. Receiver comes online and handshakes
         let hs_pkt = create_handshake_packet(&receiver_secret, receiver_session);
-        let resp = handle_request(&tables, &server_identity, receiver_addr, &hs_pkt).unwrap().unwrap();
-        
+        let resp = handle_request(&tables, &server_identity, receiver_addr, &hs_pkt)
+            .unwrap()
+            .unwrap();
+
         let mut server_eph_pub_bytes = [0u8; 32];
         server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
         let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
@@ -539,7 +557,11 @@ mod tests {
         {
             let mut tables_lock = tables.lock().unwrap();
             let msgs = tables_lock.outbound_messages();
-            assert_eq!(msgs.len(), 1, "Queued message should be flushed to outbound");
+            assert_eq!(
+                msgs.len(),
+                1,
+                "Queued message should be flushed to outbound"
+            );
             assert_eq!(msgs[0].payload, b"QueuedMsg");
             // Queue should be empty/removed now
             assert!(tables_lock.get_queued_packets(&receiver_token).is_none());
@@ -560,8 +582,10 @@ mod tests {
 
         // 1. Sender handshakes
         let hs_pkt = create_handshake_packet(&sender_secret, sender_session);
-        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt).unwrap().unwrap();
-        
+        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt)
+            .unwrap()
+            .unwrap();
+
         let mut server_eph_pub_bytes = [0u8; 32];
         server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
         let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
@@ -574,7 +598,12 @@ mod tests {
         // 2. Spam 55 messages to the offline token
         for i in 0..55 {
             let msg = format!("Spam {}", i);
-            let forward_pkt = create_data_packet(sender_link_key, sender_session, receiver_token, msg.as_bytes());
+            let forward_pkt = create_data_packet(
+                sender_link_key,
+                sender_session,
+                receiver_token,
+                msg.as_bytes(),
+            );
             handle_request(&tables, &server_identity, sender_addr, &forward_pkt).unwrap();
         }
 
@@ -582,8 +611,12 @@ mod tests {
         {
             let tables_lock = tables.lock().unwrap();
             let queue = tables_lock.get_queued_packets(&receiver_token).unwrap();
-            assert_eq!(queue.len(), 50, "Offline queue must drop messages beyond limit");
-            
+            assert_eq!(
+                queue.len(),
+                50,
+                "Offline queue must drop messages beyond limit"
+            );
+
             // Because it pops the front (oldest), the remaining messages should be 5 to 54
             assert_eq!(queue.front().unwrap().payload, b"Spam 5");
             assert_eq!(queue.back().unwrap().payload, b"Spam 54");
@@ -596,13 +629,21 @@ mod tests {
         let receiver_token = [0xCC; 16];
 
         // Manually enqueue a message with 0 TTL (so it expires immediately)
-        tables.enqueue_message(receiver_token, b"ExpiredMsg".to_vec(), std::time::Duration::from_secs(0));
-        
+        tables.enqueue_message(
+            receiver_token,
+            b"ExpiredMsg".to_vec(),
+            std::time::Duration::from_secs(0),
+        );
+
         // Wait 1 ms to ensure 'now' is past the expiry
         std::thread::sleep(std::time::Duration::from_millis(1));
 
         // Enqueue a valid message
-        tables.enqueue_message(receiver_token, b"ValidMsg".to_vec(), std::time::Duration::from_secs(3600));
+        tables.enqueue_message(
+            receiver_token,
+            b"ValidMsg".to_vec(),
+            std::time::Duration::from_secs(3600),
+        );
 
         assert_eq!(tables.get_queued_packets(&receiver_token).unwrap().len(), 2);
 

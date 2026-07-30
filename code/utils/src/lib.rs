@@ -3,7 +3,6 @@ use std::net::UdpSocket;
 /// NOTE: This utils crate is legacy code. The client and server both implement
 /// their own packet formatting inline. These helpers are retained for
 /// potential future use but are not currently imported by either binary.
-
 pub const SESSION_ID_LEN: usize = 4;
 
 pub fn prepare_udp_payload(
