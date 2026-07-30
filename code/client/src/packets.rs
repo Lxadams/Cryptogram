@@ -89,7 +89,7 @@ impl KeyExchangePayload {
         }
     }
 
-    pub fn verify(&self) -> Result<()> {
+    pub fn verify(&self, verifier: &VerifyingKey) -> Result<()> {
         let mut msg = Vec::with_capacity(1288);
         msg.extend_from_slice(&self.routing_token);
         msg.extend_from_slice(&self.target_token);
@@ -97,7 +97,7 @@ impl KeyExchangePayload {
         msg.extend_from_slice(self.ed25519_public.as_bytes());
         msg.extend_from_slice(self.x25519_public.as_bytes());
         msg.extend_from_slice(self.kyber_public.as_bytes());
-        self.ed25519_public
+        verifier
             .verify(&msg, &self.signature)
             .map_err(|_| anyhow!("Signature verification failed"))
     }

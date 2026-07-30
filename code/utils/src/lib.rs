@@ -1,6 +1,10 @@
 use std::net::UdpSocket;
 
-pub const SESSION_ID_LEN: usize = 2;
+/// NOTE: This utils crate is legacy code. The client and server both implement
+/// their own packet formatting inline. These helpers are retained for
+/// potential future use but are not currently imported by either binary.
+
+pub const SESSION_ID_LEN: usize = 4;
 
 pub fn prepare_udp_payload(
     request_type: u8,
@@ -23,7 +27,7 @@ pub fn send_udp(
 
     let payload = prepare_udp_payload(request_type, session_id, data);
 
-    socket.send_to(&payload, "127.0.0.1:443")?;
+    socket.send_to(&payload, "127.0.0.1:4430")?;
     println!(
         "Sent UDP packet with request_type: {}, session_id: {}, data: {}",
         request_type,

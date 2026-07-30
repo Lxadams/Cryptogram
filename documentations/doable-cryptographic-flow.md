@@ -7,7 +7,7 @@ This document describes the cryptographic architecture of the E2E Messenger MVP 
 ## 1. Architectural Role Summary
 
 *   **Clients (Alice & Bob)**: Generate all keys locally in memory. Trust is established strictly in person via Micro-QR codes (48 bytes). The clients handle all asymmetric/symmetric cryptography and the Deferred Key Exchange protocol.
-*   **Server Relay**: A blind RAM-only router. It has zero knowledge of User IDs or E2E keys. It uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID to identify the link key, decrypts the outer shell, reads the 16-byte Routing Token, re-encrypts the inner payload with the recipient's link key, and forwards it.
+*   **Server Relay**: A blind RAM-only router. It has zero knowledge of User IDs or E2E keys. It uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID to identify the link key, decrypts the outer shell, reads the 16-byte Routing Token, re-encrypts the inner payload with the recipient's link key, and forwards it to their active IP. If the recipient is offline, the packet is securely queued in RAM (bounded to 50 messages) until the client connects and syncs.
 
 ---
 
@@ -29,9 +29,9 @@ Because ML-KEM-768 public keys are 1184 bytes (far too large for a reliable QR c
 
 Before any E2E communication can occur, each client must establish a link-layer encrypted tunnel with the server.
 
-1.  **Client Boot**: The client generates an ephemeral X25519 keypair and sends a Handshake packet `[TYPE_HANDSHAKE | SessionID | EphemeralPubKey]` to the server.
-2.  **Server Processing**: The server performs `DH(ServerStaticPriv, ClientEphPub)` and derives a Link Master Key via `HKDF-SHA256` with info string `"wireguard-lite-link"`. It stores the `SessionID → LinkKey` mapping in RAM.
-3.  **Client Completion**: The client performs the same DH with the server's hardcoded static public key and derives the identical Link Master Key.
+1.  **Client Boot**: The client generates an ephemeral X25519 keypair, signs the ephemeral public key with its Ed25519 identity, and sends a Handshake packet `[TYPE_HANDSHAKE | SessionID | EphX25519Pub | Ed25519Pub | Ed25519Signature]` to the server.
+2.  **Server Processing**: The server verifies the client's Ed25519 signature over the ephemeral key (Mutual Auth). It performs `DH(ServerEphPriv, ClientEphPub)` and derives a Link Master Key via `HKDF-SHA256` with salt `"e2e-messenger-v1"` and info string `"wireguard-lite-link"`. It returns `[TYPE_HANDSHAKE_RESP | SessionID | ServerEphPub | ServerEd25519Sig]`.
+3.  **Client Completion**: The client verifies the server's signature using the server's static identity, performs DH with the server's ephemeral public key, and derives the identical Link Master Key using the same HKDF parameters.
 4.  **Sync Packet**: The client sends its Routing Token (link-encrypted) so the server can map `RoutingToken → (SocketAddr, SessionID)` for routing.
 
 All subsequent packets are wrapped in `XChaCha20-Poly1305` link encryption using this key.
@@ -48,7 +48,7 @@ The 3-way handshake exchanges the massive Post-Quantum keys in-band, authenticat
 4.  **SessionEstablish (0x04)**: Alice performs the Hybrid PQXDH handshake:
     *   Generates an ephemeral X25519 keypair and computes `DH(AliceEphPriv, BobX25519Pub)`.
     *   Encapsulates a secret against Bob's Kyber public key: `encapsulate(BobKyberPub) → (PQ_SharedSecret, KyberCiphertext)`.
-    *   Derives the Master Key: `HKDF-SHA256(DH_Secret || PQ_Secret, info="pqxdh-root-key")`.
+    *   Derives the Master Key: `HKDF-SHA256(DH_Secret || PQ_Secret, salt="e2e-messenger-v1", info="pqxdh-root-key")`.
     *   Sends a `SessionEstablishPayload` (1224 bytes) containing: `[AliceToken | BobToken | Timestamp | KyberCT | EphX25519Pub | Ed25519Signature]`.
 5.  **Bob Accepts**: Bob verifies the signature against Alice's stored Ed25519 key, decapsulates the Kyber ciphertext, performs the same hybrid derivation, and arrives at the identical Master Key. The E2E tunnel is now established.
 
@@ -140,7 +140,7 @@ Raw UDP Datagram
 | 5 | **Plaintext Dummy Packets** | Server sent cleartext dummy packets (`b"dummy_padding_to_look_real"`), making them trivially distinguishable from real traffic | Dummy packets are now random 64-byte payloads encrypted with recipient's link key, indistinguishable from real traffic. |
 | 6 | **Session Reset DoS** | Attacker replays intercepted `SessionEstablish` packets to force redundant derivations | Added a `seen_session_keys` cache to drop previously processed ephemeral X25519 keys silently. |
 
-### Unit Test Report (24 tests, all passing)
+### Unit Test Report (30 tests, all passing)
 
 #### Serialization & Signature Tests
 | Test | Description |
@@ -164,11 +164,20 @@ Raw UDP Datagram
 | `test_edge_case_est_wrong_verifier_key` | Signs a `SessionEstablish` with Alice's key but attempts verification with Bob's key. Simulates Mallory forging a packet. Must return `Err`. |
 | `test_edge_case_pq_inject_wrong_verifier_key` | Simulates Mallory forging a `PQInject` packet. Must return `Err`. |
 
+#### Edge Case: Server Offline Routing & Queuing
+| Test | Description |
+|---|---|
+| `test_edge_case_offline_queuing_and_sync` | Asserts that messages sent to an offline receiver are securely queued in RAM, and natively flushed via the background sweeper as soon as the receiver boots, handshakes, and sends a Sync packet. |
+| `test_edge_case_offline_queue_dos_bounds` | Spams 55 messages to an offline routing token. Asserts the server strictly bounds the queue to 50 messages, popping the oldest to prevent RAM exhaustion (DoS protection). |
+| `test_edge_case_offline_queue_ttl_expiry` | Enqueues a message with an expired TTL. Asserts the background sweeper safely destroys the expired message and cleans up the empty queue HashMap entry. |
+
 #### Edge Case: Replay & Misbinding
 | Test | Description |
 |---|---|
 | `test_edge_case_timestamp_expiration` | Sets a payload's timestamp to 10 minutes in the past. Asserts the time differential exceeds the 300-second threshold. |
+| `test_edge_case_timestamp_rejection_via_handler` | Sends a stale-timestamp KeyExchange through `handle_incoming_packet` with a correctly re-signed payload. Asserts the handler drops it and does NOT create a pending contact. |
 | `test_edge_case_target_misbinding` | Generates a `KeyExchange` intended for Charlie (`0xCC`). Asserts that Bob (`0xBB`) correctly detects the `target_token` mismatch. |
+| `test_edge_case_target_misbinding_via_handler` | Sends a misbinding KeyExchange through `handle_incoming_packet`. Asserts the handler drops it and does NOT create a pending contact. |
 
 #### Symmetric Hash Ratchet
 | Test | Description |
@@ -193,6 +202,18 @@ Raw UDP Datagram
 | `test_attack_session_overwrite_prevention` | Mallory creates a `SessionEstablish` signed with her own key but spoofs Alice's `routing_token`. Bob verifies the signature against Alice's stored Ed25519 key — verification fails, session is NOT established. |
 | `test_attack_no_session_without_pending` | A valid `SessionEstablish` arrives from an unknown sender (not in `pending_contacts`). Bob rejects it — no session is established. |
 | `test_attack_forged_pq_inject` | Mallory sends a `PQInject` spoofing Alice. Signature verification fails and Bob's chain key is not altered. |
+
+#### Out-of-Order, Bounds & DoS Protection
+| Test | Description |
+|---|---|
+| `test_edge_case_out_of_order_packets_and_loss` | Delivers 3 messages out of order (msg3 first, then msg1, msg2). Verifies skip dictionary correctly buffers and delivers all messages. |
+| `test_edge_case_max_skip_dict_exhaustion` | Attempts to decrypt a message with seq_no 150 (gap > 100). Verifies the ratchet rejects it and recv_count stays at 0. |
+| `test_edge_case_duplicate_message_rejection` | Delivers msg1 out of order (skip_dict), then delivers msg0 from skip_dict, then replays msg0. Verifies replay is rejected (returns None). |
+| `test_edge_case_pending_contacts_exhaustion` | Floods 55 KeyExchanges to a single client. Verifies pending_contacts is bounded to 51 (50 + 1 already accepted before the check). |
+| `test_edge_case_seen_session_keys_exhaustion` | Floods 1050 SessionEstablish packets. Verifies seen_session_keys cache is bounded to ≤1000 entries. |
+| `test_edge_case_session_establish_replay_detection` | Full handshake, then replays the same SessionEstablish. Verifies seen_session_keys blocks the replay from creating a new session. |
+| `test_edge_case_pq_inject_stale_timestamp` | Creates a PQ inject with timestamp 600s in the past, re-signs it. Verifies the handler drops it and chain key is unchanged. |
+| `test_storage_save_load_roundtrip` | Creates a Client with sessions, pending contacts, and seen keys. Saves to JSON, loads back, and verifies all keys survive round-trip. |
 
 ### Known Issues & Acceptable MVP Compromises
 

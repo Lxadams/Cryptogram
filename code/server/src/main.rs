@@ -8,6 +8,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
+    fs,
 };
 use tokio::net::UdpSocket;
 use tracing::{error, info};
@@ -21,20 +22,45 @@ const MESSAGE_TTL: Duration = Duration::from_secs(1000);
 const OUTBOUND_TASK_INTERVAL: Duration = Duration::from_secs(1);
 const SWEEPING_TASK_INTERVAL: Duration = Duration::from_secs(120);
 
+// Domain-separation salt for HKDF derivations (must match client)
+const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
+
 // Request Types
 const TYPE_HANDSHAKE_INIT: u8 = 0;
 const TYPE_DATA: u8 = 1;
 const TYPE_HANDSHAKE_RESP: u8 = 2;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ServerIdentityDto {
+    ed25519_secret: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+
     // Initialize logging
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     // Generate server static identity
-    let mut identity_bytes = [0u8; 32];
-    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut identity_bytes);
-    let server_identity = SigningKey::from_bytes(&identity_bytes);
+
+    let identity_path = "server_identity.json";
+    let server_identity = if let Ok(json) = fs::read_to_string(identity_path) {
+        let dto: ServerIdentityDto = serde_json::from_str(&json)?;
+        let mut sec_bytes = [0u8; 32];
+        hex::decode_to_slice(&dto.ed25519_secret, &mut sec_bytes)?;
+        SigningKey::from_bytes(&sec_bytes)
+    } else {
+        info!("No existing server identity found. Generating new Ed25519 keypair...");
+        let mut identity_bytes = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut identity_bytes);
+        let key = SigningKey::from_bytes(&identity_bytes);
+        let dto = ServerIdentityDto {
+            ed25519_secret: hex::encode(identity_bytes),
+        };
+        fs::write(identity_path, serde_json::to_string_pretty(&dto)?)?;
+        key
+    };
+
     let server_pub = server_identity.verifying_key();
 
     let mut buffer = [0u8; 2048];
@@ -89,9 +115,10 @@ fn handle_request(
     }
 
     match payload[0] {
+
         TYPE_HANDSHAKE_INIT => {
-            // Handshake format: [1 byte type] [4 byte SessionId] [32 byte Ephemeral PubKey]
-            if payload.len() != 1 + 4 + 32 {
+            // Handshake format: [1 byte type] [4 byte SessionId] [32 byte Ephemeral PubKey] [32 byte Client Ed25519 Pub] [64 byte Signature]
+            if payload.len() != 1 + 4 + 32 + 32 + 64 {
                 return Err(anyhow!("Invalid handshake length"));
             }
             let mut session_id = [0u8; 4];
@@ -101,13 +128,25 @@ fn handle_request(
             pubkey_bytes.copy_from_slice(&payload[5..37]);
             let client_pub = X25519PublicKey::from(pubkey_bytes);
 
+            let mut client_ed_bytes = [0u8; 32];
+            client_ed_bytes.copy_from_slice(&payload[37..69]);
+            let client_ed_pub = ed25519_dalek::VerifyingKey::from_bytes(&client_ed_bytes).map_err(|_| anyhow!("Invalid client ed25519 key"))?;
+
+            let mut sig_bytes = [0u8; 64];
+            sig_bytes.copy_from_slice(&payload[69..133]);
+            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+            use ed25519_dalek::Verifier;
+            client_ed_pub.verify(&pubkey_bytes, &signature).map_err(|_| anyhow!("Invalid client signature"))?;
+
             let server_eph_secret =
+
                 x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
             let server_eph_pub = X25519PublicKey::from(&server_eph_secret);
 
             let shared_secret = server_eph_secret.diffie_hellman(&client_pub);
             let mut link_master_key = [0u8; 32];
-            Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
+            Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
                 .expand(b"wireguard-lite-link", &mut link_master_key)
                 .map_err(|e| anyhow!("HKDF error: {}", e))?;
 
@@ -195,6 +234,7 @@ fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
         loop {
             {
                 let mut tables = tables.lock().unwrap();
+                tables.sweep_active_links();
                 tables.sweep_metadata();
                 tables.sweep_expired_messages();
             }
@@ -207,7 +247,7 @@ type OutboundMessages = (Vec<(String, Vec<u8>, SessionId)>, Vec<(String, Session
 
 fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> OutboundMessages {
     let (messages, dummy_targets) = {
-        let tables = tables.lock().unwrap();
+        let mut tables = tables.lock().unwrap();
         let mut sent_tokens = HashSet::new();
         let mut messages = Vec::new();
 
@@ -222,13 +262,7 @@ fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> OutboundMessages {
             }
         }
 
-        let mut dummy_targets = Vec::new();
-
-        for (token, metadata) in tables.metadata_iter() {
-            if !sent_tokens.contains(token) {
-                dummy_targets.push((metadata.incoming_addr.to_string(), metadata.session_id));
-            }
-        }
+        let dummy_targets = Vec::new();
 
         (messages, dummy_targets)
     };
@@ -249,13 +283,19 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
             }
         };
 
+
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
         let mut nonce_bytes = [0u8; 24];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
+        
+        let mut full_inner = vec![0u8; 16]; // Dummy routing token prefix
+        full_inner.extend_from_slice(inner_payload.as_ref());
+
         let ciphertext = cipher
-            .encrypt(nonce, inner_payload.as_ref())
+            .encrypt(nonce, full_inner.as_slice())
             .map_err(|_| anyhow!("Failed to re-encrypt outbound"))?;
+
 
         let mut packet = vec![TYPE_DATA];
         packet.extend_from_slice(recipient_session_id);
@@ -275,8 +315,9 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
             }
         };
 
-        // Generate random dummy payload of fixed size
-        let mut dummy_payload = vec![0u8; 64];
+        // Generate random dummy payload with variable size to match real traffic
+        let dummy_size = 32 + (OsRng.next_u32() as usize % 1469); // 32..1500
+        let mut dummy_payload = vec![0u8; dummy_size];
         OsRng.fill_bytes(&mut dummy_payload);
 
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
@@ -306,10 +347,19 @@ mod tests {
     use x25519_dalek::EphemeralSecret;
 
     fn create_handshake_packet(client_secret: &EphemeralSecret, session_id: [u8; 4]) -> Vec<u8> {
+        use ed25519_dalek::{Signer, SigningKey};
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        let client_ed = SigningKey::from_bytes(&bytes);
+        let client_ed_pub = client_ed.verifying_key();
         let pubkey = X25519PublicKey::from(client_secret);
+        let signature = client_ed.sign(pubkey.as_bytes());
+
         let mut packet = vec![TYPE_HANDSHAKE_INIT];
         packet.extend_from_slice(&session_id);
         packet.extend_from_slice(pubkey.as_bytes());
+        packet.extend_from_slice(client_ed_pub.as_bytes());
+        packet.extend_from_slice(&signature.to_bytes());
         packet
     }
 
@@ -362,7 +412,7 @@ mod tests {
 
         let shared_secret = client_secret.diffie_hellman(&server_eph_pub);
         let mut link_key = [0u8; 32];
-        Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
+        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
             .expand(b"wireguard-lite-link", &mut link_key)
             .unwrap();
 
@@ -382,11 +432,186 @@ mod tests {
         handle_request(&tables, &server_identity, socket_address, &forward_pkt).unwrap();
 
         {
-            let tables_lock = tables.lock().unwrap();
+            let mut tables_lock = tables.lock().unwrap();
             let msgs = tables_lock.outbound_messages();
             assert_eq!(msgs.len(), 1);
             assert_eq!(msgs[0].receiver_token, routing_token);
             assert_eq!(msgs[0].payload, b"Hello");
         }
+    }
+
+    // ==========================================
+    // Missing Edge Case: Server Relay & Handshake Tests
+    // ==========================================
+
+    #[test]
+    fn test_edge_case_invalid_handshake() {
+        let tables = Arc::new(Mutex::new(Tables::new()));
+        let mut identity_bytes = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
+        let server_identity = SigningKey::from_bytes(&identity_bytes);
+        let socket_address = SocketAddr::from(([127, 0, 0, 1], 50000));
+
+        let res = handle_request(&tables, &server_identity, socket_address, &[]);
+        assert!(res.is_err(), "Empty packet should fail");
+
+        let res = handle_request(&tables, &server_identity, socket_address, &[TYPE_HANDSHAKE_INIT, 0x01]);
+        assert!(res.is_err(), "Invalid handshake length should fail");
+    }
+
+    #[test]
+    fn test_edge_case_handshake_mutual_auth_failure() {
+        let tables = Arc::new(Mutex::new(Tables::new()));
+        let mut identity_bytes = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
+        let server_identity = SigningKey::from_bytes(&identity_bytes);
+        let socket_address = SocketAddr::from(([127, 0, 0, 1], 50000));
+
+        let client_secret = EphemeralSecret::random_from_rng(OsRng);
+        let mut hs_pkt = create_handshake_packet(&client_secret, [0xAA; 4]);
+        
+        // Corrupt the client's signature
+        let len = hs_pkt.len();
+        hs_pkt[len - 1] ^= 0x01;
+
+        let res = handle_request(&tables, &server_identity, socket_address, &hs_pkt);
+        assert!(res.is_err(), "Invalid client signature must fail");
+    }
+
+    #[test]
+    fn test_edge_case_offline_queuing_and_sync() {
+        let tables = Arc::new(Mutex::new(Tables::new()));
+        let mut identity_bytes = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
+        let server_identity = SigningKey::from_bytes(&identity_bytes);
+        let sender_addr = SocketAddr::from(([127, 0, 0, 1], 50001));
+        let receiver_addr = SocketAddr::from(([127, 0, 0, 1], 50002));
+
+        let sender_secret = EphemeralSecret::random_from_rng(OsRng);
+        let receiver_secret = EphemeralSecret::random_from_rng(OsRng);
+        let sender_session = [0xAA; 4];
+        let receiver_session = [0xBB; 4];
+        let receiver_token = [0xCC; 16];
+
+        // 1. Sender does handshake
+        let hs_pkt = create_handshake_packet(&sender_secret, sender_session);
+        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt).unwrap().unwrap();
+        
+        let mut server_eph_pub_bytes = [0u8; 32];
+        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
+        let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
+        let shared_secret = sender_secret.diffie_hellman(&server_eph_pub);
+        let mut sender_link_key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
+            .expand(b"wireguard-lite-link", &mut sender_link_key)
+            .unwrap();
+
+        // 2. Sender sends message to receiver (receiver is OFFLINE, not synced)
+        let forward_pkt = create_data_packet(sender_link_key, sender_session, receiver_token, b"QueuedMsg");
+        handle_request(&tables, &server_identity, sender_addr, &forward_pkt).unwrap();
+
+        // Ensure it's in the offline queue, NOT the outbound queue
+        {
+            let mut tables_lock = tables.lock().unwrap();
+            let msgs = tables_lock.outbound_messages();
+            assert_eq!(msgs.len(), 0, "Should not be outbound yet");
+            assert_eq!(tables_lock.get_queued_packets(&receiver_token).unwrap().len(), 1);
+        }
+
+        // 3. Receiver comes online and handshakes
+        let hs_pkt = create_handshake_packet(&receiver_secret, receiver_session);
+        let resp = handle_request(&tables, &server_identity, receiver_addr, &hs_pkt).unwrap().unwrap();
+        
+        let mut server_eph_pub_bytes = [0u8; 32];
+        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
+        let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
+        let shared_secret = receiver_secret.diffie_hellman(&server_eph_pub);
+        let mut receiver_link_key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
+            .expand(b"wireguard-lite-link", &mut receiver_link_key)
+            .unwrap();
+
+        // 4. Receiver sends sync packet
+        let sync_pkt = create_data_packet(receiver_link_key, receiver_session, receiver_token, b"");
+        handle_request(&tables, &server_identity, receiver_addr, &sync_pkt).unwrap();
+
+        // 5. Check that the queued packet was flushed to the outbound queue
+        {
+            let mut tables_lock = tables.lock().unwrap();
+            let msgs = tables_lock.outbound_messages();
+            assert_eq!(msgs.len(), 1, "Queued message should be flushed to outbound");
+            assert_eq!(msgs[0].payload, b"QueuedMsg");
+            // Queue should be empty/removed now
+            assert!(tables_lock.get_queued_packets(&receiver_token).is_none());
+        }
+    }
+
+    #[test]
+    fn test_edge_case_offline_queue_dos_bounds() {
+        let tables = Arc::new(Mutex::new(Tables::new()));
+        let mut identity_bytes = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
+        let server_identity = SigningKey::from_bytes(&identity_bytes);
+        let sender_addr = SocketAddr::from(([127, 0, 0, 1], 50001));
+
+        let sender_secret = EphemeralSecret::random_from_rng(OsRng);
+        let sender_session = [0xAA; 4];
+        let receiver_token = [0xCC; 16];
+
+        // 1. Sender handshakes
+        let hs_pkt = create_handshake_packet(&sender_secret, sender_session);
+        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt).unwrap().unwrap();
+        
+        let mut server_eph_pub_bytes = [0u8; 32];
+        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
+        let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
+        let shared_secret = sender_secret.diffie_hellman(&server_eph_pub);
+        let mut sender_link_key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
+            .expand(b"wireguard-lite-link", &mut sender_link_key)
+            .unwrap();
+
+        // 2. Spam 55 messages to the offline token
+        for i in 0..55 {
+            let msg = format!("Spam {}", i);
+            let forward_pkt = create_data_packet(sender_link_key, sender_session, receiver_token, msg.as_bytes());
+            handle_request(&tables, &server_identity, sender_addr, &forward_pkt).unwrap();
+        }
+
+        // 3. Ensure offline queue is strictly bounded to 50
+        {
+            let tables_lock = tables.lock().unwrap();
+            let queue = tables_lock.get_queued_packets(&receiver_token).unwrap();
+            assert_eq!(queue.len(), 50, "Offline queue must drop messages beyond limit");
+            
+            // Because it pops the front (oldest), the remaining messages should be 5 to 54
+            assert_eq!(queue.front().unwrap().payload, b"Spam 5");
+            assert_eq!(queue.back().unwrap().payload, b"Spam 54");
+        }
+    }
+
+    #[test]
+    fn test_edge_case_offline_queue_ttl_expiry() {
+        let mut tables = Tables::new();
+        let receiver_token = [0xCC; 16];
+
+        // Manually enqueue a message with 0 TTL (so it expires immediately)
+        tables.enqueue_message(receiver_token, b"ExpiredMsg".to_vec(), std::time::Duration::from_secs(0));
+        
+        // Wait 1 ms to ensure 'now' is past the expiry
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        // Enqueue a valid message
+        tables.enqueue_message(receiver_token, b"ValidMsg".to_vec(), std::time::Duration::from_secs(3600));
+
+        assert_eq!(tables.get_queued_packets(&receiver_token).unwrap().len(), 2);
+
+        // Sweep
+        tables.sweep_expired_messages();
+
+        // Queue should now only have the valid message
+        let queue = tables.get_queued_packets(&receiver_token).unwrap();
+        assert_eq!(queue.len(), 1, "Expired message should be swept");
+        assert_eq!(queue[0].payload, b"ValidMsg");
     }
 }

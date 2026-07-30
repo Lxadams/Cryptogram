@@ -39,6 +39,7 @@ pub struct SymmetricSessionStateDto {
     pub recv_count: u64,
     pub peer_kyber_pub: Option<String>,
     pub skip_dict: HashMap<u64, String>,
+    pub pq_inject_replay_cache: HashSet<String>,
 }
 
 impl ClientStateDto {
@@ -68,10 +69,16 @@ impl ClientStateDto {
 
         let mut e2e_sessions = HashMap::new();
         for (token, state) in &client.e2e_sessions {
+
             let mut skip_dict = HashMap::new();
             for (k, v) in &state.skip_dict {
                 skip_dict.insert(*k, hex::encode(v));
             }
+            let mut pq_inject_replay_cache = HashSet::new();
+            for sig in &state.pq_inject_replay_cache {
+                pq_inject_replay_cache.insert(hex::encode(sig));
+            }
+
             e2e_sessions.insert(
                 hex::encode(token),
                 SymmetricSessionStateDto {
@@ -84,6 +91,7 @@ impl ClientStateDto {
                         .as_ref()
                         .map(|k| hex::encode(k.as_bytes())),
                     skip_dict,
+                    pq_inject_replay_cache,
                 },
             );
         }
@@ -171,12 +179,20 @@ impl ClientStateDto {
                 None
             };
 
+
             let mut skip_dict = HashMap::new();
             for (k, v) in dto_state.skip_dict {
                 let mut mk = [0u8; 32];
                 hex::decode_to_slice(&v, &mut mk)?;
                 skip_dict.insert(k, mk);
             }
+            let mut pq_inject_replay_cache = HashSet::new();
+            for hex_sig in dto_state.pq_inject_replay_cache {
+                let mut sig = [0u8; 64];
+                hex::decode_to_slice(&hex_sig, &mut sig)?;
+                pq_inject_replay_cache.insert(sig);
+            }
+
 
             e2e_sessions.insert(
                 tok,
@@ -187,6 +203,7 @@ impl ClientStateDto {
                     recv_count: dto_state.recv_count,
                     peer_kyber_pub: pkp,
                     skip_dict,
+                    pq_inject_replay_cache,
                 },
             );
         }

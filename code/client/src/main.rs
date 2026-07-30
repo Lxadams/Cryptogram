@@ -8,6 +8,7 @@ use pqcrypto_traits::kem::{PublicKey as _, SharedSecret as _};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{io::AsyncBufReadExt, net::UdpSocket, sync::Mutex};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
@@ -24,6 +25,15 @@ pub type RoutingToken = [u8; 16];
 
 // PQ injection interval: inject fresh Kyber entropy every N messages
 const PQ_INJECT_INTERVAL: u64 = 5;
+
+// Maximum number of skipped message keys to retain
+const MAX_SKIP_DICT_SIZE: usize = 500;
+
+// Domain-separation salt for HKDF derivations
+const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
+
+// Maximum timestamp drift allowed (seconds)
+const MAX_TIMESTAMP_DRIFT: u64 = 300;
 
 // Request Types for Server
 const TYPE_HANDSHAKE_INIT: u8 = 0;
@@ -44,7 +54,9 @@ impl UserIdentity {
     pub fn generate() -> Self {
         let mut routing_token = [0u8; 16];
         OsRng.fill_bytes(&mut routing_token);
-        let ed25519_secret = SigningKey::generate(&mut OsRng);
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        let ed25519_secret = SigningKey::from_bytes(&bytes);
         let ed25519_public = ed25519_secret.verifying_key();
         let x25519_secret = StaticSecret::random_from_rng(OsRng);
         let x25519_public = X25519PublicKey::from(&x25519_secret);
@@ -68,6 +80,7 @@ pub struct SymmetricSessionState {
     pub recv_count: u64,
     pub peer_kyber_pub: Option<PublicKey>,
     pub skip_dict: HashMap<u64, [u8; 32]>,
+    pub pq_inject_replay_cache: HashSet<[u8; 64]>,
 }
 
 impl SymmetricSessionState {
@@ -91,10 +104,12 @@ impl SymmetricSessionState {
         ciphertext: &[u8],
     ) -> Option<Vec<u8>> {
         if seq_no < self.recv_count {
-            if let Some(key) = self.skip_dict.remove(&seq_no) {
-                let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+            if let Some(key) = self.skip_dict.get(&seq_no) {
+                let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
                 if let Ok(pt) = cipher.decrypt(nonce, ciphertext) {
-                    return Some(pt);
+                    let pt_clone = pt.clone();
+                    self.skip_dict.remove(&seq_no);
+                    return Some(pt_clone);
                 }
             }
             return None;
@@ -102,6 +117,15 @@ impl SymmetricSessionState {
 
         if seq_no - self.recv_count > 100 {
             return None;
+        }
+
+        // Prune oldest skip_dict entries if we're at capacity
+        while self.skip_dict.len() >= MAX_SKIP_DICT_SIZE {
+            if let Some(&oldest_key) = self.skip_dict.keys().min() {
+                self.skip_dict.remove(&oldest_key);
+            } else {
+                break;
+            }
         }
 
         let mut test_chain = self.chain_key;
@@ -141,7 +165,7 @@ impl SymmetricSessionState {
         let mut inject_input = Vec::new();
         inject_input.extend_from_slice(&self.chain_key);
         inject_input.extend_from_slice(pq_secret_bytes);
-        let hkdf = Hkdf::<Sha256>::new(None, &inject_input);
+        let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), &inject_input);
         hkdf.expand(b"pq-ratchet-inject", &mut self.chain_key)
             .unwrap();
     }
@@ -182,11 +206,16 @@ impl Client {
     }
 
     pub fn generate_handshake_packet(&self) -> (EphemeralSecret, Vec<u8>) {
+        use ed25519_dalek::Signer;
         let client_ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
         let client_ephemeral_public = X25519PublicKey::from(&client_ephemeral_secret);
+        // Sign the ephemeral X25519 public key with our Ed25519 identity
+        let signature = self.identity.ed25519_secret.sign(client_ephemeral_public.as_bytes());
         let mut packet = vec![TYPE_HANDSHAKE_INIT];
         packet.extend_from_slice(&self.session_id);
         packet.extend_from_slice(client_ephemeral_public.as_bytes());
+        packet.extend_from_slice(self.identity.ed25519_public.as_bytes());
+        packet.extend_from_slice(&signature.to_bytes());
         (client_ephemeral_secret, packet)
     }
 
@@ -215,7 +244,7 @@ impl Client {
         server_ed25519_pub.verify(&msg, &signature)?;
 
         let shared_secret = client_secret.diffie_hellman(&server_eph_pub);
-        Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
+        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
             .expand(b"wireguard-lite-link", &mut self.link_master_key)
             .unwrap();
         Ok(())
@@ -281,7 +310,7 @@ impl Client {
         let mut hybrid_input = Vec::new();
         hybrid_input.extend_from_slice(classical_shared_secret.as_bytes());
         hybrid_input.extend_from_slice(pq_shared_secret.as_bytes());
-        let hkdf = Hkdf::<Sha256>::new(None, &hybrid_input);
+        let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), &hybrid_input);
         let mut root_key = [0u8; 32];
         hkdf.expand(b"pqxdh-root-key", &mut root_key).unwrap();
 
@@ -295,6 +324,7 @@ impl Client {
             recv_count: 0,
             peer_kyber_pub: Some(peer_kyber_copy),
             skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: HashSet::new(),
         };
 
         let est_payload = SessionEstablishPayload::generate(
@@ -322,7 +352,7 @@ impl Client {
         let mut hybrid_input = Vec::new();
         hybrid_input.extend_from_slice(classical_shared_secret.as_bytes());
         hybrid_input.extend_from_slice(pq_shared_secret.as_bytes());
-        let hkdf = Hkdf::<Sha256>::new(None, &hybrid_input);
+        let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), &hybrid_input);
         let mut root_key = [0u8; 32];
         hkdf.expand(b"pqxdh-root-key", &mut root_key).unwrap();
 
@@ -339,6 +369,7 @@ impl Client {
             recv_count: 0,
             peer_kyber_pub: peer_kyber,
             skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: HashSet::new(),
         };
         self.e2e_sessions.insert(est.routing_token, session_state);
         self.save();
@@ -457,8 +488,8 @@ impl Client {
             0x02 => {
                 // KeyExchange
                 if let Ok(kx) = KeyExchangePayload::from_bytes(pkt_data) {
-                    if kx.verify().is_ok() {
-                        if kx.target_token != self.identity.routing_token {
+                    if kx.verify(&kx.ed25519_public).is_ok() {
+                        if kx.target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
                             println!(
                                 ">> [SECURITY ALERT] Dropped KeyExchange! It was bound to a different target."
                             );
@@ -468,7 +499,8 @@ impl Client {
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_secs();
-                        if (now as i64 - kx.timestamp as i64).abs() > 300 {
+                        let time_diff = now.max(kx.timestamp) - now.min(kx.timestamp);
+                        if time_diff > MAX_TIMESTAMP_DRIFT {
                             println!(
                                 ">> [SECURITY ALERT] Dropped KeyExchange! Timestamp is stale or from the future."
                             );
@@ -477,6 +509,11 @@ impl Client {
 
                         let peer_token = kx.routing_token;
                         let is_initiator = self.pending_contacts.contains_key(&peer_token);
+
+                        if !is_initiator && self.pending_contacts.len() > 50 {
+                            println!(">> [SECURITY ALERT] Dropped KeyExchange! Too many pending contacts.");
+                            return Ok(None);
+                        }
 
                         // Store peer's Kyber key for future PQ injections
                         self.peer_kyber_keys.insert(
@@ -523,14 +560,9 @@ impl Client {
             }
             0x04 => {
                 // SessionEstablish
+
                 if let Ok(est) = SessionEstablishPayload::from_bytes(pkt_data) {
-                    if !self.seen_session_keys.insert(est.eph_x25519_pub.to_bytes()) {
-                        println!(
-                            ">> [SECURITY ALERT] Dropped SessionEstablish! Replay detected (key already seen)."
-                        );
-                        return Ok(None);
-                    }
-                    if est.target_token != self.identity.routing_token {
+                    if est.target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
                         println!(
                             ">> [SECURITY ALERT] Dropped SessionEstablish! Bound to different target."
                         );
@@ -540,7 +572,8 @@ impl Client {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
-                    if (now as i64 - est.timestamp as i64).abs() > 300 {
+                    let time_diff = now.max(est.timestamp) - now.min(est.timestamp);
+                    if time_diff > MAX_TIMESTAMP_DRIFT {
                         println!(
                             ">> [SECURITY ALERT] Dropped SessionEstablish! Timestamp is stale."
                         );
@@ -548,7 +581,15 @@ impl Client {
                     }
                     if let Some(alice_pub) = self.pending_contacts.get(&est.routing_token) {
                         if est.verify(alice_pub).is_ok() {
+                            if !self.seen_session_keys.insert(est.eph_x25519_pub.to_bytes()) {
+                                println!(">> [SECURITY ALERT] Dropped SessionEstablish! Replay detected (key already seen).");
+                                return Ok(None);
+                            }
+                            if self.seen_session_keys.len() > 1000 {
+                                self.seen_session_keys.clear();
+                            }
                             self.accept_session_est(&est);
+
                         } else {
                             println!(">> [SECURITY ALERT] SessionEstablish signature invalid!");
                         }
@@ -561,7 +602,7 @@ impl Client {
             0x05 => {
                 // PQ Inject
                 if let Ok(pqi) = PQInjectPayload::from_bytes(pkt_data) {
-                    if pqi.target_token != self.identity.routing_token {
+                    if pqi.target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
                         println!(
                             ">> [SECURITY ALERT] Dropped PQInject! Bound to different target."
                         );
@@ -571,16 +612,29 @@ impl Client {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
-                    if (now as i64 - pqi.timestamp as i64).abs() > 300 {
+                    let time_diff = now.max(pqi.timestamp) - now.min(pqi.timestamp);
+                    if time_diff > MAX_TIMESTAMP_DRIFT {
                         println!(">> [SECURITY ALERT] Dropped PQInject! Timestamp is stale.");
                         return Ok(None);
                     }
                     if let Some(sender_pub) = self.pending_contacts.get(&pqi.routing_token) {
                         if pqi.verify(sender_pub).is_ok() {
                             // Decapsulate and inject PQ entropy into the session
+
                             let pq_secret = decapsulate(&pqi.kyber_ct, &self.identity.kyber_secret);
                             if let Some(session) = self.e2e_sessions.get_mut(&pqi.routing_token) {
+                                let sig_bytes = pqi.signature.to_bytes();
+                                if session.pq_inject_replay_cache.contains(&sig_bytes) {
+                                    println!(">> [SECURITY ALERT] Dropped PQInject! Replay detected.");
+                                    return Ok(None);
+                                }
+                                if session.pq_inject_replay_cache.len() > 1000 {
+                                    session.pq_inject_replay_cache.clear();
+                                }
+                                session.pq_inject_replay_cache.insert(sig_bytes);
+
                                 session.inject_pq_secret(pq_secret.as_bytes());
+
                                 println!(
                                     ">> [PQ] Received and injected post-quantum entropy from {}!",
                                     hex::encode(&pqi.routing_token[0..4])
@@ -776,7 +830,7 @@ mod tests {
         let bytes = payload.to_bytes();
         assert_eq!(bytes.len(), 1352);
         let parsed = KeyExchangePayload::from_bytes(&bytes).unwrap();
-        assert!(parsed.verify().is_ok());
+        assert!(parsed.verify(&parsed.ed25519_public).is_ok());
         assert_eq!(parsed.target_token, bob_token);
         assert_eq!(parsed.routing_token, alice_id.routing_token);
     }
@@ -848,7 +902,7 @@ mod tests {
         let mut bytes = payload.to_bytes();
         bytes[104] ^= 0x01;
         let parsed = KeyExchangePayload::from_bytes(&bytes).unwrap();
-        assert!(parsed.verify().is_err());
+        assert!(parsed.verify(&parsed.ed25519_public).is_err());
     }
 
     #[test]
@@ -945,6 +999,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: HashSet::new(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -953,6 +1008,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: HashSet::new(),
         };
         for i in 0..10 {
             let alice_mk = alice_state.symmetric_ratchet();
@@ -971,6 +1027,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: HashSet::new(),
         };
         let mut seen_keys = std::collections::HashSet::new();
         for _ in 0..100 {
@@ -994,6 +1051,7 @@ mod tests {
                 peer_kyber_pub: None,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: std::collections::HashSet::new(),
             },
         );
         bob.e2e_sessions.insert(
@@ -1005,6 +1063,7 @@ mod tests {
                 peer_kyber_pub: None,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: std::collections::HashSet::new(),
             },
         );
         let (packet, _pq) = alice
@@ -1043,6 +1102,7 @@ mod tests {
                 send_count: 0,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: std::collections::HashSet::new(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -1097,6 +1157,7 @@ mod tests {
                 send_count: 0,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: std::collections::HashSet::new(),
                 peer_kyber_pub: None, // No Kyber key!
             },
         );
@@ -1132,6 +1193,7 @@ mod tests {
                 send_count: 0,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: std::collections::HashSet::new(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -1143,6 +1205,7 @@ mod tests {
                 send_count: 0,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: std::collections::HashSet::new(),
                 peer_kyber_pub: Some(alice_kyber_copy),
             },
         );
@@ -1201,6 +1264,7 @@ mod tests {
                 send_count: 0,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: std::collections::HashSet::new(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -1244,6 +1308,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: HashSet::new(),
         };
         for _ in 0..5 {
             no_pq_state.symmetric_ratchet();
@@ -1448,6 +1513,7 @@ mod tests {
                 peer_kyber_pub: None,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: std::collections::HashSet::new(),
             },
         );
         let chain_before = bob
@@ -1475,5 +1541,441 @@ mod tests {
             chain_before, chain_after,
             "Forged PQ inject must NOT modify chain key"
         );
+    }
+
+    // ==========================================
+    // Edge Case: Out-of-Order Packets & Bounds
+    // ==========================================
+
+    #[test]
+    fn test_edge_case_out_of_order_packets_and_loss() {
+        use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+        let mut alice_state = SymmetricSessionState {
+            root_key: [0x42u8; 32],
+            chain_key: [0x42u8; 32],
+            send_count: 0,
+            peer_kyber_pub: None,
+            recv_count: 0,
+            skip_dict: std::collections::HashMap::new(),
+            pq_inject_replay_cache: std::collections::HashSet::new(),
+        };
+        let mut bob_state = SymmetricSessionState {
+            root_key: [0x42u8; 32],
+            chain_key: [0x42u8; 32],
+            send_count: 0,
+            peer_kyber_pub: None,
+            recv_count: 0,
+            skip_dict: std::collections::HashMap::new(),
+            pq_inject_replay_cache: std::collections::HashSet::new(),
+        };
+        
+        let mk1 = alice_state.symmetric_ratchet();
+        let mk2 = alice_state.symmetric_ratchet();
+        let mk3 = alice_state.symmetric_ratchet();
+        
+        let c1 = XChaCha20Poly1305::new(Key::from_slice(&mk1));
+        let c2 = XChaCha20Poly1305::new(Key::from_slice(&mk2));
+        let c3 = XChaCha20Poly1305::new(Key::from_slice(&mk3));
+        
+        let nonce = XNonce::from_slice(&[0u8; 24]);
+        let ct1 = c1.encrypt(nonce, b"msg1".as_ref()).unwrap();
+        let ct2 = c2.encrypt(nonce, b"msg2".as_ref()).unwrap();
+        let ct3 = c3.encrypt(nonce, b"msg3".as_ref()).unwrap();
+
+        // Deliver pkt 3 first (out of order, missing 1 and 2)
+        let pt3 = bob_state.try_decrypt(2, nonce, &ct3).unwrap();
+        assert_eq!(pt3, b"msg3");
+        assert_eq!(bob_state.recv_count, 3);
+        assert_eq!(bob_state.skip_dict.len(), 2); // Buffered keys for seq 0 and 1
+
+        // Deliver pkt 1 (delayed)
+        let pt1 = bob_state.try_decrypt(0, nonce, &ct1).unwrap();
+        assert_eq!(pt1, b"msg1");
+        assert_eq!(bob_state.skip_dict.len(), 1);
+
+        // Deliver pkt 2 (delayed)
+        let pt2 = bob_state.try_decrypt(1, nonce, &ct2).unwrap();
+        assert_eq!(pt2, b"msg2");
+        assert_eq!(bob_state.skip_dict.len(), 0);
+    }
+
+    #[test]
+    fn test_edge_case_max_skip_dict_exhaustion() {
+        use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+        let mut alice_state = SymmetricSessionState {
+            root_key: [0x42u8; 32],
+            chain_key: [0x42u8; 32],
+            send_count: 0,
+            peer_kyber_pub: None,
+            recv_count: 0,
+            skip_dict: std::collections::HashMap::new(),
+            pq_inject_replay_cache: std::collections::HashSet::new(),
+        };
+        let mut bob_state = SymmetricSessionState {
+            root_key: [0x42u8; 32],
+            chain_key: [0x42u8; 32],
+            send_count: 0,
+            peer_kyber_pub: None,
+            recv_count: 0,
+            skip_dict: std::collections::HashMap::new(),
+            pq_inject_replay_cache: std::collections::HashSet::new(),
+        };
+        
+        // Receive packet with seq_no 150 (exceeds MAX_SKIP_DICT_ENTRIES of 100)
+        for _ in 0..151 {
+            alice_state.symmetric_ratchet();
+        }
+        let mk150 = alice_state.symmetric_ratchet();
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&mk150));
+        let nonce = XNonce::from_slice(&[0u8; 24]);
+        let ct150 = cipher.encrypt(nonce, b"msg150".as_ref()).unwrap();
+
+        let pt = bob_state.try_decrypt(150, nonce, &ct150);
+        assert!(pt.is_none(), "Should drop packet that skips more than 100 seq nums");
+        assert_eq!(bob_state.recv_count, 0);
+    }
+
+    #[test]
+    fn test_edge_case_pending_contacts_exhaustion() {
+        let server_addr: std::net::SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut bob = Client::new(server_addr);
+        
+        // Flood with 55 KeyExchanges
+        for _ in 0..55 {
+            let alice_id = UserIdentity::generate();
+            let payload = KeyExchangePayload::generate(&alice_id, bob.identity.routing_token);
+            let mut packet = vec![0x02];
+            packet.extend_from_slice(&payload.to_bytes());
+            
+            // Send
+            let _ = bob.handle_incoming_packet(&packet);
+        }
+        
+        // Ensure bounded to 51 (inserts up to 50, drops if > 50 which allows 51)
+        assert_eq!(bob.pending_contacts.len(), 51);
+        assert_eq!(bob.peer_kyber_keys.len(), 51);
+    }
+
+    #[test]
+    fn test_edge_case_seen_session_keys_exhaustion() {
+        let server_addr: std::net::SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut bob = Client::new(server_addr);
+        
+        // Insert a dummy pending contact to allow verification
+        let alice_id = UserIdentity::generate();
+        bob.pending_contacts.insert(alice_id.routing_token, alice_id.ed25519_public);
+        
+        // Flood with 1050 SessionEstablish payloads
+        for _ in 0..1050 {
+            let eph_sec = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
+            let eph_pub = x25519_dalek::PublicKey::from(&eph_sec);
+            let (_, kyber_ct) = pqcrypto_kyber::kyber768::encapsulate(&alice_id.kyber_public);
+            let payload = SessionEstablishPayload::generate(
+                &alice_id,
+                bob.identity.routing_token,
+                kyber_ct,
+                eph_pub,
+            );
+            
+            let mut packet = vec![0x04];
+            packet.extend_from_slice(&payload.to_bytes());
+            
+            let _ = bob.handle_incoming_packet(&packet);
+        }
+        
+        // Ensure bounded to 1000 or cleared
+        assert!(bob.seen_session_keys.len() <= 1000);
+    }
+
+    // ==========================================
+    // New Tests: Duplicate, Replay, Timestamp, Misbinding, Storage
+    // ==========================================
+
+    #[test]
+    fn test_edge_case_duplicate_message_rejection() {
+        // Verifies: same seq_no decrypts first time from skip_dict, fails second time
+        use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+        let mut alice_state = SymmetricSessionState {
+            root_key: [0x42u8; 32],
+            chain_key: [0x42u8; 32],
+            send_count: 0,
+            peer_kyber_pub: None,
+            recv_count: 0,
+            skip_dict: std::collections::HashMap::new(),
+            pq_inject_replay_cache: std::collections::HashSet::new(),
+        };
+        let mut bob_state = SymmetricSessionState {
+            root_key: [0x42u8; 32],
+            chain_key: [0x42u8; 32],
+            send_count: 0,
+            peer_kyber_pub: None,
+            recv_count: 0,
+            skip_dict: std::collections::HashMap::new(),
+            pq_inject_replay_cache: std::collections::HashSet::new(),
+        };
+
+        let mk0 = alice_state.symmetric_ratchet();
+        let mk1 = alice_state.symmetric_ratchet();
+        let nonce = XNonce::from_slice(&[0u8; 24]);
+
+        // Encrypt messages
+        let c0 = XChaCha20Poly1305::new(Key::from_slice(&mk0));
+        let c1 = XChaCha20Poly1305::new(Key::from_slice(&mk1));
+        let ct0 = c0.encrypt(nonce, b"first".as_ref()).unwrap();
+        let ct1 = c1.encrypt(nonce, b"second".as_ref()).unwrap();
+
+        // Deliver msg 1 first (out of order), which stores msg 0's key in skip_dict
+        let pt1 = bob_state.try_decrypt(1, nonce, &ct1).unwrap();
+        assert_eq!(pt1, b"second");
+        assert_eq!(bob_state.skip_dict.len(), 1); // Key for seq 0 stored
+
+        // Deliver msg 0 from skip_dict — should succeed
+        let pt0 = bob_state.try_decrypt(0, nonce, &ct0).unwrap();
+        assert_eq!(pt0, b"first");
+        assert_eq!(bob_state.skip_dict.len(), 0); // Consumed
+
+        // Replay msg 0 — skip_dict entry consumed, should fail
+        let dup = bob_state.try_decrypt(0, nonce, &ct0);
+        assert!(dup.is_none(), "Duplicate message must be rejected");
+    }
+
+    #[test]
+    fn test_edge_case_timestamp_rejection_via_handler() {
+        // Sends a stale-timestamp KeyExchange through handle_incoming_packet
+        // and verifies it is rejected (fixes incomplete test from review)
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut bob = Client::new(server_addr);
+        let alice_id = UserIdentity::generate();
+
+        // Generate a valid payload, then manually set a stale timestamp and re-sign
+        let mut payload = KeyExchangePayload::generate(&alice_id, bob.identity.routing_token);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        payload.timestamp = now - 600; // 10 minutes in the past
+        // Re-sign with the stale timestamp
+        use ed25519_dalek::Signer;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&payload.routing_token);
+        msg.extend_from_slice(&payload.target_token);
+        msg.extend_from_slice(&payload.timestamp.to_be_bytes());
+        msg.extend_from_slice(payload.ed25519_public.as_bytes());
+        msg.extend_from_slice(payload.x25519_public.as_bytes());
+        msg.extend_from_slice(payload.kyber_public.as_bytes());
+        payload.signature = alice_id.ed25519_secret.sign(&msg);
+
+        let mut packet = vec![0x02];
+        packet.extend_from_slice(&payload.to_bytes());
+        let result = bob.handle_incoming_packet(&packet).unwrap();
+        assert!(result.is_none(), "Stale timestamp must cause packet to be dropped");
+        // Bob should NOT have added alice to pending_contacts
+        assert!(
+            !bob.pending_contacts.contains_key(&alice_id.routing_token),
+            "Stale KX must not create a pending contact"
+        );
+    }
+
+    #[test]
+    fn test_edge_case_target_misbinding_via_handler() {
+        // Sends a KeyExchange bound to Charlie through Bob's handler
+        // and verifies Bob drops it (fixes incomplete test from review)
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut bob = Client::new(server_addr);
+        let alice_id = UserIdentity::generate();
+
+        let mut charlie_token = [0u8; 16];
+        charlie_token[0] = 0xCC;
+        // Alice signs a KX intended for Charlie, NOT Bob
+        let payload = KeyExchangePayload::generate(&alice_id, charlie_token);
+        let mut packet = vec![0x02];
+        packet.extend_from_slice(&payload.to_bytes());
+
+        let result = bob.handle_incoming_packet(&packet).unwrap();
+        assert!(result.is_none(), "Misbinding must cause packet to be dropped");
+        assert!(
+            !bob.pending_contacts.contains_key(&alice_id.routing_token),
+            "Misbinding must not create a pending contact"
+        );
+    }
+
+    #[test]
+    fn test_edge_case_session_establish_replay_detection() {
+        // Sends the same SessionEstablish twice; second must be dropped
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut alice = Client::new(server_addr);
+        let mut bob = Client::new(server_addr);
+
+        // Set up pending contacts
+        alice
+            .pending_contacts
+            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
+
+        // Alice sends KX, Bob replies, Alice sends SessionEstablish
+        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token);
+        let mut kx_inner = vec![0x02];
+        kx_inner.extend_from_slice(&alice_kx.to_bytes());
+        let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
+        let inner = strip_link(&bob_reply, &bob.link_master_key);
+        let alice_reply = alice.handle_incoming_packet(&inner).unwrap().unwrap();
+
+        // Bob processes SessionEstablish — first time should succeed
+        let est_inner = strip_link(&alice_reply, &alice.link_master_key);
+        let result1 = bob.handle_incoming_packet(&est_inner).unwrap();
+        assert!(result1.is_none()); // SessionEstablish returns None on success
+        assert!(bob.e2e_sessions.contains_key(&alice.identity.routing_token));
+
+        // Remove the session to test replay detection (session already exists,
+        // but seen_session_keys should still block replay)
+        bob.e2e_sessions.remove(&alice.identity.routing_token);
+
+        // Replay the same SessionEstablish — must be rejected via seen_session_keys
+        let result2 = bob.handle_incoming_packet(&est_inner).unwrap();
+        assert!(result2.is_none());
+        assert!(
+            !bob.e2e_sessions.contains_key(&alice.identity.routing_token),
+            "Replayed SessionEstablish must NOT create a new session"
+        );
+    }
+
+    #[test]
+    fn test_edge_case_pq_inject_stale_timestamp() {
+        // PQ inject with an expired timestamp must be rejected
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut bob = Client::new(server_addr);
+        let alice_id = UserIdentity::generate();
+
+        bob.pending_contacts
+            .insert(alice_id.routing_token, alice_id.ed25519_public);
+        bob.e2e_sessions.insert(
+            alice_id.routing_token,
+            SymmetricSessionState {
+                root_key: [0x42; 32],
+                chain_key: [0x42; 32],
+                send_count: 0,
+                peer_kyber_pub: None,
+                recv_count: 0,
+                skip_dict: std::collections::HashMap::new(),
+                pq_inject_replay_cache: std::collections::HashSet::new(),
+            },
+        );
+        let chain_before = bob
+            .e2e_sessions
+            .get(&alice_id.routing_token)
+            .unwrap()
+            .chain_key;
+
+        // Create PQ inject with stale timestamp
+        let (_, kyber_ct) = encapsulate(&bob.identity.kyber_public);
+        let mut pqi = PQInjectPayload::generate(&alice_id, bob.identity.routing_token, kyber_ct);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        pqi.timestamp = now - 600; // 10 minutes in the past
+        // Re-sign with the stale timestamp
+        use ed25519_dalek::Signer;
+        use pqcrypto_traits::kem::Ciphertext as _;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&pqi.routing_token);
+        msg.extend_from_slice(&pqi.target_token);
+        msg.extend_from_slice(&pqi.timestamp.to_be_bytes());
+        msg.extend_from_slice(pqi.kyber_ct.as_bytes());
+        pqi.signature = alice_id.ed25519_secret.sign(&msg);
+
+        let mut packet = vec![0x05];
+        packet.extend_from_slice(&pqi.to_bytes());
+        bob.handle_incoming_packet(&packet).unwrap();
+
+        let chain_after = bob
+            .e2e_sessions
+            .get(&alice_id.routing_token)
+            .unwrap()
+            .chain_key;
+        assert_eq!(
+            chain_before, chain_after,
+            "Stale PQ inject must NOT modify chain key"
+        );
+    }
+
+    #[test]
+    fn test_storage_save_load_roundtrip() {
+        // Verifies all keys survive serialization round-trip
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut original = Client::new(server_addr);
+
+        // Set up some state
+        let peer_token = [0xBB; 16];
+        let peer_id = UserIdentity::generate();
+        original
+            .pending_contacts
+            .insert(peer_token, peer_id.ed25519_public);
+        original.peer_kyber_keys.insert(
+            peer_token,
+            PublicKey::from_bytes(peer_id.kyber_public.as_bytes()).unwrap(),
+        );
+        original.e2e_sessions.insert(
+            peer_token,
+            SymmetricSessionState {
+                root_key: [0x42; 32],
+                chain_key: [0x43; 32],
+                send_count: 7,
+                recv_count: 3,
+                peer_kyber_pub: Some(
+                    PublicKey::from_bytes(peer_id.kyber_public.as_bytes()).unwrap(),
+                ),
+                skip_dict: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(1, [0xAA; 32]);
+                    m
+                },
+                pq_inject_replay_cache: std::collections::HashSet::new(),
+            },
+        );
+        original.seen_session_keys.insert([0xDD; 32]);
+
+        // Save to a temp file
+        let tmp_path = "test_roundtrip_state.json";
+        ClientStateDto::save(&original, tmp_path).unwrap();
+
+        // Load back
+        let loaded = ClientStateDto::load(tmp_path).unwrap();
+
+        // Verify identity
+        assert_eq!(
+            original.identity.routing_token,
+            loaded.identity.routing_token
+        );
+        assert_eq!(
+            original.identity.ed25519_public.as_bytes(),
+            loaded.identity.ed25519_public.as_bytes()
+        );
+        assert_eq!(
+            original.identity.x25519_public.as_bytes(),
+            loaded.identity.x25519_public.as_bytes()
+        );
+        assert_eq!(
+            original.identity.kyber_public.as_bytes(),
+            loaded.identity.kyber_public.as_bytes()
+        );
+
+        // Verify session state
+        let orig_sess = original.e2e_sessions.get(&peer_token).unwrap();
+        let load_sess = loaded.e2e_sessions.get(&peer_token).unwrap();
+        assert_eq!(orig_sess.root_key, load_sess.root_key);
+        assert_eq!(orig_sess.chain_key, load_sess.chain_key);
+        assert_eq!(orig_sess.send_count, load_sess.send_count);
+        assert_eq!(orig_sess.recv_count, load_sess.recv_count);
+        assert_eq!(orig_sess.skip_dict.len(), load_sess.skip_dict.len());
+        assert_eq!(orig_sess.skip_dict[&1], load_sess.skip_dict[&1]);
+
+        // Verify pending contacts
+        assert!(loaded.pending_contacts.contains_key(&peer_token));
+
+        // Verify seen_session_keys
+        assert!(loaded.seen_session_keys.contains(&[0xDD; 32]));
+
+        // Clean up
+        let _ = std::fs::remove_file(tmp_path);
     }
 }
