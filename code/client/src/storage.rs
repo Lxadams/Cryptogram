@@ -244,6 +244,7 @@ impl ClientStateDto {
             pending_contacts,
             peer_kyber_keys,
             seen_session_keys,
+            inbox: Vec::new(), // transient handoff buffer, not persisted
         })
     }
 }
