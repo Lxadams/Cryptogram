@@ -390,9 +390,9 @@ mod tests {
     fn test_sync_then_forward() {
         let tables = Arc::new(Mutex::new(Tables::new()));
         let mut identity_bytes = [0u8; 32];
-        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
+        let mut rng = OsRng;
+        rng.fill_bytes(&mut identity_bytes);
         let server_identity = SigningKey::from_bytes(&identity_bytes);
-
         let client_secret = EphemeralSecret::random_from_rng(OsRng);
         let session_id = [0xAA; 4];
         let routing_token = [0xBB; 16];
