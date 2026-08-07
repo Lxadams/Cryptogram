@@ -51,7 +51,8 @@ async fn main() -> Result<()> {
     } else {
         info!("No existing server identity found. Generating new Ed25519 keypair...");
         let mut identity_bytes = [0u8; 32];
-        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut identity_bytes);
+        let mut rng = rand_core::OsRng;
+        rand_core::RngCore::fill_bytes(&mut rng, &mut identity_bytes);
         let key = SigningKey::from_bytes(&identity_bytes);
         let dto = ServerIdentityDto {
             ed25519_secret: hex::encode(identity_bytes),
