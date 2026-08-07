@@ -722,7 +722,18 @@ async fn main() -> Result<()> {
         let mut buf = [0u8; 4096];
         loop {
             if let Ok((len, _)) = socket_clone.recv_from(&mut buf).await {
+                if len < 1 + 4 + 24 + 16 || buf[0] != TYPE_DATA {
+                    continue;
+                }
+
+                let mut session_id = [0u8; 4];
+                session_id.copy_from_slice(&buf[1..5]);
+
                 let mut c = client_clone.lock().await;
+                if session_id != c.session_id {
+                    continue;
+                }
+
                 let mut nonce_bytes = [0u8; 24];
                 nonce_bytes.copy_from_slice(&buf[5..29]);
                 let link_nonce = XNonce::from_slice(&nonce_bytes);
