@@ -669,10 +669,18 @@ async fn main() -> Result<()> {
     }
 
     let server_pub_hex = &args[1];
-    let server_pub_bytes = hex::decode(server_pub_hex).expect("Invalid hex for server pubkey");
+    let server_pub_bytes =
+        hex::decode(server_pub_hex).map_err(|_| anyhow!("Invalid hex for server pubkey"))?;
+    if server_pub_bytes.len() != 32 {
+        return Err(anyhow!(
+            "Server Ed25519 pubkey must be 32 bytes (64 hex chars), got {} bytes",
+            server_pub_bytes.len()
+        ));
+    }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&server_pub_bytes);
-    let server_pub = VerifyingKey::from_bytes(&arr).expect("Invalid server verifying key");
+    let server_pub =
+        VerifyingKey::from_bytes(&arr).map_err(|_| anyhow!("Invalid server verifying key"))?;
 
     let server_addr: SocketAddr = "127.0.0.1:4430".parse()?;
 
