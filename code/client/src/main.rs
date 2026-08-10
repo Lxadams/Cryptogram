@@ -2711,5 +2711,109 @@ mod tests {
         assert_eq!(charlie_sess2.recv_count, 0);
         assert_eq!(charlie_sess2.recv_chain_key, root_charlie);
     }
-}
 
+    #[test]
+    fn test_concurrent_multi_peer_out_of_order() {
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut alice = Client::new(server_addr);
+        let bob_token = [0xBB; 16];
+        let charlie_token = [0xCC; 16];
+
+        let root_bob = [0x11; 32];
+        let root_charlie = [0x22; 32];
+
+        alice.e2e_sessions.insert(
+            bob_token,
+            SymmetricSessionState {
+                root_key: root_bob,
+                send_chain_key: root_bob,
+                recv_chain_key: root_bob,
+                send_count: 0,
+                recv_count: 0,
+                peer_kyber_pub: None,
+                skip_dict: HashMap::new(),
+                pq_inject_replay_cache: HashSet::new(),
+            },
+        );
+
+        alice.e2e_sessions.insert(
+            charlie_token,
+            SymmetricSessionState {
+                root_key: root_charlie,
+                send_chain_key: root_charlie,
+                recv_chain_key: root_charlie,
+                send_count: 0,
+                recv_count: 0,
+                peer_kyber_pub: None,
+                skip_dict: HashMap::new(),
+                pq_inject_replay_cache: HashSet::new(),
+            },
+        );
+
+        let mut bob_sender = SymmetricSessionState {
+            root_key: root_bob,
+            send_chain_key: root_bob,
+            recv_chain_key: root_bob,
+            send_count: 0,
+            recv_count: 0,
+            peer_kyber_pub: None,
+            skip_dict: HashMap::new(),
+            pq_inject_replay_cache: HashSet::new(),
+        };
+
+        let mut charlie_sender = SymmetricSessionState {
+            root_key: root_charlie,
+            send_chain_key: root_charlie,
+            recv_chain_key: root_charlie,
+            send_count: 0,
+            recv_count: 0,
+            peer_kyber_pub: None,
+            skip_dict: HashMap::new(),
+            pq_inject_replay_cache: HashSet::new(),
+        };
+
+        let mut bob_pkts = vec![];
+        for i in 0..3 {
+            let key = bob_sender.symmetric_ratchet();
+            let c = XChaCha20Poly1305::new(Key::from_slice(&key));
+            let nonce = XNonce::from_slice(&[0x77u8; 24]);
+            let ct = c.encrypt(nonce, format!("bob{}", i).as_bytes()).unwrap();
+            let mut pkt = vec![0x01];
+            pkt.extend_from_slice(&bob_token);
+            pkt.extend_from_slice(&(i as u64).to_be_bytes());
+            pkt.extend_from_slice(&[0x77u8; 24]);
+            pkt.extend_from_slice(&ct);
+            bob_pkts.push(pkt);
+        }
+
+        let mut charlie_pkts = vec![];
+        for i in 0..3 {
+            let key = charlie_sender.symmetric_ratchet();
+            let c = XChaCha20Poly1305::new(Key::from_slice(&key));
+            let nonce = XNonce::from_slice(&[0x88u8; 24]);
+            let ct = c.encrypt(nonce, format!("char{}", i).as_bytes()).unwrap();
+            let mut pkt = vec![0x01];
+            pkt.extend_from_slice(&charlie_token);
+            pkt.extend_from_slice(&(i as u64).to_be_bytes());
+            pkt.extend_from_slice(&[0x88u8; 24]);
+            pkt.extend_from_slice(&ct);
+            charlie_pkts.push(pkt);
+        }
+
+        // Deliver interleaved and out of order
+        alice.handle_incoming_packet(&bob_pkts[2]).unwrap();
+        alice.handle_incoming_packet(&bob_pkts[0]).unwrap();
+        alice.handle_incoming_packet(&charlie_pkts[1]).unwrap();
+        alice.handle_incoming_packet(&bob_pkts[1]).unwrap();
+        alice.handle_incoming_packet(&charlie_pkts[0]).unwrap();
+        alice.handle_incoming_packet(&charlie_pkts[2]).unwrap();
+
+        let bob_sess = alice.e2e_sessions.get(&bob_token).unwrap();
+        assert_eq!(bob_sess.recv_count, 3);
+        assert!(bob_sess.skip_dict.is_empty());
+
+        let charlie_sess = alice.e2e_sessions.get(&charlie_token).unwrap();
+        assert_eq!(charlie_sess.recv_count, 3);
+        assert!(charlie_sess.skip_dict.is_empty());
+    }
+}
