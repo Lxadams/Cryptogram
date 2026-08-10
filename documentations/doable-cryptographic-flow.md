@@ -58,14 +58,14 @@ The 3-way handshake exchanges the massive Post-Quantum keys in-band, authenticat
 
 Once the session is bootstrapped, ongoing messaging uses a **Symmetric Hash Ratchet** (HMAC-SHA256) — not the Signal Double Ratchet. This was a deliberate simplification.
 
-1.  **Symmetric Ratchet & Skip Dictionary**: Each message derives a unique Message Key and advances the Chain Key:
-    *   `MessageKey = HMAC-SHA256(ChainKey, "message-key")`
-    *   `NextChainKey = HMAC-SHA256(ChainKey, "chain-key")`
+1.  **Symmetric Ratchet (Split Send/Recv) & Skip Dictionary**: Each direction maintains independent state (`send_chain_key` and `recv_chain_key`) to prevent cross-talk or desynchronization in two-way conversations:
+    *   `MessageKey = HMAC-SHA256(SendChainKey, "message-key")`
+    *   `NextSendChainKey = HMAC-SHA256(SendChainKey, "chain-key")` (and similarly for `RecvChainKey` on decryption).
     *   The old Chain Key is destroyed, but unused Message Keys are temporarily stored in a **Skip Dictionary** (up to 100 keys ahead) to handle out-of-order delivery gracefully.
 2.  **Message Encryption**: The plaintext is encrypted with `XChaCha20-Poly1305` using the Message Key. A fresh 24-byte random nonce is generated per message. The sender's 8-byte sequence number (`seq_no`) is included in the E2E payload structure.
-3.  **Periodic KEM Injection (PQ Ratchet)**: To provide continuous Post-Quantum secrecy without full session resets, a new Kyber encapsulation is performed against the peer's stored Kyber public key every 5 messages. The new PQ shared secret is mixed into the Chain Key via HKDF. The Kyber ciphertext is sent as a `0x05 PQInjectPayload` (1192 bytes).
-4.  **Packet Structure**: `[0x01 | 8-byte SeqNo | 24-byte Nonce | E2E Ciphertext]`, wrapped in link encryption.
-5.  **Decryption**: The receiver extracts the `seq_no`. If it's a previously skipped message, it retrieves the key from the Skip Dictionary. If it's a future message, it fast-forwards the chain key (up to 100 steps) and stores the intermediate skipped keys.
+3.  **Periodic KEM Injection (PQ Ratchet)**: To provide continuous Post-Quantum secrecy without full session resets, a new Kyber encapsulation is performed against the peer's stored Kyber public key every 5 messages. The new PQ shared secret is mixed independently into the respective Chain Key via HKDF. The Kyber ciphertext is sent as a `0x05 PQInjectPayload` (1192 bytes).
+4.  **Packet Structure**: `[0x01 | 16-byte SenderToken | 8-byte SeqNo | 24-byte Nonce | E2E Ciphertext]`, wrapped in link encryption. The 16-byte `SenderToken` enables O(1) direct session lookup, preventing speculative ratchet corruption.
+5.  **Decryption**: The receiver extracts the `SenderToken` to locate the correct session, then uses the `seq_no`. If it's a previously skipped message, it retrieves the key from the Skip Dictionary. If it's a future message, it fast-forwards the `recv_chain_key` (up to 100 steps) and stores the intermediate skipped keys.
 
 ---
 
@@ -123,6 +123,7 @@ Raw UDP Datagram
     └── Inner E2E Payload
         ├── [1 byte] Inner Type (0x01=Msg, 0x02=KeyExchange, 0x04=SessionEstablish, 0x05=PQInject)
         └── Type-specific payload (E2E encrypted or signed)
+            ├── Msg (0x01): [16 bytes SenderToken] + [8 bytes SeqNo] + [24 bytes Nonce] + [Ciphertext]
 ```
 
 ---
@@ -139,6 +140,8 @@ Raw UDP Datagram
 | 4 | **Server Forwarding Plaintext** | Server stored raw inner payloads and forwarded them without re-encrypting with recipient's link key | Server now re-encrypts all outbound messages with recipient's `XChaCha20-Poly1305` link key before sending. |
 | 5 | **Plaintext Dummy Packets** | Server sent cleartext dummy packets (`b"dummy_padding_to_look_real"`), making them trivially distinguishable from real traffic | Dummy packets are now random 64-byte payloads encrypted with recipient's link key, indistinguishable from real traffic. |
 | 6 | **Session Reset DoS** | Attacker replays intercepted `SessionEstablish` packets to force redundant derivations | Added a `seen_session_keys` cache to drop previously processed ephemeral X25519 keys silently. |
+| 7 | **Bidirectional Desync** | A single shared `chain_key` meant that Alice sending a message would desync Bob's sending state, permanently breaking the session if both parties sent messages. | Split `chain_key` into independent `send_chain_key` and `recv_chain_key` to maintain separate bidirectional state. |
+| 8 | **Ratchet Corruption via Speculative Decryption** | E2E messages did not contain sender identities, forcing receivers to brute-force decrypt against all sessions. This speculatively advanced ratchets, permanently corrupting innocent sessions. | Prepend 16-byte `SenderToken` to the E2E `0x01` message payload. Receiver now performs $O(1)$ direct session lookup without touching other sessions. |
 
 ### Unit Test Report (30 tests, all passing)
 
