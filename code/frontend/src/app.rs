@@ -195,7 +195,7 @@ fn ContactPanel(
             <ul class="contact-list">
                 <For
                     each=move || contacts.get()
-                    key=|c| c.token.clone()
+                    key=|c| (c.token.clone(), c.status.clone())
                     let(contact)
                 >
                     {
