@@ -28,14 +28,134 @@ struct ChatMessage {
     text: String,
 }
 
+/// Light/dark preference. Applied to `<html data-theme="...">` (see
+/// style.css, which keys both palettes' CSS custom properties off that
+/// attribute) and persisted to localStorage so it survives a reload.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+
+    fn flipped(self) -> Self {
+        match self {
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::Light,
+        }
+    }
+}
+
+const THEME_STORAGE_KEY: &str = "e2e-messenger-theme";
+
+/// Saved preference if there is one, otherwise the OS/webview's
+/// `prefers-color-scheme`, defaulting to dark (this UI's original look) if
+/// neither is available.
+fn initial_theme() -> Theme {
+    let stored = window()
+        .local_storage()
+        .ok()
+        .flatten()
+        .and_then(|storage| storage.get_item(THEME_STORAGE_KEY).ok().flatten());
+    match stored.as_deref() {
+        Some("light") => return Theme::Light,
+        Some("dark") => return Theme::Dark,
+        _ => {}
+    }
+    let prefers_light = window()
+        .match_media("(prefers-color-scheme: light)")
+        .ok()
+        .flatten()
+        .map(|mql| mql.matches())
+        .unwrap_or(false);
+    if prefers_light { Theme::Light } else { Theme::Dark }
+}
+
+/// Reflects `theme` onto `<html>` and persists it — the actual repaint
+/// happens in CSS (style.css selectors keyed on `data-theme`), this just
+/// flips the attribute.
+fn apply_theme(theme: Theme) {
+    if let Some(el) = document().document_element() {
+        let _ = el.set_attribute("data-theme", theme.as_str());
+    }
+    if let Ok(Some(storage)) = window().local_storage() {
+        let _ = storage.set_item(THEME_STORAGE_KEY, theme.as_str());
+    }
+}
+
+fn copy_to_clipboard(text: &str) {
+    // Fire-and-forget: `write_text` returns a Promise that the browser/webview
+    // runs regardless of whether we await it from Rust, and there's nothing
+    // useful to do here if it rejects (e.g. no clipboard permission).
+    let _ = window().navigator().clipboard().write_text(text);
+}
+
+/// Icon button that copies `value` to the clipboard on click, swapping to a
+/// checkmark briefly as feedback — lets users grab a routing token/Ed25519
+/// key without manually selecting the text.
+#[component]
+fn CopyButton(value: String) -> impl IntoView {
+    let copied = RwSignal::new(false);
+
+    view! {
+        <button
+            type="button"
+            class="copy-btn"
+            class:copied=move || copied.get()
+            title="Copy to clipboard"
+            on:click=move |_| {
+                copy_to_clipboard(&value);
+                copied.set(true);
+                set_timeout(move || copied.set(false), Duration::from_millis(1200));
+            }
+        >
+            {move || if copied.get() {
+                view! {
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M3 8.5l3 3 7-7" />
+                    </svg>
+                }.into_any()
+            } else {
+                view! {
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="5.5" y="5.5" width="8" height="9" rx="1.5" />
+                        <path d="M3.5 10.5v-6a1.5 1.5 0 0 1 1.5-1.5h6" />
+                    </svg>
+                }.into_any()
+            }}
+        </button>
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     // `None` until `bootstrap` succeeds — gates which screen renders.
     let identity = RwSignal::new(None::<api::IdentityDto>);
 
+    let theme = RwSignal::new(initial_theme());
+    Effect::new(move |_| apply_theme(theme.get()));
+
     view! {
         <main class="app">
-            <h1>"E2E-Messenger"</h1>
+            <div class="app-header">
+                <h1>"E2E-Messenger"</h1>
+                <button
+                    class="theme-toggle"
+                    on:click=move |_| theme.update(|t| *t = t.flipped())
+                >
+                    {move || match theme.get() {
+                        Theme::Dark => "Light mode",
+                        Theme::Light => "Dark mode",
+                    }}
+                </button>
+            </div>
             {move || match identity.get() {
                 None => view! { <ConnectScreen identity=identity /> }.into_any(),
                 Some(id) => view! { <MainScreen identity=id /> }.into_any(),
@@ -152,8 +272,16 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
     view! {
         <div class="identity-card">
             <h2>"Your Identity"</h2>
-            <p><strong>"Token: "</strong><code>{identity.routing_token}</code></p>
-            <p><strong>"Ed25519: "</strong><code>{identity.ed25519_public}</code></p>
+            <p>
+                <strong>"Token: "</strong>
+                <code>{identity.routing_token.clone()}</code>
+                <CopyButton value=identity.routing_token />
+            </p>
+            <p>
+                <strong>"Ed25519: "</strong>
+                <code>{identity.ed25519_public.clone()}</code>
+                <CopyButton value=identity.ed25519_public />
+            </p>
         </div>
     }
 }

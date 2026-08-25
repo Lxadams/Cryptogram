@@ -35,6 +35,15 @@ const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
 // Maximum timestamp drift allowed (seconds)
 const MAX_TIMESTAMP_DRIFT: u64 = 300;
 
+/// Where `Client::save`/callers' `ClientStateDto::load` persist identity +
+/// session state. Overridable via `E2E_STATE_FILE` so multiple peer
+/// processes (e.g. `code/frontend`'s Tauri backend, one per `runpeer.sh`
+/// invocation) can each keep their own identity without relying on process
+/// cwd tricks.
+pub fn state_file_path() -> String {
+    std::env::var("E2E_STATE_FILE").unwrap_or_else(|_| "client_state.json".to_string())
+}
+
 // Request Types for Server
 const TYPE_HANDSHAKE_INIT: u8 = 0;
 pub const TYPE_DATA: u8 = 1;
