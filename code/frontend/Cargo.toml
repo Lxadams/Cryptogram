@@ -19,4 +19,4 @@ serde-wasm-bindgen = "0.6.5"
 # B integration — see documentations/tech-decision-leptos-client.md).
 wasm-bindgen = "0.2.126"
 wasm-bindgen-futures = "0.4.76"
-web-sys = "0.3.103"
+web-sys = { version = "0.3.103", features = ["Storage", "MediaQueryList", "Navigator", "Clipboard"] }

@@ -6,7 +6,7 @@
 
 use crate::state::{AppState, ClientRuntime};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-use client::{Client, ClientStateDto, TYPE_DATA, perform_handshake};
+use client::{Client, ClientStateDto, TYPE_DATA, perform_handshake, state_file_path};
 use ed25519_dalek::VerifyingKey;
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
@@ -16,7 +16,6 @@ use tokio::net::UdpSocket;
 /// The relay (server) this prototype always talks to. Hardcoded for now —
 /// same assumption the CLI makes (`127.0.0.1:4430`, see runserver.sh).
 const SERVER_ADDR: &str = "127.0.0.1:4430";
-const STATE_FILE: &str = "client_state.json";
 
 #[derive(Serialize, Clone)]
 pub struct IdentityDto {
@@ -67,7 +66,8 @@ pub async fn bootstrap(
 
     // Resume a previous identity if one was saved, otherwise mint a new one
     // — identical fallback logic to the CLI.
-    let mut client = ClientStateDto::load(STATE_FILE).unwrap_or_else(|_| Client::new(server_addr));
+    let mut client =
+        ClientStateDto::load(&state_file_path()).unwrap_or_else(|_| Client::new(server_addr));
 
     let socket = Arc::new(
         UdpSocket::bind("0.0.0.0:0")

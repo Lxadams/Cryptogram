@@ -1,17 +1,52 @@
-/* Minimal dark-theme styling for the prototype — just enough structure to
-   demo the flow (connect -> identity -> contacts -> chat) without looking
-   like unstyled default HTML. Not a design system, just a prototype skin. */
+/* Minimal styling for the prototype — just enough structure to demo the
+   flow (connect -> identity -> contacts -> chat) without looking like
+   unstyled default HTML. Not a design system, just a prototype skin.
+
+   Theme: `data-theme` is set on <html> by app.rs (see toggle_theme/
+   apply_theme) based on saved preference or prefers-color-scheme. The
+   bare :root block below is the fallback used for the instant before that
+   JS-equivalent runs, and doubles as the dark palette. */
 
 :root {
   color-scheme: dark;
   --bg: #14161a;
   --panel: #1d2026;
+  --sunken: #0f1115;
+  --hover: #262a32;
   --border: #2c3038;
   --text: #e6e8eb;
   --muted: #8b92a0;
   --accent: #5b8cff;
   --ok: #3ecf8e;
   --error: #ff6b6b;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #14161a;
+  --panel: #1d2026;
+  --sunken: #0f1115;
+  --hover: #262a32;
+  --border: #2c3038;
+  --text: #e6e8eb;
+  --muted: #8b92a0;
+  --accent: #5b8cff;
+  --ok: #3ecf8e;
+  --error: #ff6b6b;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --sunken: #eceef2;
+  --hover: #e6e9ef;
+  --border: #dbdfe6;
+  --text: #1c1f26;
+  --muted: #636b7a;
+  --accent: #3b63e0;
+  --ok: #1c8f5e;
+  --error: #d1453b;
 }
 
 * {
@@ -31,14 +66,35 @@ body {
   padding: 1.5rem;
 }
 
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
 h1 {
   font-size: 1.25rem;
   color: var(--muted);
   letter-spacing: 0.02em;
 }
 
+.theme-toggle {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-weight: 400;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.8rem;
+  white-space: nowrap;
+}
+
+.theme-toggle:hover {
+  background: var(--hover);
+}
+
 code {
-  background: #0f1115;
+  background: var(--sunken);
   padding: 0.1rem 0.35rem;
   border-radius: 4px;
   font-size: 0.85em;
@@ -46,7 +102,7 @@ code {
 }
 
 input {
-  background: #0f1115;
+  background: var(--sunken);
   border: 1px solid var(--border);
   color: var(--text);
   padding: 0.5rem 0.7rem;
@@ -91,6 +147,36 @@ button:disabled {
   margin-bottom: 1rem;
 }
 
+.identity-card p {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 0.3rem;
+  border-radius: 6px;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.copy-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.copy-btn.copied {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
 .columns {
   display: grid;
   grid-template-columns: 260px 1fr;
@@ -114,11 +200,11 @@ button:disabled {
 }
 
 .contact-list li:hover {
-  background: #262a32;
+  background: var(--hover);
 }
 
 .contact-list li.selected {
-  background: #262a32;
+  background: var(--hover);
   outline: 1px solid var(--accent);
 }
 
@@ -168,7 +254,7 @@ button:disabled {
 
 .transcript p.from-peer {
   align-self: flex-start;
-  background: #262a32;
+  background: var(--hover);
 }
 
 .composer {
