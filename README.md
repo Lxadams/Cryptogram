@@ -11,6 +11,7 @@ Please visit the `documentations/` folder for more details.
 
 ## Setup
 - Run the server locally using `runserver.sh`. You might be prompted to enter your password since it uses `sudo`.
+- To run the server/client in Docker instead, or build the desktop frontend's Linux bundle via Docker, see [`code/README.md`](code/README.md).
 
 ## Conventions
 * For client-side or server-side code, please place all implementations in the `code/` folder.

@@ -75,7 +75,11 @@ fn initial_theme() -> Theme {
         .flatten()
         .map(|mql| mql.matches())
         .unwrap_or(false);
-    if prefers_light { Theme::Light } else { Theme::Dark }
+    if prefers_light {
+        Theme::Light
+    } else {
+        Theme::Dark
+    }
 }
 
 /// Reflects `theme` onto `<html>` and persists it — the actual repaint
@@ -234,17 +238,17 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
             if let Ok(list) = api::list_contacts().await {
                 contacts.set(list);
             }
-            if let Ok(incoming) = api::poll_inbox().await {
-                if !incoming.is_empty() {
-                    messages.update(|map| {
-                        for msg in incoming {
-                            map.entry(msg.from_token).or_default().push(ChatMessage {
-                                from_me: false,
-                                text: msg.text,
-                            });
-                        }
-                    });
-                }
+            if let Ok(incoming) = api::poll_inbox().await
+                && !incoming.is_empty()
+            {
+                messages.update(|map| {
+                    for msg in incoming {
+                        map.entry(msg.from_token).or_default().push(ChatMessage {
+                            from_me: false,
+                            text: msg.text,
+                        });
+                    }
+                });
             }
         });
     };

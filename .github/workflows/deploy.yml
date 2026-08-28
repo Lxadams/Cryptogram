@@ -34,7 +34,7 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_SSH_PORT || 22 }}
-          source: "server.tar"
+          source: "server.tar.gz"
           target: "/home/ubuntu/"
 
       - name: Load and run container on EC2
@@ -45,13 +45,24 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_SSH_PORT || 22 }}
           script: |
-            gunzip /home/ubuntu/server.tar.gz
+            set -e
+            gunzip -f /home/ubuntu/server.tar.gz
             docker load -i /home/ubuntu/server.tar
             docker stop server || true
             docker rm server || true
+            # server_identity is a named volume, not a bind mount: it's
+            # created once on first run and then persists across every
+            # `docker rm`+`run` this script does on later deploys, so the
+            # server's Ed25519 identity (and the pubkey clients trust)
+            # doesn't change every time you push to production.
             docker run -d \
               --name server \
               --restart unless-stopped \
               -p 443:443/udp \
+              -v server_identity:/data \
+              -e RUST_LOG=info \
               server:latest
             rm /home/ubuntu/server.tar
+            docker image prune -f
+            sleep 2
+            docker logs server --tail 20

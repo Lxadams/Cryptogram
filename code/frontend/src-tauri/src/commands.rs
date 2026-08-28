@@ -5,8 +5,8 @@
 //! serializable DTOs back.
 
 use crate::state::{AppState, ClientRuntime};
-use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-use client::{Client, ClientStateDto, TYPE_DATA, perform_handshake, state_file_path};
+use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
+use client::{perform_handshake, state_file_path, Client, ClientStateDto, TYPE_DATA};
 use ed25519_dalek::VerifyingKey;
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};

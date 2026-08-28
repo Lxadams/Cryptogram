@@ -35,8 +35,7 @@ async fn call<A: Serialize, R: DeserializeOwned>(cmd: &str, args: &A) -> Result<
 /// Tauri command errors (the `Err(String)` side of a command's `Result`)
 /// arrive as a plain JS string, not an `Error` object with a `.message`.
 fn js_error_to_string(v: &JsValue) -> String {
-    v.as_string()
-        .unwrap_or_else(|| format!("{v:?}"))
+    v.as_string().unwrap_or_else(|| format!("{v:?}"))
 }
 
 // ---------------------------------------------------------------------
@@ -87,7 +86,14 @@ struct ConnectArgs<'a> {
 }
 
 pub async fn connect_to_peer(token_hex: &str, ed25519_hex: &str) -> Result<(), String> {
-    call("connect_to_peer", &ConnectArgs { token_hex, ed25519_hex }).await
+    call(
+        "connect_to_peer",
+        &ConnectArgs {
+            token_hex,
+            ed25519_hex,
+        },
+    )
+    .await
 }
 
 #[derive(Serialize)]

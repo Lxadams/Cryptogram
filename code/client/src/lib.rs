@@ -8,8 +8,8 @@ use pqcrypto_traits::kem::{PublicKey as _, SharedSecret as _};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
-use subtle::ConstantTimeEq;
 use std::{collections::HashMap, net::SocketAddr};
+use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 
@@ -222,7 +222,7 @@ impl Client {
     }
 
     pub fn save(&self) {
-        if let Err(e) = ClientStateDto::save(self, "client_state.json") {
+        if let Err(e) = ClientStateDto::save(self, &state_file_path()) {
             tracing::error!("Failed to save state: {}", e);
         }
     }
@@ -232,7 +232,10 @@ impl Client {
         let client_ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
         let client_ephemeral_public = X25519PublicKey::from(&client_ephemeral_secret);
         // Sign the ephemeral X25519 public key with our Ed25519 identity
-        let signature = self.identity.ed25519_secret.sign(client_ephemeral_public.as_bytes());
+        let signature = self
+            .identity
+            .ed25519_secret
+            .sign(client_ephemeral_public.as_bytes());
         let mut packet = vec![TYPE_HANDSHAKE_INIT];
         packet.extend_from_slice(&self.session_id);
         packet.extend_from_slice(client_ephemeral_public.as_bytes());
@@ -346,7 +349,7 @@ impl Client {
             recv_count: 0,
             peer_kyber_pub: Some(peer_kyber_copy),
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
 
         let est_payload = SessionEstablishPayload::generate(
@@ -391,7 +394,7 @@ impl Client {
             recv_count: 0,
             peer_kyber_pub: peer_kyber,
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
         self.e2e_sessions.insert(est.routing_token, session_state);
         self.save();
@@ -514,7 +517,12 @@ impl Client {
                 // KeyExchange
                 if let Ok(kx) = KeyExchangePayload::from_bytes(pkt_data) {
                     if kx.verify(&kx.ed25519_public).is_ok() {
-                        if kx.target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
+                        if kx
+                            .target_token
+                            .ct_eq(&self.identity.routing_token)
+                            .unwrap_u8()
+                            == 0
+                        {
                             println!(
                                 ">> [SECURITY ALERT] Dropped KeyExchange! It was bound to a different target."
                             );
@@ -536,7 +544,9 @@ impl Client {
                         let is_initiator = self.pending_contacts.contains_key(&peer_token);
 
                         if !is_initiator && self.pending_contacts.len() > 50 {
-                            println!(">> [SECURITY ALERT] Dropped KeyExchange! Too many pending contacts.");
+                            println!(
+                                ">> [SECURITY ALERT] Dropped KeyExchange! Too many pending contacts."
+                            );
                             return Ok(None);
                         }
 
@@ -587,7 +597,12 @@ impl Client {
                 // SessionEstablish
 
                 if let Ok(est) = SessionEstablishPayload::from_bytes(pkt_data) {
-                    if est.target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
+                    if est
+                        .target_token
+                        .ct_eq(&self.identity.routing_token)
+                        .unwrap_u8()
+                        == 0
+                    {
                         println!(
                             ">> [SECURITY ALERT] Dropped SessionEstablish! Bound to different target."
                         );
@@ -607,14 +622,15 @@ impl Client {
                     if let Some(alice_pub) = self.pending_contacts.get(&est.routing_token) {
                         if est.verify(alice_pub).is_ok() {
                             if !self.seen_session_keys.insert(est.eph_x25519_pub.to_bytes()) {
-                                println!(">> [SECURITY ALERT] Dropped SessionEstablish! Replay detected (key already seen).");
+                                println!(
+                                    ">> [SECURITY ALERT] Dropped SessionEstablish! Replay detected (key already seen)."
+                                );
                                 return Ok(None);
                             }
                             if self.seen_session_keys.len() > 1000 {
                                 self.seen_session_keys.clear();
                             }
                             self.accept_session_est(&est);
-
                         } else {
                             println!(">> [SECURITY ALERT] SessionEstablish signature invalid!");
                         }
@@ -627,7 +643,12 @@ impl Client {
             0x05 => {
                 // PQ Inject
                 if let Ok(pqi) = PQInjectPayload::from_bytes(pkt_data) {
-                    if pqi.target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
+                    if pqi
+                        .target_token
+                        .ct_eq(&self.identity.routing_token)
+                        .unwrap_u8()
+                        == 0
+                    {
                         println!(
                             ">> [SECURITY ALERT] Dropped PQInject! Bound to different target."
                         );
@@ -650,7 +671,9 @@ impl Client {
                             if let Some(session) = self.e2e_sessions.get_mut(&pqi.routing_token) {
                                 let sig_bytes = pqi.signature.to_bytes();
                                 if session.pq_inject_replay_cache.contains(&sig_bytes) {
-                                    println!(">> [SECURITY ALERT] Dropped PQInject! Replay detected.");
+                                    println!(
+                                        ">> [SECURITY ALERT] Dropped PQInject! Replay detected."
+                                    );
                                     return Ok(None);
                                 }
                                 if session.pq_inject_replay_cache.len() > 1000 {
@@ -905,7 +928,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -914,7 +937,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
         for i in 0..10 {
             let alice_mk = alice_state.symmetric_ratchet();
@@ -933,7 +956,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
         let mut seen_keys = std::collections::HashSet::new();
         for _ in 0..100 {
@@ -1214,7 +1237,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
         for _ in 0..5 {
             no_pq_state.symmetric_ratchet();
@@ -1474,15 +1497,15 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: std::collections::HashSet::new(),
         };
-        
+
         let mk1 = alice_state.symmetric_ratchet();
         let mk2 = alice_state.symmetric_ratchet();
         let mk3 = alice_state.symmetric_ratchet();
-        
+
         let c1 = XChaCha20Poly1305::new(Key::from_slice(&mk1));
         let c2 = XChaCha20Poly1305::new(Key::from_slice(&mk2));
         let c3 = XChaCha20Poly1305::new(Key::from_slice(&mk3));
-        
+
         let nonce = XNonce::from_slice(&[0u8; 24]);
         let ct1 = c1.encrypt(nonce, b"msg1".as_ref()).unwrap();
         let ct2 = c2.encrypt(nonce, b"msg2".as_ref()).unwrap();
@@ -1526,7 +1549,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: std::collections::HashSet::new(),
         };
-        
+
         // Receive packet with seq_no 150 (exceeds MAX_SKIP_DICT_ENTRIES of 100)
         for _ in 0..151 {
             alice_state.symmetric_ratchet();
@@ -1537,7 +1560,10 @@ mod tests {
         let ct150 = cipher.encrypt(nonce, b"msg150".as_ref()).unwrap();
 
         let pt = bob_state.try_decrypt(150, nonce, &ct150);
-        assert!(pt.is_none(), "Should drop packet that skips more than 100 seq nums");
+        assert!(
+            pt.is_none(),
+            "Should drop packet that skips more than 100 seq nums"
+        );
         assert_eq!(bob_state.recv_count, 0);
     }
 
@@ -1545,18 +1571,18 @@ mod tests {
     fn test_edge_case_pending_contacts_exhaustion() {
         let server_addr: std::net::SocketAddr = "127.0.0.1:4430".parse().unwrap();
         let mut bob = Client::new(server_addr);
-        
+
         // Flood with 55 KeyExchanges
         for _ in 0..55 {
             let alice_id = UserIdentity::generate();
             let payload = KeyExchangePayload::generate(&alice_id, bob.identity.routing_token);
             let mut packet = vec![0x02];
             packet.extend_from_slice(&payload.to_bytes());
-            
+
             // Send
             let _ = bob.handle_incoming_packet(&packet);
         }
-        
+
         // Ensure bounded to 51 (inserts up to 50, drops if > 50 which allows 51)
         assert_eq!(bob.pending_contacts.len(), 51);
         assert_eq!(bob.peer_kyber_keys.len(), 51);
@@ -1566,11 +1592,12 @@ mod tests {
     fn test_edge_case_seen_session_keys_exhaustion() {
         let server_addr: std::net::SocketAddr = "127.0.0.1:4430".parse().unwrap();
         let mut bob = Client::new(server_addr);
-        
+
         // Insert a dummy pending contact to allow verification
         let alice_id = UserIdentity::generate();
-        bob.pending_contacts.insert(alice_id.routing_token, alice_id.ed25519_public);
-        
+        bob.pending_contacts
+            .insert(alice_id.routing_token, alice_id.ed25519_public);
+
         // Flood with 1050 SessionEstablish payloads
         for _ in 0..1050 {
             let eph_sec = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
@@ -1582,13 +1609,13 @@ mod tests {
                 kyber_ct,
                 eph_pub,
             );
-            
+
             let mut packet = vec![0x04];
             packet.extend_from_slice(&payload.to_bytes());
-            
+
             let _ = bob.handle_incoming_packet(&packet);
         }
-        
+
         // Ensure bounded to 1000 or cleared
         assert!(bob.seen_session_keys.len() <= 1000);
     }
@@ -1674,7 +1701,10 @@ mod tests {
         let mut packet = vec![0x02];
         packet.extend_from_slice(&payload.to_bytes());
         let result = bob.handle_incoming_packet(&packet).unwrap();
-        assert!(result.is_none(), "Stale timestamp must cause packet to be dropped");
+        assert!(
+            result.is_none(),
+            "Stale timestamp must cause packet to be dropped"
+        );
         // Bob should NOT have added alice to pending_contacts
         assert!(
             !bob.pending_contacts.contains_key(&alice_id.routing_token),
@@ -1698,7 +1728,10 @@ mod tests {
         packet.extend_from_slice(&payload.to_bytes());
 
         let result = bob.handle_incoming_packet(&packet).unwrap();
-        assert!(result.is_none(), "Misbinding must cause packet to be dropped");
+        assert!(
+            result.is_none(),
+            "Misbinding must cause packet to be dropped"
+        );
         assert!(
             !bob.pending_contacts.contains_key(&alice_id.routing_token),
             "Misbinding must not create a pending contact"

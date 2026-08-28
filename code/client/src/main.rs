@@ -17,7 +17,7 @@ use ed25519_dalek::VerifyingKey;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{io::AsyncBufReadExt, net::UdpSocket, sync::Mutex};
 
-use client::{Client, ClientStateDto, TYPE_DATA, perform_handshake};
+use client::{Client, ClientStateDto, TYPE_DATA, perform_handshake, state_file_path};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,11 +46,21 @@ async fn main() -> Result<()> {
     let server_pub =
         VerifyingKey::from_bytes(&arr).map_err(|_| anyhow!("Invalid server verifying key"))?;
 
-    let server_addr: SocketAddr = "127.0.0.1:4430".parse()?;
+    // Defaults to 127.0.0.1:4430 to match the server's local-dev default.
+    // Override with SERVER_ADDR (e.g. "server:443" when running in Docker
+    // Compose, where the relay isn't reachable via loopback). Resolved via
+    // DNS lookup rather than SocketAddr::parse so a Compose service name
+    // works, not just IP literals.
+    let server_addr_raw =
+        std::env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:4430".to_string());
+    let server_addr: SocketAddr = tokio::net::lookup_host(&server_addr_raw)
+        .await?
+        .next()
+        .ok_or_else(|| anyhow!("Could not resolve SERVER_ADDR: {}", server_addr_raw))?;
 
     // Resume a previous identity/session set if one was persisted to disk,
     // otherwise mint a fresh identity.
-    let client_obj = match ClientStateDto::load("client_state.json") {
+    let client_obj = match ClientStateDto::load(&state_file_path()) {
         Ok(c) => {
             println!("Loaded client state from disk.");
             c

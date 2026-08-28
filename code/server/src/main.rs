@@ -65,8 +65,10 @@ async fn main() -> Result<()> {
 
     let mut buffer = [0u8; 2048];
 
-    // Bind to 127.0.0.1:4430 for local testing without sudo
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:4430").await?);
+    // Defaults to 127.0.0.1:4430 for local testing without sudo.
+    // Override with BIND_ADDR (e.g. "0.0.0.0:443" when running in Docker).
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4430".to_string());
+    let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
     info!("UDP server listening on {}", socket.local_addr()?);
     info!(
         "Server Static Pubkey: {}",

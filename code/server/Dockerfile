@@ -8,5 +8,7 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 COPY --from=builder /app/server/target/release/server /usr/local/bin/server
+WORKDIR /data
+ENV BIND_ADDR=0.0.0.0:443
 EXPOSE 443/udp
 CMD ["server"]
