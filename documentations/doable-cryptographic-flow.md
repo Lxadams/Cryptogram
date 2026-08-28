@@ -143,7 +143,7 @@ Raw UDP Datagram
 | 7 | **Bidirectional Desync** | A single shared `chain_key` meant that Alice sending a message would desync Bob's sending state, permanently breaking the session if both parties sent messages. | Split `chain_key` into independent `send_chain_key` and `recv_chain_key` to maintain separate bidirectional state. |
 | 8 | **Ratchet Corruption via Speculative Decryption** | E2E messages did not contain sender identities, forcing receivers to brute-force decrypt against all sessions. This speculatively advanced ratchets, permanently corrupting innocent sessions. | Prepend 16-byte `SenderToken` to the E2E `0x01` message payload. Receiver now performs $O(1)$ direct session lookup without touching other sessions. |
 
-### Unit Test Report (30 tests, all passing)
+### Unit Test Report (34 tests, all passing)
 
 #### Serialization & Signature Tests
 | Test | Description |
@@ -217,8 +217,8 @@ Raw UDP Datagram
 | `test_edge_case_session_establish_replay_detection` | Full handshake, then replays the same SessionEstablish. Verifies seen_session_keys blocks the replay from creating a new session. |
 | `test_edge_case_pq_inject_stale_timestamp` | Creates a PQ inject with timestamp 600s in the past, re-signs it. Verifies the handler drops it and chain key is unchanged. |
 | `test_storage_save_load_roundtrip` | Creates a Client with sessions, pending contacts, and seen keys. Saves to JSON, loads back, and verifies all keys survive round-trip. |
+| `test_concurrent_multi_peer_out_of_order` | Simulates receiving highly interleaved and out-of-order packets from multiple peers simultaneously. Asserts $O(1)$ SenderToken lookup routes to the correct session and skip dictionaries handle the disorder cleanly without advancing the wrong ratchets. |
 
 ### Known Issues & Acceptable MVP Compromises
 
-1.  **TOFU (Trust On First Use) Vulnerability**: When Bob receives a `KeyExchange` from an unknown sender, the CLI auto-accepts it with a `[SECURITY WARNING]`. A real mobile app must implement a "Message Requests" inbox requiring explicit user acceptance.
-2.  **Trial Decryption Scaling**: Message decryption currently iterates over all active E2E sessions attempting trial decryption. With many contacts, this is O(n) per message. A sender-identifier header (encrypted under the link layer) would reduce this to O(1).
+1.  **TOFU (Trust On First Use) Vulnerability**: When Bob receives a `KeyExchange` from an unknown sender, the core library auto-accepts it with a `[SECURITY WARNING]`. A real mobile app must implement a "Message Requests" inbox requiring explicit user acceptance.
