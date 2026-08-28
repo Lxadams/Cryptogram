@@ -103,3 +103,64 @@ sequenceDiagram
     
     A->>A: Reassemble & Decrypt
 ```
+## 4. High-Level Topology (The 10,000-Foot View)
+
+This diagram shows the broad network layout. It highlights that the server is completely untrusted and has no persistent database, while all sensitive cryptographic keys and session states remain strictly isolated on the local devices.
+
+```mermaid
+graph TD
+    subgraph Client A [Alice's Device]
+        AppA[Tauri Desktop App]
+        StorageA[(Local Storage & Keys)]
+        AppA --> StorageA
+    end
+
+    subgraph Server [Relay Server]
+        direction TB
+        Relay[Blind UDP Router]
+        RAM[(Volatile RAM Queue)]
+        Relay --- RAM
+    end
+
+    subgraph Client B [Bob's Device]
+        AppB[Tauri Desktop App]
+        StorageB[(Local Storage & Keys)]
+        AppB --> StorageB
+    end
+
+    AppA <==>|Link Encrypted UDP| Relay
+    Relay <==>|Link Encrypted UDP| AppB
+    
+    AppA -.->|Out-of-Band Micro-QR Scan| AppB
+```
+
+## 5. Component & Data Flow (The Tech Stack)
+
+This diagram illustrates the internal architecture of the desktop client. It shows how the Leptos WebAssembly frontend communicates with the Rust core via Tauri's IPC bridge, and how the cryptographic engine manages the UDP network state.
+
+```mermaid
+graph TD
+    subgraph Desktop Client [Tauri Application]
+        
+        subgraph Frontend [Webview]
+            Leptos[Leptos UI / WASM]
+        end
+
+        subgraph Backend [Rust Core]
+            TauriAPI[Tauri IPC Handlers]
+            LibRS[lib.rs Cryptographic Core]
+            Crypto[Kyber & XChaCha20 Engine]
+            Net[UDP Socket Manager]
+            Storage[(Local JSON State)]
+        end
+        
+        Leptos <-->|JSON Commands| TauriAPI
+        TauriAPI <--> LibRS
+        LibRS <--> Crypto
+        LibRS <--> Storage
+        LibRS <--> Net
+        
+    end
+    
+    Net <-->|Raw UDP Packets| WAN((Internet / Relay))
+```
