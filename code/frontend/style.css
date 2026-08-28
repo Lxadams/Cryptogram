@@ -1,0 +1,267 @@
+/* Minimal styling for the prototype — just enough structure to demo the
+   flow (connect -> identity -> contacts -> chat) without looking like
+   unstyled default HTML. Not a design system, just a prototype skin.
+
+   Theme: `data-theme` is set on <html> by app.rs (see toggle_theme/
+   apply_theme) based on saved preference or prefers-color-scheme. The
+   bare :root block below is the fallback used for the instant before that
+   JS-equivalent runs, and doubles as the dark palette. */
+
+:root {
+  color-scheme: dark;
+  --bg: #14161a;
+  --panel: #1d2026;
+  --sunken: #0f1115;
+  --hover: #262a32;
+  --border: #2c3038;
+  --text: #e6e8eb;
+  --muted: #8b92a0;
+  --accent: #5b8cff;
+  --ok: #3ecf8e;
+  --error: #ff6b6b;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #14161a;
+  --panel: #1d2026;
+  --sunken: #0f1115;
+  --hover: #262a32;
+  --border: #2c3038;
+  --text: #e6e8eb;
+  --muted: #8b92a0;
+  --accent: #5b8cff;
+  --ok: #3ecf8e;
+  --error: #ff6b6b;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --sunken: #eceef2;
+  --hover: #e6e9ef;
+  --border: #dbdfe6;
+  --text: #1c1f26;
+  --muted: #636b7a;
+  --accent: #3b63e0;
+  --ok: #1c8f5e;
+  --error: #d1453b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.app {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+h1 {
+  font-size: 1.25rem;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.theme-toggle {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-weight: 400;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.8rem;
+  white-space: nowrap;
+}
+
+.theme-toggle:hover {
+  background: var(--hover);
+}
+
+code {
+  background: var(--sunken);
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+  word-break: break-all;
+}
+
+input {
+  background: var(--sunken);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.5rem 0.7rem;
+  border-radius: 6px;
+  width: 100%;
+  margin-bottom: 0.5rem;
+}
+
+button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.error {
+  color: var(--error);
+  font-size: 0.9rem;
+}
+
+.connect-screen,
+.identity-card,
+.contact-panel,
+.chat-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.identity-card p {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 0.3rem;
+  border-radius: 6px;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.copy-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.copy-btn.copied {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.columns {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+
+.contact-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1rem 0;
+}
+
+.contact-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.contact-list li:hover {
+  background: var(--hover);
+}
+
+.contact-list li.selected {
+  background: var(--hover);
+  outline: 1px solid var(--accent);
+}
+
+.status {
+  font-size: 0.75rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  text-transform: uppercase;
+}
+
+.status-established {
+  background: rgba(62, 207, 142, 0.15);
+  color: var(--ok);
+}
+
+.status-pending {
+  background: rgba(255, 193, 7, 0.15);
+  color: #ffc107;
+}
+
+.chat-panel {
+  min-height: 320px;
+  display: flex;
+  flex-direction: column;
+}
+
+.transcript {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+
+.transcript p {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border-radius: 8px;
+  max-width: 70%;
+}
+
+.transcript p.from-me {
+  align-self: flex-end;
+  background: var(--accent);
+  color: white;
+}
+
+.transcript p.from-peer {
+  align-self: flex-start;
+  background: var(--hover);
+}
+
+.composer {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.composer input {
+  margin-bottom: 0;
+}

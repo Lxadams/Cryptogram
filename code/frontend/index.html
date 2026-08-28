@@ -1,0 +1,17 @@
+<!--
+  Trunk's build entry point. Trunk (the Leptos/WASM build tool) scans this
+  file for `data-trunk` tags at build time: the `rel="css"` link below gets
+  the stylesheet copied/hashed into the output, and Trunk injects a
+  `<link rel="rust">`-equivalent <script> tag automatically to load and run
+  the compiled WASM app into <body>. No <script> tag needed by hand here.
+-->
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>E2E-Messenger</title>
+    <link data-trunk rel="css" href="style.css" />
+  </head>
+  <body></body>
+</html>

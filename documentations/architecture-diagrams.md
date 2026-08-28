@@ -1,5 +1,8 @@
 # E2E-Messenger: Protocol Flow Diagrams
 
+> [!WARNING]
+> **This document describes the aspirational target architecture.** The current implementation is documented in [doable-cryptographic-flow.md](doable-cryptographic-flow.md). The following features shown in these diagrams are **NOT yet implemented**: RaptorQ erasure coding, per-conversation unidirectional routing tokens, 100ms metronome constant-rate sending, and X25519 Double Ratchet (the current implementation uses a Symmetric Hash Ratchet with periodic PQ KEM injection).
+
 This document illustrates the core operational flows of the E2E-Messenger architecture. It covers the initial physical and cryptographic handshake, the ongoing metronomic communication, and the offline queuing mechanism.
 
 ## 1. Initial Handshake & Session Bootstrapping
@@ -24,8 +27,9 @@ sequenceDiagram
     B->>B: HKDF(Kyber + X25519) = Session Master Key
     
     Note over B, S: Phase 3: Server Link Handshake (App Boot)
-    B->>S: Link Handshake (Ephemeral X25519 PubKey)
-    S->>B: 4-byte Session ID (Link Key Established)
+    B->>S: Link Handshake (Eph X25519 Pub + Ed25519 Sig)
+    S->>S: Verify Client Signature
+    S->>B: 4-byte Session ID + Server Ed25519 Sig (Mutual Auth)
 
     B->>B: Encrypt Msg 1 & Handshake with Master Key
     B->>B: Slice via RaptorQ & Apply XChaCha20 Link Encryption
