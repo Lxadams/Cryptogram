@@ -1,0 +1,22 @@
+[package]
+name = "frontend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Forwards Rust panics to the browser console with a real stack trace
+# instead of the default opaque "unreachable executed" WASM trap.
+console_error_panic_hook = "0.1.7"
+js-sys = "0.3.103"
+# `csr` = client-side rendering: compile straight to WASM and run entirely
+# in the browser/webview, no server-rendering feature needed here.
+leptos = { version = "0.8.20", features = ["csr"] }
+# Client-side routing between UI screens (identity, contacts, chat, etc.).
+leptos_router = "0.8.15"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-wasm-bindgen = "0.6.5"
+# Low-level JS interop, needed once we bridge to Tauri's `invoke()` (Option
+# B integration — see documentations/tech-decision-leptos-client.md).
+wasm-bindgen = "0.2.126"
+wasm-bindgen-futures = "0.4.76"
+web-sys = { version = "0.3.103", features = ["Storage", "MediaQueryList", "Navigator", "Clipboard"] }
