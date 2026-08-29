@@ -200,6 +200,15 @@ pub struct Client {
     pub pending_contacts: HashMap<RoutingToken, VerifyingKey>,
     pub peer_kyber_keys: HashMap<RoutingToken, PublicKey>,
     pub seen_session_keys: HashSet<[u8; 32]>,
+    /// This peer's own self-chosen display name (e.g. `./runpeer.sh alice`
+    /// sets it via `E2E_PEER_NAME`), sent with every outgoing KeyExchange so
+    /// peers can label us by name instead of hex. Empty if unset.
+    pub local_name: String,
+    /// Display names peers have told us about themselves, learned from the
+    /// (signed) `name` field of their `KeyExchangePayload` — populated for
+    /// both pending and established contacts as soon as their KeyExchange
+    /// arrives, no manual entry required.
+    pub contact_names: HashMap<RoutingToken, String>,
     /// Decrypted messages that have arrived but not yet been collected by a
     /// consumer. The CLI doesn't use this (it prints inline as messages
     /// arrive), but a GUI front end has no console to print to — it polls
@@ -222,6 +231,8 @@ impl Client {
             pending_contacts: HashMap::new(),
             peer_kyber_keys: HashMap::new(),
             seen_session_keys: HashSet::new(),
+            local_name: String::new(),
+            contact_names: HashMap::new(),
             inbox: Vec::new(),
         }
     }
@@ -233,7 +244,7 @@ impl Client {
     }
 
     pub fn save(&self) {
-        if let Err(e) = ClientStateDto::save(self, "client_state.json") {
+        if let Err(e) = ClientStateDto::save(self, &state_file_path()) {
             tracing::error!("Failed to save state: {}", e);
         }
     }
@@ -319,7 +330,7 @@ impl Client {
     }
 
     pub fn create_kx_request(&self, target_token: RoutingToken) -> Vec<u8> {
-        let payload = KeyExchangePayload::generate(&self.identity, target_token);
+        let payload = KeyExchangePayload::generate(&self.identity, target_token, &self.local_name);
         let mut inner = vec![0x02];
         inner.extend_from_slice(&payload.to_bytes());
         self.wrap_link_encryption(target_token, &inner)
@@ -562,6 +573,15 @@ impl Client {
                             PublicKey::from_bytes(kx.kyber_public.as_bytes()).unwrap(),
                         );
 
+                        // Learn the peer's self-chosen name (if any) the moment
+                        // their KeyExchange arrives — before either branch below,
+                        // so it shows up for pending AND established contacts.
+                        if kx.name.is_empty() {
+                            self.contact_names.remove(&peer_token);
+                        } else {
+                            self.contact_names.insert(peer_token, kx.name.clone());
+                        }
+
                         if is_initiator {
                             let expected_ed25519 = self.pending_contacts.get(&peer_token).unwrap();
                             if kx.ed25519_public.as_bytes() != expected_ed25519.as_bytes() {
@@ -748,9 +768,9 @@ mod tests {
         let alice_id = UserIdentity::generate();
         let mut bob_token = [0u8; 16];
         bob_token[0] = 0xBB;
-        let payload = KeyExchangePayload::generate(&alice_id, bob_token);
+        let payload = KeyExchangePayload::generate(&alice_id, bob_token, "");
         let bytes = payload.to_bytes();
-        assert_eq!(bytes.len(), 1352);
+        assert_eq!(bytes.len(), 1384);
         let parsed = KeyExchangePayload::from_bytes(&bytes).unwrap();
         assert!(parsed.verify(&parsed.ed25519_public).is_ok());
         assert_eq!(parsed.target_token, bob_token);
@@ -820,7 +840,7 @@ mod tests {
     #[test]
     fn test_edge_case_bad_kx_signature() {
         let alice_id = UserIdentity::generate();
-        let payload = KeyExchangePayload::generate(&alice_id, [0u8; 16]);
+        let payload = KeyExchangePayload::generate(&alice_id, [0u8; 16], "");
         let mut bytes = payload.to_bytes();
         bytes[104] ^= 0x01;
         let parsed = KeyExchangePayload::from_bytes(&bytes).unwrap();
@@ -887,7 +907,7 @@ mod tests {
     #[test]
     fn test_edge_case_timestamp_expiration() {
         let alice_id = UserIdentity::generate();
-        let mut payload = KeyExchangePayload::generate(&alice_id, [0u8; 16]);
+        let mut payload = KeyExchangePayload::generate(&alice_id, [0u8; 16], "");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -902,7 +922,7 @@ mod tests {
         let alice_id = UserIdentity::generate();
         let mut charlie_token = [0u8; 16];
         charlie_token[0] = 0xCC;
-        let payload = KeyExchangePayload::generate(&alice_id, charlie_token);
+        let payload = KeyExchangePayload::generate(&alice_id, charlie_token, "");
         let mut bob_token = [0u8; 16];
         bob_token[0] = 0xBB;
         assert_ne!(payload.target_token, bob_token);
@@ -1268,7 +1288,7 @@ mod tests {
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
 
         // Step 1: Alice sends KeyExchange to Bob
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token);
+        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap();
@@ -1308,6 +1328,46 @@ mod tests {
     }
 
     #[test]
+    fn test_key_exchange_propagates_display_name() {
+        // A self-chosen name (e.g. set via `./runpeer.sh alice`) should
+        // reach the peer automatically as part of the KeyExchange — no
+        // manual entry by the other side, in either direction.
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut alice = Client::new(server_addr);
+        let mut bob = Client::new(server_addr);
+        alice.local_name = "alice".to_string();
+        bob.local_name = "bob".to_string();
+
+        alice
+            .pending_contacts
+            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
+
+        let alice_kx = KeyExchangePayload::generate(
+            &alice.identity,
+            bob.identity.routing_token,
+            &alice.local_name,
+        );
+        let mut kx_inner = vec![0x02];
+        kx_inner.extend_from_slice(&alice_kx.to_bytes());
+        let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
+
+        assert_eq!(
+            bob.contact_names.get(&alice.identity.routing_token),
+            Some(&"alice".to_string()),
+            "Bob should learn Alice's name straight from her KeyExchange, while still only 'pending'"
+        );
+
+        let inner = strip_link(&bob_reply, &bob.link_master_key);
+        alice.handle_incoming_packet(&inner).unwrap();
+
+        assert_eq!(
+            alice.contact_names.get(&bob.identity.routing_token),
+            Some(&"bob".to_string()),
+            "Alice should learn Bob's name from his auto-reply, without typing it in herself"
+        );
+    }
+
+    #[test]
     fn test_full_handshake_then_pq_inject() {
         // Full handshake + 5 messages + PQ inject: end-to-end integration
         let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
@@ -1318,7 +1378,7 @@ mod tests {
         alice
             .pending_contacts
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token);
+        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
@@ -1581,7 +1641,7 @@ mod tests {
         // Flood with 55 KeyExchanges
         for _ in 0..55 {
             let alice_id = UserIdentity::generate();
-            let payload = KeyExchangePayload::generate(&alice_id, bob.identity.routing_token);
+            let payload = KeyExchangePayload::generate(&alice_id, bob.identity.routing_token, "");
             let mut packet = vec![0x02];
             packet.extend_from_slice(&payload.to_bytes());
             
@@ -1688,7 +1748,7 @@ mod tests {
         let alice_id = UserIdentity::generate();
 
         // Generate a valid payload, then manually set a stale timestamp and re-sign
-        let mut payload = KeyExchangePayload::generate(&alice_id, bob.identity.routing_token);
+        let mut payload = KeyExchangePayload::generate(&alice_id, bob.identity.routing_token, "");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1727,7 +1787,7 @@ mod tests {
         let mut charlie_token = [0u8; 16];
         charlie_token[0] = 0xCC;
         // Alice signs a KX intended for Charlie, NOT Bob
-        let payload = KeyExchangePayload::generate(&alice_id, charlie_token);
+        let payload = KeyExchangePayload::generate(&alice_id, charlie_token, "");
         let mut packet = vec![0x02];
         packet.extend_from_slice(&payload.to_bytes());
 
@@ -1752,7 +1812,7 @@ mod tests {
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
 
         // Alice sends KX, Bob replies, Alice sends SessionEstablish
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token);
+        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
