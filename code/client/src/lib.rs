@@ -84,7 +84,8 @@ impl UserIdentity {
 
 pub struct SymmetricSessionState {
     pub root_key: [u8; 32],
-    pub chain_key: [u8; 32],
+    pub send_chain_key: [u8; 32],
+    pub recv_chain_key: [u8; 32],
     pub send_count: u64,
     pub recv_count: u64,
     pub peer_kyber_pub: Option<PublicKey>,
@@ -94,13 +95,13 @@ pub struct SymmetricSessionState {
 
 impl SymmetricSessionState {
     pub fn symmetric_ratchet(&mut self) -> [u8; 32] {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.chain_key).unwrap();
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.send_chain_key).unwrap();
         mac.update(b"message-key");
         let message_key = mac.finalize().into_bytes().into();
 
-        let mut mac_chain = <HmacSha256 as Mac>::new_from_slice(&self.chain_key).unwrap();
+        let mut mac_chain = <HmacSha256 as Mac>::new_from_slice(&self.send_chain_key).unwrap();
         mac_chain.update(b"chain-key");
-        self.chain_key = mac_chain.finalize().into_bytes().into();
+        self.send_chain_key = mac_chain.finalize().into_bytes().into();
 
         message_key
     }
@@ -137,7 +138,7 @@ impl SymmetricSessionState {
             }
         }
 
-        let mut test_chain = self.chain_key;
+        let mut test_chain = self.recv_chain_key;
         let mut skipped_keys = Vec::new();
 
         let mut msg_key = [0u8; 32];
@@ -155,7 +156,7 @@ impl SymmetricSessionState {
 
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&msg_key));
         if let Ok(pt) = cipher.decrypt(nonce, ciphertext) {
-            self.chain_key = test_chain;
+            self.recv_chain_key = test_chain;
             for (i, key) in skipped_keys.into_iter().enumerate() {
                 let s = self.recv_count + i as u64;
                 if s < seq_no {
@@ -169,13 +170,23 @@ impl SymmetricSessionState {
         }
     }
 
-    /// Mix fresh PQ shared secret into the chain key via HKDF
-    pub fn inject_pq_secret(&mut self, pq_secret_bytes: &[u8]) {
+    /// Mix fresh PQ shared secret into the send chain key via HKDF (called by sender)
+    pub fn inject_pq_secret_send(&mut self, pq_secret_bytes: &[u8]) {
         let mut inject_input = Vec::new();
-        inject_input.extend_from_slice(&self.chain_key);
+        inject_input.extend_from_slice(&self.send_chain_key);
         inject_input.extend_from_slice(pq_secret_bytes);
         let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), &inject_input);
-        hkdf.expand(b"pq-ratchet-inject", &mut self.chain_key)
+        hkdf.expand(b"pq-ratchet-inject", &mut self.send_chain_key)
+            .unwrap();
+    }
+
+    /// Mix fresh PQ shared secret into the recv chain key via HKDF (called by receiver)
+    pub fn inject_pq_secret_recv(&mut self, pq_secret_bytes: &[u8]) {
+        let mut inject_input = Vec::new();
+        inject_input.extend_from_slice(&self.recv_chain_key);
+        inject_input.extend_from_slice(pq_secret_bytes);
+        let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), &inject_input);
+        hkdf.expand(b"pq-ratchet-inject", &mut self.recv_chain_key)
             .unwrap();
     }
 }
@@ -341,7 +352,8 @@ impl Client {
 
         let session_state = SymmetricSessionState {
             root_key,
-            chain_key: root_key,
+            send_chain_key: root_key,
+            recv_chain_key: root_key,
             send_count: 0,
             recv_count: 0,
             peer_kyber_pub: Some(peer_kyber_copy),
@@ -386,7 +398,8 @@ impl Client {
 
         let session_state = SymmetricSessionState {
             root_key,
-            chain_key: root_key,
+            send_chain_key: root_key,
+            recv_chain_key: root_key,
             send_count: 0,
             recv_count: 0,
             peer_kyber_pub: peer_kyber,
@@ -422,6 +435,7 @@ impl Client {
             let e2e_nonce = XNonce::from_slice(&e2e_nonce_bytes);
 
             let mut full_e2e_payload = vec![0x01];
+            full_e2e_payload.extend_from_slice(&self.identity.routing_token);
             full_e2e_payload.extend_from_slice(&session.send_count.to_be_bytes());
             full_e2e_payload.extend_from_slice(&e2e_nonce_bytes);
             let e2e_ciphertext = e2e_cipher.encrypt(e2e_nonce, plaintext).unwrap();
@@ -435,7 +449,7 @@ impl Client {
             let pq_ct = if session.send_count % PQ_INJECT_INTERVAL == 0 {
                 if let Some(ref peer_kyber) = session.peer_kyber_pub {
                     let (pq_secret, kyber_ct) = encapsulate(peer_kyber);
-                    session.inject_pq_secret(pq_secret.as_bytes());
+                    session.inject_pq_secret_send(pq_secret.as_bytes());
                     println!(
                         ">> [PQ] Injected post-quantum entropy after {} messages",
                         session.send_count
@@ -475,37 +489,39 @@ impl Client {
 
         match pkt_type {
             0x01 => {
-                // Msg
-                if pkt_data.len() < 32 {
+                // Msg: [16-byte sender_token | 8-byte seq_no | 24-byte nonce | ciphertext]
+                if pkt_data.len() < 16 + 8 + 24 {
                     return Err(anyhow!("Msg payload too small"));
                 }
-                let seq_no = u64::from_be_bytes(pkt_data[0..8].try_into().unwrap());
+                let mut sender_token = [0u8; 16];
+                sender_token.copy_from_slice(&pkt_data[0..16]);
+                let seq_no = u64::from_be_bytes(pkt_data[16..24].try_into().unwrap());
                 let mut nonce_bytes = [0u8; 24];
-                nonce_bytes.copy_from_slice(&pkt_data[8..32]);
+                nonce_bytes.copy_from_slice(&pkt_data[24..48]);
                 let nonce = XNonce::from_slice(&nonce_bytes);
-                let ciphertext = &pkt_data[32..];
+                let ciphertext = &pkt_data[48..];
 
-                let mut decrypted = None;
-                for (token, session) in self.e2e_sessions.iter_mut() {
+                if let Some(session) = self.e2e_sessions.get_mut(&sender_token) {
                     if let Some(pt) = session.try_decrypt(seq_no, nonce, ciphertext) {
-                        decrypted = Some((*token, pt));
-                        break;
+                        self.save();
+                        println!(
+                            ">> [From {}]: {}",
+                            hex::encode(&sender_token[0..4]),
+                            String::from_utf8_lossy(&pt)
+                        );
+                        // Also hand it to any polling consumer (e.g. a GUI) —
+                        // see the `inbox` field doc comment above.
+                        self.inbox.push((sender_token, pt));
+                    } else {
+                        println!(
+                            ">> Received packet from {} but decryption failed (out of sync?).",
+                            hex::encode(&sender_token[0..4])
+                        );
                     }
-                }
-
-                if let Some((token, pt)) = decrypted {
-                    self.save();
-                    println!(
-                        ">> [From {}]: {}",
-                        hex::encode(&token[0..4]),
-                        String::from_utf8_lossy(&pt)
-                    );
-                    // Also hand it to any polling consumer (e.g. a GUI) —
-                    // see the `inbox` field doc comment above.
-                    self.inbox.push((token, pt));
                 } else {
                     println!(
-                        ">> Received packet but couldn't decrypt. E2E session not found or out of sync."
+                        ">> Received packet from unknown sender {}. No E2E session found.",
+                        hex::encode(&sender_token[0..4])
                     );
                 }
                 Ok(None)
@@ -658,7 +674,7 @@ impl Client {
                                 }
                                 session.pq_inject_replay_cache.insert(sig_bytes);
 
-                                session.inject_pq_secret(pq_secret.as_bytes());
+                                session.inject_pq_secret_recv(pq_secret.as_bytes());
 
                                 println!(
                                     ">> [PQ] Received and injected post-quantum entropy from {}!",
@@ -900,7 +916,8 @@ mod tests {
     fn test_symmetric_ratchet_multiple_messages() {
         let mut alice_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
-            chain_key: [0x42u8; 32],
+            send_chain_key: [0x42u8; 32],
+            recv_chain_key: [0x42u8; 32],
             send_count: 0,
             peer_kyber_pub: None,
             recv_count: 0,
@@ -909,7 +926,8 @@ mod tests {
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
-            chain_key: [0x42u8; 32],
+            send_chain_key: [0x42u8; 32],
+            recv_chain_key: [0x42u8; 32],
             send_count: 0,
             peer_kyber_pub: None,
             recv_count: 0,
@@ -920,7 +938,7 @@ mod tests {
             let alice_mk = alice_state.symmetric_ratchet();
             let bob_mk = bob_state.symmetric_ratchet();
             assert_eq!(alice_mk, bob_mk, "Message key mismatch at iteration {}", i);
-            assert_eq!(alice_state.chain_key, bob_state.chain_key);
+            assert_eq!(alice_state.send_chain_key, bob_state.send_chain_key);
         }
     }
 
@@ -928,7 +946,8 @@ mod tests {
     fn test_symmetric_ratchet_produces_unique_keys() {
         let mut state = SymmetricSessionState {
             root_key: [0x42u8; 32],
-            chain_key: [0x42u8; 32],
+            send_chain_key: [0x42u8; 32],
+            recv_chain_key: [0x42u8; 32],
             send_count: 0,
             peer_kyber_pub: None,
             recv_count: 0,
@@ -952,7 +971,8 @@ mod tests {
             bob.identity.routing_token,
             SymmetricSessionState {
                 root_key,
-                chain_key: root_key,
+                send_chain_key: root_key,
+                recv_chain_key: root_key,
                 send_count: 0,
                 peer_kyber_pub: None,
                 recv_count: 0,
@@ -964,7 +984,8 @@ mod tests {
             alice.identity.routing_token,
             SymmetricSessionState {
                 root_key,
-                chain_key: root_key,
+                send_chain_key: root_key,
+                recv_chain_key: root_key,
                 send_count: 0,
                 peer_kyber_pub: None,
                 recv_count: 0,
@@ -981,12 +1002,12 @@ mod tests {
             .e2e_sessions
             .get(&bob.identity.routing_token)
             .unwrap()
-            .chain_key;
+            .send_chain_key;
         let b_ck = bob
             .e2e_sessions
             .get(&alice.identity.routing_token)
             .unwrap()
-            .chain_key;
+            .recv_chain_key;
         assert_eq!(a_ck, b_ck);
     }
 
@@ -1004,7 +1025,8 @@ mod tests {
             bob_id.routing_token,
             SymmetricSessionState {
                 root_key: [0x42u8; 32],
-                chain_key: [0x42u8; 32],
+                send_chain_key: [0x42u8; 32],
+                recv_chain_key: [0x42u8; 32],
                 send_count: 0,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
@@ -1059,7 +1081,8 @@ mod tests {
             bob_token,
             SymmetricSessionState {
                 root_key: [0x42u8; 32],
-                chain_key: [0x42u8; 32],
+                send_chain_key: [0x42u8; 32],
+                recv_chain_key: [0x42u8; 32],
                 send_count: 0,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
@@ -1095,7 +1118,8 @@ mod tests {
             bob.identity.routing_token,
             SymmetricSessionState {
                 root_key,
-                chain_key: root_key,
+                send_chain_key: root_key,
+                recv_chain_key: root_key,
                 send_count: 0,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
@@ -1107,7 +1131,8 @@ mod tests {
             alice.identity.routing_token,
             SymmetricSessionState {
                 root_key,
-                chain_key: root_key,
+                send_chain_key: root_key,
+                recv_chain_key: root_key,
                 send_count: 0,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
@@ -1144,12 +1169,12 @@ mod tests {
             .e2e_sessions
             .get(&bob.identity.routing_token)
             .unwrap()
-            .chain_key;
+            .send_chain_key;
         let b_ck = bob
             .e2e_sessions
             .get(&alice.identity.routing_token)
             .unwrap()
-            .chain_key;
+            .recv_chain_key;
         assert_eq!(a_ck, b_ck, "Chain keys must be in sync after PQ injection!");
     }
 
@@ -1166,7 +1191,8 @@ mod tests {
             bob_id.routing_token,
             SymmetricSessionState {
                 root_key,
-                chain_key: root_key,
+                send_chain_key: root_key,
+                recv_chain_key: root_key,
                 send_count: 0,
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
@@ -1185,7 +1211,7 @@ mod tests {
             .e2e_sessions
             .get(&bob_id.routing_token)
             .unwrap()
-            .chain_key;
+            .send_chain_key;
 
         // Send 5th message (triggers PQ inject)
         let (_, pq) = alice
@@ -1197,7 +1223,7 @@ mod tests {
             .e2e_sessions
             .get(&bob_id.routing_token)
             .unwrap()
-            .chain_key;
+            .send_chain_key;
 
         // The chain key must be different from what a pure hash ratchet would produce
         // (because the PQ secret was mixed in)
@@ -1209,7 +1235,8 @@ mod tests {
         // Also verify it's not just a normal ratchet step by comparing to a no-PQ ratchet
         let mut no_pq_state = SymmetricSessionState {
             root_key,
-            chain_key: root_key,
+            send_chain_key: root_key,
+            recv_chain_key: root_key,
             send_count: 0,
             peer_kyber_pub: None,
             recv_count: 0,
@@ -1220,7 +1247,7 @@ mod tests {
             no_pq_state.symmetric_ratchet();
         }
         assert_ne!(
-            chain_after_pq, no_pq_state.chain_key,
+            chain_after_pq, no_pq_state.send_chain_key,
             "PQ-injected chain must differ from non-PQ chain"
         );
     }
@@ -1267,7 +1294,7 @@ mod tests {
         let a_sess = alice.e2e_sessions.get(&bob.identity.routing_token).unwrap();
         let b_sess = bob.e2e_sessions.get(&alice.identity.routing_token).unwrap();
         assert_eq!(a_sess.root_key, b_sess.root_key);
-        assert_eq!(a_sess.chain_key, b_sess.chain_key);
+        assert_eq!(a_sess.send_chain_key, b_sess.send_chain_key);
 
         // Verify both sessions have peer Kyber keys for future PQ injections
         assert!(
@@ -1322,12 +1349,12 @@ mod tests {
             .e2e_sessions
             .get(&bob.identity.routing_token)
             .unwrap()
-            .chain_key;
+            .send_chain_key;
         let b_ck = bob
             .e2e_sessions
             .get(&alice.identity.routing_token)
             .unwrap()
-            .chain_key;
+            .recv_chain_key;
         assert_eq!(a_ck, b_ck, "Chain keys must match after 5 msgs + PQ inject");
 
         // Send message 6 to prove the session still works
@@ -1341,12 +1368,12 @@ mod tests {
             .e2e_sessions
             .get(&bob.identity.routing_token)
             .unwrap()
-            .chain_key;
+            .send_chain_key;
         let b_ck2 = bob
             .e2e_sessions
             .get(&alice.identity.routing_token)
             .unwrap()
-            .chain_key;
+            .recv_chain_key;
         assert_eq!(a_ck2, b_ck2, "Chain keys must match after post-PQ message");
     }
 
@@ -1414,7 +1441,8 @@ mod tests {
             alice_id.routing_token,
             SymmetricSessionState {
                 root_key: [0x42; 32],
-                chain_key: [0x42; 32],
+                send_chain_key: [0x42; 32],
+                recv_chain_key: [0x42; 32],
                 send_count: 0,
                 peer_kyber_pub: None,
                 recv_count: 0,
@@ -1426,7 +1454,7 @@ mod tests {
             .e2e_sessions
             .get(&alice_id.routing_token)
             .unwrap()
-            .chain_key;
+            .send_chain_key;
 
         // Mallory signs PQ inject with her own key but spoofs Alice's routing token
         let (_, kyber_ct) = encapsulate(&bob.identity.kyber_public);
@@ -1442,7 +1470,7 @@ mod tests {
             .e2e_sessions
             .get(&alice_id.routing_token)
             .unwrap()
-            .chain_key;
+            .send_chain_key;
         assert_eq!(
             chain_before, chain_after,
             "Forged PQ inject must NOT modify chain key"
@@ -1458,7 +1486,8 @@ mod tests {
         use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
         let mut alice_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
-            chain_key: [0x42u8; 32],
+            send_chain_key: [0x42u8; 32],
+            recv_chain_key: [0x42u8; 32],
             send_count: 0,
             peer_kyber_pub: None,
             recv_count: 0,
@@ -1467,7 +1496,8 @@ mod tests {
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
-            chain_key: [0x42u8; 32],
+            send_chain_key: [0x42u8; 32],
+            recv_chain_key: [0x42u8; 32],
             send_count: 0,
             peer_kyber_pub: None,
             recv_count: 0,
@@ -1510,7 +1540,8 @@ mod tests {
         use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
         let mut alice_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
-            chain_key: [0x42u8; 32],
+            send_chain_key: [0x42u8; 32],
+            recv_chain_key: [0x42u8; 32],
             send_count: 0,
             peer_kyber_pub: None,
             recv_count: 0,
@@ -1519,7 +1550,8 @@ mod tests {
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
-            chain_key: [0x42u8; 32],
+            send_chain_key: [0x42u8; 32],
+            recv_chain_key: [0x42u8; 32],
             send_count: 0,
             peer_kyber_pub: None,
             recv_count: 0,
@@ -1603,7 +1635,8 @@ mod tests {
         use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
         let mut alice_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
-            chain_key: [0x42u8; 32],
+            send_chain_key: [0x42u8; 32],
+            recv_chain_key: [0x42u8; 32],
             send_count: 0,
             peer_kyber_pub: None,
             recv_count: 0,
@@ -1612,7 +1645,8 @@ mod tests {
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
-            chain_key: [0x42u8; 32],
+            send_chain_key: [0x42u8; 32],
+            recv_chain_key: [0x42u8; 32],
             send_count: 0,
             peer_kyber_pub: None,
             recv_count: 0,
@@ -1757,7 +1791,8 @@ mod tests {
             alice_id.routing_token,
             SymmetricSessionState {
                 root_key: [0x42; 32],
-                chain_key: [0x42; 32],
+                send_chain_key: [0x42; 32],
+                recv_chain_key: [0x42; 32],
                 send_count: 0,
                 peer_kyber_pub: None,
                 recv_count: 0,
@@ -1769,7 +1804,7 @@ mod tests {
             .e2e_sessions
             .get(&alice_id.routing_token)
             .unwrap()
-            .chain_key;
+            .send_chain_key;
 
         // Create PQ inject with stale timestamp
         let (_, kyber_ct) = encapsulate(&bob.identity.kyber_public);
@@ -1797,7 +1832,7 @@ mod tests {
             .e2e_sessions
             .get(&alice_id.routing_token)
             .unwrap()
-            .chain_key;
+            .send_chain_key;
         assert_eq!(
             chain_before, chain_after,
             "Stale PQ inject must NOT modify chain key"
@@ -1824,7 +1859,8 @@ mod tests {
             peer_token,
             SymmetricSessionState {
                 root_key: [0x42; 32],
-                chain_key: [0x43; 32],
+                send_chain_key: [0x43; 32],
+                recv_chain_key: [0x43; 32],
                 send_count: 7,
                 recv_count: 3,
                 peer_kyber_pub: Some(
@@ -1869,7 +1905,7 @@ mod tests {
         let orig_sess = original.e2e_sessions.get(&peer_token).unwrap();
         let load_sess = loaded.e2e_sessions.get(&peer_token).unwrap();
         assert_eq!(orig_sess.root_key, load_sess.root_key);
-        assert_eq!(orig_sess.chain_key, load_sess.chain_key);
+        assert_eq!(orig_sess.send_chain_key, load_sess.send_chain_key);
         assert_eq!(orig_sess.send_count, load_sess.send_count);
         assert_eq!(orig_sess.recv_count, load_sess.recv_count);
         assert_eq!(orig_sess.skip_dict.len(), load_sess.skip_dict.len());
@@ -1883,5 +1919,109 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(tmp_path);
+    }
+    #[test]
+    fn test_concurrent_multi_peer_out_of_order() {
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut alice = Client::new(server_addr);
+        let bob_token = [0xBB; 16];
+        let charlie_token = [0xCC; 16];
+
+        let root_bob = [0x11; 32];
+        let root_charlie = [0x22; 32];
+
+        alice.e2e_sessions.insert(
+            bob_token,
+            SymmetricSessionState {
+                root_key: root_bob,
+                send_chain_key: root_bob,
+                recv_chain_key: root_bob,
+                send_count: 0,
+                recv_count: 0,
+                peer_kyber_pub: None,
+                skip_dict: HashMap::new(),
+                pq_inject_replay_cache: HashSet::new(),
+            },
+        );
+
+        alice.e2e_sessions.insert(
+            charlie_token,
+            SymmetricSessionState {
+                root_key: root_charlie,
+                send_chain_key: root_charlie,
+                recv_chain_key: root_charlie,
+                send_count: 0,
+                recv_count: 0,
+                peer_kyber_pub: None,
+                skip_dict: HashMap::new(),
+                pq_inject_replay_cache: HashSet::new(),
+            },
+        );
+
+        let mut bob_sender = SymmetricSessionState {
+            root_key: root_bob,
+            send_chain_key: root_bob,
+            recv_chain_key: root_bob,
+            send_count: 0,
+            recv_count: 0,
+            peer_kyber_pub: None,
+            skip_dict: HashMap::new(),
+            pq_inject_replay_cache: HashSet::new(),
+        };
+
+        let mut charlie_sender = SymmetricSessionState {
+            root_key: root_charlie,
+            send_chain_key: root_charlie,
+            recv_chain_key: root_charlie,
+            send_count: 0,
+            recv_count: 0,
+            peer_kyber_pub: None,
+            skip_dict: HashMap::new(),
+            pq_inject_replay_cache: HashSet::new(),
+        };
+
+        let mut bob_pkts = vec![];
+        for i in 0..3 {
+            let key = bob_sender.symmetric_ratchet();
+            let c = XChaCha20Poly1305::new(Key::from_slice(&key));
+            let nonce = XNonce::from_slice(&[0x77u8; 24]);
+            let ct = c.encrypt(nonce, format!("bob{}", i).as_bytes()).unwrap();
+            let mut pkt = vec![0x01];
+            pkt.extend_from_slice(&bob_token);
+            pkt.extend_from_slice(&(i as u64).to_be_bytes());
+            pkt.extend_from_slice(&[0x77u8; 24]);
+            pkt.extend_from_slice(&ct);
+            bob_pkts.push(pkt);
+        }
+
+        let mut charlie_pkts = vec![];
+        for i in 0..3 {
+            let key = charlie_sender.symmetric_ratchet();
+            let c = XChaCha20Poly1305::new(Key::from_slice(&key));
+            let nonce = XNonce::from_slice(&[0x88u8; 24]);
+            let ct = c.encrypt(nonce, format!("char{}", i).as_bytes()).unwrap();
+            let mut pkt = vec![0x01];
+            pkt.extend_from_slice(&charlie_token);
+            pkt.extend_from_slice(&(i as u64).to_be_bytes());
+            pkt.extend_from_slice(&[0x88u8; 24]);
+            pkt.extend_from_slice(&ct);
+            charlie_pkts.push(pkt);
+        }
+
+        // Deliver interleaved and out of order
+        alice.handle_incoming_packet(&bob_pkts[2]).unwrap();
+        alice.handle_incoming_packet(&bob_pkts[0]).unwrap();
+        alice.handle_incoming_packet(&charlie_pkts[1]).unwrap();
+        alice.handle_incoming_packet(&bob_pkts[1]).unwrap();
+        alice.handle_incoming_packet(&charlie_pkts[0]).unwrap();
+        alice.handle_incoming_packet(&charlie_pkts[2]).unwrap();
+
+        let bob_sess = alice.e2e_sessions.get(&bob_token).unwrap();
+        assert_eq!(bob_sess.recv_count, 3);
+        assert!(bob_sess.skip_dict.is_empty());
+
+        let charlie_sess = alice.e2e_sessions.get(&charlie_token).unwrap();
+        assert_eq!(charlie_sess.recv_count, 3);
+        assert!(charlie_sess.skip_dict.is_empty());
     }
 }
