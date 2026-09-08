@@ -21,6 +21,10 @@ const SERVER_ADDR: &str = "127.0.0.1:4430";
 pub struct IdentityDto {
     pub routing_token: String,
     pub ed25519_public: String,
+    /// This peer's own display name, if launched via `./runpeer.sh <name>`
+    /// (read from `E2E_PEER_NAME`). Share it alongside the token/key so a
+    /// peer adding you as a contact can label you with it instead of hex.
+    pub name: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -29,6 +33,9 @@ pub struct ContactDto {
     /// "established" once the PQXDH session handshake completed, otherwise
     /// "pending" (KeyExchange sent/received, waiting on SessionEstablish).
     pub status: String,
+    /// Locally-entered display name for this contact, if one was given
+    /// when adding them (see `connect_to_peer`'s `name` argument).
+    pub name: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -41,6 +48,7 @@ fn identity_dto(client: &Client) -> IdentityDto {
     IdentityDto {
         routing_token: hex::encode(client.identity.routing_token),
         ed25519_public: hex::encode(client.identity.ed25519_public.as_bytes()),
+        name: Some(client.local_name.clone()).filter(|n| !n.is_empty()),
     }
 }
 
@@ -68,6 +76,13 @@ pub async fn bootstrap(
     // — identical fallback logic to the CLI.
     let mut client =
         ClientStateDto::load(&state_file_path()).unwrap_or_else(|_| Client::new(server_addr));
+
+    // The pseudonym this peer chose at launch (`./runpeer.sh alice` sets
+    // this via E2E_PEER_NAME) — sent with every outgoing KeyExchange so
+    // peers can label us by name automatically, with no manual step on
+    // their end. Re-applied on every bootstrap rather than persisted, so
+    // renaming a peer is just a matter of relaunching it with a new name.
+    client.local_name = std::env::var("E2E_PEER_NAME").unwrap_or_default();
 
     let socket = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
@@ -164,6 +179,7 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
         .map(|token| ContactDto {
             token: hex::encode(token),
             status: "pending".to_string(),
+            name: rt.client.contact_names.get(token).cloned(),
         })
         .collect();
 
@@ -175,6 +191,7 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
             contacts.push(ContactDto {
                 token: token_hex,
                 status: "established".to_string(),
+                name: rt.client.contact_names.get(token).cloned(),
             });
         }
     }

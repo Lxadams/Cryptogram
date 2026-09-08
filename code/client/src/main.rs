@@ -17,7 +17,7 @@ use ed25519_dalek::VerifyingKey;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{io::AsyncBufReadExt, net::UdpSocket, sync::Mutex};
 
-use client::{Client, ClientStateDto, TYPE_DATA, perform_handshake};
+use client::{Client, ClientStateDto, TYPE_DATA, perform_handshake, state_file_path};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
 
     // Resume a previous identity/session set if one was persisted to disk,
     // otherwise mint a fresh identity.
-    let client_obj = match ClientStateDto::load("client_state.json") {
+    let client_obj = match ClientStateDto::load(&state_file_path()) {
         Ok(c) => {
             println!("Loaded client state from disk.");
             c

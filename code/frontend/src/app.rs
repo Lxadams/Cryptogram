@@ -256,7 +256,7 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
             <IdentityCard identity=identity />
             <div class="columns">
                 <ContactPanel contacts=contacts selected=selected />
-                <ChatPanel selected=selected messages=messages />
+                <ChatPanel contacts=contacts selected=selected messages=messages />
             </div>
         </section>
     }
@@ -266,12 +266,24 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
 /// add us as a contact. In a real build this would render as a QR code
 /// (see documentations/doable-cryptographic-flow.md, Micro-QR); this
 /// prototype just shows the hex so it can be copy-pasted between two
-/// running instances during local testing.
+/// running instances during local testing. `name` (set via
+/// `./runpeer.sh <name>`, see README) is shown here for your own
+/// reference only — it's sent automatically as part of the KeyExchange
+/// once you connect to someone, so peers see "alice" in their contact
+/// list without typing anything themselves (see `Client::local_name` /
+/// `contact_names` in code/client/src/lib.rs).
 #[component]
 fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
     view! {
         <div class="identity-card">
             <h2>"Your Identity"</h2>
+            {identity.name.clone().map(|name| view! {
+                <p>
+                    <strong>"Name: "</strong>
+                    <code>{name.clone()}</code>
+                    <CopyButton value=name />
+                </p>
+            })}
             <p>
                 <strong>"Token: "</strong>
                 <code>{identity.routing_token.clone()}</code>
@@ -323,7 +335,7 @@ fn ContactPanel(
             <ul class="contact-list">
                 <For
                     each=move || contacts.get()
-                    key=|c| (c.token.clone(), c.status.clone())
+                    key=|c| (c.token.clone(), c.status.clone(), c.name.clone())
                     let(contact)
                 >
                     {
@@ -334,7 +346,12 @@ fn ContactPanel(
                                 class:selected=move || selected.get().as_deref() == Some(token.as_str())
                                 on:click=move |_| selected.set(Some(token_for_click.clone()))
                             >
-                                <code>{contact.token.chars().take(8).collect::<String>()}"..."</code>
+                                {match &contact.name {
+                                    Some(name) => view! { <span class="contact-name">{name.clone()}</span> }.into_any(),
+                                    None => view! {
+                                        <code>{contact.token.chars().take(8).collect::<String>()}"..."</code>
+                                    }.into_any(),
+                                }}
                                 <span class=format!("status status-{}", contact.status)>
                                     {contact.status.clone()}
                                 </span>
@@ -370,6 +387,7 @@ fn ContactPanel(
 /// there's no ratchet key yet.
 #[component]
 fn ChatPanel(
+    contacts: RwSignal<Vec<api::ContactDto>>,
     selected: RwSignal<Option<String>>,
     messages: RwSignal<HashMap<String, Vec<ChatMessage>>>,
 ) -> impl IntoView {
@@ -413,8 +431,17 @@ fn ChatPanel(
             {move || match selected.get() {
                 None => view! { <p class="hint">"Select a contact to start chatting."</p> }.into_any(),
                 Some(token) => {
+                    let header_token = token.clone();
                     let history = move || messages.get().get(&token).cloned().unwrap_or_default();
+                    let chat_label = move || {
+                        contacts.get()
+                            .iter()
+                            .find(|c| c.token == header_token)
+                            .and_then(|c| c.name.clone())
+                            .unwrap_or_else(|| format!("{}...", header_token.chars().take(8).collect::<String>()))
+                    };
                     view! {
+                        <h3 class="chat-header">"Chat with " {chat_label}</h3>
                         <div class="transcript">
                             <For
                                 each=history

@@ -40,6 +40,11 @@ mkdir -p "$PEER_DIR"
 # process's working directory.
 export E2E_STATE_FILE="$PEER_DIR/client_state.json"
 
+# Read by commands.rs to label this peer's own identity card with a name
+# instead of just hex, so contacts can enter it when adding you and see
+# "alice" rather than a routing token in their contact list.
+export E2E_PEER_NAME="$PEER_NAME"
+
 # Bash-native "is something listening on this TCP port" check — avoids
 # depending on nc/lsof/curl being installed.
 port_open() {
