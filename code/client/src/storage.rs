@@ -34,7 +34,8 @@ pub struct UserIdentityDto {
 #[derive(Serialize, Deserialize)]
 pub struct SymmetricSessionStateDto {
     pub root_key: String,
-    pub chain_key: String,
+    pub send_chain_key: String,
+    pub recv_chain_key: String,
     pub send_count: u64,
     pub recv_count: u64,
     pub peer_kyber_pub: Option<String>,
@@ -82,7 +83,8 @@ impl ClientStateDto {
                 hex::encode(token),
                 SymmetricSessionStateDto {
                     root_key: hex::encode(state.root_key),
-                    chain_key: hex::encode(state.chain_key),
+                    send_chain_key: hex::encode(state.send_chain_key),
+                    recv_chain_key: hex::encode(state.recv_chain_key),
                     send_count: state.send_count,
                     recv_count: state.recv_count,
                     peer_kyber_pub: state
@@ -166,8 +168,11 @@ impl ClientStateDto {
             let mut r_key = [0u8; 32];
             hex::decode_to_slice(&dto_state.root_key, &mut r_key)?;
 
-            let mut c_key = [0u8; 32];
-            hex::decode_to_slice(&dto_state.chain_key, &mut c_key)?;
+            let mut sc_key = [0u8; 32];
+            hex::decode_to_slice(&dto_state.send_chain_key, &mut sc_key)?;
+
+            let mut rc_key = [0u8; 32];
+            hex::decode_to_slice(&dto_state.recv_chain_key, &mut rc_key)?;
 
             let pkp = if let Some(pk_hex) = dto_state.peer_kyber_pub {
                 Some(
@@ -195,7 +200,8 @@ impl ClientStateDto {
                 tok,
                 SymmetricSessionState {
                     root_key: r_key,
-                    chain_key: c_key,
+                    send_chain_key: sc_key,
+                    recv_chain_key: rc_key,
                     send_count: dto_state.send_count,
                     recv_count: dto_state.recv_count,
                     peer_kyber_pub: pkp,
