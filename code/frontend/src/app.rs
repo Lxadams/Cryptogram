@@ -15,6 +15,7 @@
 use crate::api;
 use leptos::prelude::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// One message in a conversation, for local display only. Not persisted —
@@ -24,8 +25,19 @@ use std::time::Duration;
 /// is ephemeral.
 #[derive(Clone, Debug, PartialEq)]
 struct ChatMessage {
+    /// Unique per message so the `<For>` transcript list can key on
+    /// identity rather than content — two messages with the same text
+    /// from the same sender (e.g. sending "s" five times in a row) would
+    /// otherwise share a key, causing Leptos to reuse/misplace the wrong
+    /// DOM node instead of creating a new one.
+    id: u64,
     from_me: bool,
     text: String,
+}
+
+fn next_message_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Light/dark preference. Applied to `<html data-theme="...">` (see
@@ -239,6 +251,7 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                     messages.update(|map| {
                         for msg in incoming {
                             map.entry(msg.from_token).or_default().push(ChatMessage {
+                                id: next_message_id(),
                                 from_me: false,
                                 text: msg.text,
                             });
@@ -416,6 +429,7 @@ fn ChatPanel(
                 Ok(()) => {
                     messages.update(|map| {
                         map.entry(token_for_task).or_default().push(ChatMessage {
+                            id: next_message_id(),
                             from_me: true,
                             text: text_for_history,
                         });
@@ -432,6 +446,7 @@ fn ChatPanel(
                 None => view! { <p class="hint">"Select a contact to start chatting."</p> }.into_any(),
                 Some(token) => {
                     let header_token = token.clone();
+                    let len_token = token.clone();
                     let history = move || messages.get().get(&token).cloned().unwrap_or_default();
                     let chat_label = move || {
                         contacts.get()
@@ -440,12 +455,38 @@ fn ChatPanel(
                             .and_then(|c| c.name.clone())
                             .unwrap_or_else(|| format!("{}...", header_token.chars().take(8).collect::<String>()))
                     };
+
+                    let transcript_ref = NodeRef::<leptos::html::Div>::new();
+                    // Tracks only this contact's message *count* (a Memo, so
+                    // it dedups) rather than depending on `messages` itself —
+                    // otherwise every contact's traffic would re-fire this
+                    // and yank the scroll position back to the bottom even
+                    // while the user is reading old messages in this chat.
+                    let message_count = Memo::new(move |_| {
+                        messages.get().get(&len_token).map(Vec::len).unwrap_or(0)
+                    });
+                    Effect::new(move |_| {
+                        message_count.get();
+                        // Deferred to a fresh task so it runs after the
+                        // `<For>` list's own DOM patch has landed —
+                        // otherwise `scroll_height` can still reflect the
+                        // pre-update layout.
+                        set_timeout(
+                            move || {
+                                if let Some(el) = transcript_ref.get() {
+                                    el.set_scroll_top(el.scroll_height());
+                                }
+                            },
+                            Duration::ZERO,
+                        );
+                    });
+
                     view! {
                         <h3 class="chat-header">"Chat with " {chat_label}</h3>
-                        <div class="transcript">
+                        <div class="transcript" node_ref=transcript_ref>
                             <For
                                 each=history
-                                key=|m| (m.from_me, m.text.clone())
+                                key=|m| m.id
                                 let(msg)
                             >
                                 <p class:from-me=msg.from_me class:from-peer=!msg.from_me>
