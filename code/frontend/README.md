@@ -103,7 +103,8 @@ code, per the Micro-QR design in `doable-cryptographic-flow.md`).
   (not persisted); reloading the app loses the transcript, though the
   underlying session/ratchet state itself is still safely persisted to
   each peer's `client_state.json` (under `.peers/<name>/`) regardless.
-- **Known limitation**: the receive-loop and `bootstrap` currently assume
-  a single relay at `127.0.0.1:4430` (hardcoded in `commands.rs`, matching
-  what the CLI and `runserver.sh` also hardcode) — no server address field
-  in the UI yet.
+- **Known limitation**: the receive-loop and `bootstrap` talk to a single
+  relay, defaulting to `127.0.0.1:4430` — override with the `SERVER_ADDR`
+  env var (e.g. `SERVER_ADDR=<ec2-host>:443`), same as the CLI. No server
+  address field in the UI yet, so it's still env-var-only, not something
+  end users configure at runtime.

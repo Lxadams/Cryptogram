@@ -13,9 +13,13 @@ use std::{net::SocketAddr, sync::Arc};
 use tauri::{AppHandle, Manager, State};
 use tokio::net::UdpSocket;
 
-/// The relay (server) this prototype always talks to. Hardcoded for now —
-/// same assumption the CLI makes (`127.0.0.1:4430`, see runserver.sh).
-const SERVER_ADDR: &str = "127.0.0.1:4430";
+/// The relay (server) this prototype talks to. Defaults to the CLI's own
+/// local-dev default (`127.0.0.1:4430`, see runserver.sh); override with
+/// the `SERVER_ADDR` env var (e.g. a deployed EC2 host's `<ip>:443`) —
+/// mirrors the same override on the CLI (see code/client/src/main.rs).
+fn server_addr_raw() -> String {
+    std::env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:4430".to_string())
+}
 
 #[derive(Serialize, Clone)]
 pub struct IdentityDto {
@@ -62,7 +66,12 @@ pub async fn bootstrap(
     let server_pub =
         VerifyingKey::from_bytes(&arr).map_err(|_| "Invalid server public key".to_string())?;
 
-    let server_addr: SocketAddr = SERVER_ADDR.parse().expect("hardcoded address is valid");
+    let server_addr_raw = server_addr_raw();
+    let server_addr: SocketAddr = tokio::net::lookup_host(&server_addr_raw)
+        .await
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or_else(|| format!("Could not resolve SERVER_ADDR: {server_addr_raw}"))?;
 
     // Resume a previous identity if one was saved, otherwise mint a new one
     // — identical fallback logic to the CLI.
