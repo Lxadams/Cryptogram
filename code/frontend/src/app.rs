@@ -15,6 +15,7 @@
 use crate::api;
 use leptos::prelude::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// One message in a conversation, for local display only. Not persisted —
@@ -24,8 +25,19 @@ use std::time::Duration;
 /// is ephemeral.
 #[derive(Clone, Debug, PartialEq)]
 struct ChatMessage {
+    /// Unique per message so the `<For>` transcript list can key on
+    /// identity rather than content — two messages with the same text
+    /// from the same sender (e.g. sending "s" five times in a row) would
+    /// otherwise share a key, causing Leptos to reuse/misplace the wrong
+    /// DOM node instead of creating a new one.
+    id: u64,
     from_me: bool,
     text: String,
+}
+
+fn next_message_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Light/dark preference. Applied to `<html data-theme="...">` (see
@@ -244,6 +256,7 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                 messages.update(|map| {
                     for msg in incoming {
                         map.entry(msg.from_token).or_default().push(ChatMessage {
+                            id: next_message_id(),
                             from_me: false,
                             text: msg.text,
                         });
@@ -260,7 +273,7 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
             <IdentityCard identity=identity />
             <div class="columns">
                 <ContactPanel contacts=contacts selected=selected />
-                <ChatPanel selected=selected messages=messages />
+                <ChatPanel contacts=contacts selected=selected messages=messages />
             </div>
         </section>
     }
@@ -270,12 +283,24 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
 /// add us as a contact. In a real build this would render as a QR code
 /// (see documentations/doable-cryptographic-flow.md, Micro-QR); this
 /// prototype just shows the hex so it can be copy-pasted between two
-/// running instances during local testing.
+/// running instances during local testing. `name` (set via
+/// `./runpeer.sh <name>`, see README) is shown here for your own
+/// reference only — it's sent automatically as part of the KeyExchange
+/// once you connect to someone, so peers see "alice" in their contact
+/// list without typing anything themselves (see `Client::local_name` /
+/// `contact_names` in code/client/src/lib.rs).
 #[component]
 fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
     view! {
         <div class="identity-card">
             <h2>"Your Identity"</h2>
+            {identity.name.clone().map(|name| view! {
+                <p>
+                    <strong>"Name: "</strong>
+                    <code>{name.clone()}</code>
+                    <CopyButton value=name />
+                </p>
+            })}
             <p>
                 <strong>"Token: "</strong>
                 <code>{identity.routing_token.clone()}</code>
@@ -327,7 +352,7 @@ fn ContactPanel(
             <ul class="contact-list">
                 <For
                     each=move || contacts.get()
-                    key=|c| (c.token.clone(), c.status.clone())
+                    key=|c| (c.token.clone(), c.status.clone(), c.name.clone())
                     let(contact)
                 >
                     {
@@ -338,7 +363,12 @@ fn ContactPanel(
                                 class:selected=move || selected.get().as_deref() == Some(token.as_str())
                                 on:click=move |_| selected.set(Some(token_for_click.clone()))
                             >
-                                <code>{contact.token.chars().take(8).collect::<String>()}"..."</code>
+                                {match &contact.name {
+                                    Some(name) => view! { <span class="contact-name">{name.clone()}</span> }.into_any(),
+                                    None => view! {
+                                        <code>{contact.token.chars().take(8).collect::<String>()}"..."</code>
+                                    }.into_any(),
+                                }}
                                 <span class=format!("status status-{}", contact.status)>
                                     {contact.status.clone()}
                                 </span>
@@ -374,6 +404,7 @@ fn ContactPanel(
 /// there's no ratchet key yet.
 #[component]
 fn ChatPanel(
+    contacts: RwSignal<Vec<api::ContactDto>>,
     selected: RwSignal<Option<String>>,
     messages: RwSignal<HashMap<String, Vec<ChatMessage>>>,
 ) -> impl IntoView {
@@ -402,6 +433,7 @@ fn ChatPanel(
                 Ok(()) => {
                     messages.update(|map| {
                         map.entry(token_for_task).or_default().push(ChatMessage {
+                            id: next_message_id(),
                             from_me: true,
                             text: text_for_history,
                         });
@@ -417,12 +449,48 @@ fn ChatPanel(
             {move || match selected.get() {
                 None => view! { <p class="hint">"Select a contact to start chatting."</p> }.into_any(),
                 Some(token) => {
+                    let header_token = token.clone();
+                    let len_token = token.clone();
                     let history = move || messages.get().get(&token).cloned().unwrap_or_default();
+                    let chat_label = move || {
+                        contacts.get()
+                            .iter()
+                            .find(|c| c.token == header_token)
+                            .and_then(|c| c.name.clone())
+                            .unwrap_or_else(|| format!("{}...", header_token.chars().take(8).collect::<String>()))
+                    };
+
+                    let transcript_ref = NodeRef::<leptos::html::Div>::new();
+                    // Tracks only this contact's message *count* (a Memo, so
+                    // it dedups) rather than depending on `messages` itself —
+                    // otherwise every contact's traffic would re-fire this
+                    // and yank the scroll position back to the bottom even
+                    // while the user is reading old messages in this chat.
+                    let message_count = Memo::new(move |_| {
+                        messages.get().get(&len_token).map(Vec::len).unwrap_or(0)
+                    });
+                    Effect::new(move |_| {
+                        message_count.get();
+                        // Deferred to a fresh task so it runs after the
+                        // `<For>` list's own DOM patch has landed —
+                        // otherwise `scroll_height` can still reflect the
+                        // pre-update layout.
+                        set_timeout(
+                            move || {
+                                if let Some(el) = transcript_ref.get() {
+                                    el.set_scroll_top(el.scroll_height());
+                                }
+                            },
+                            Duration::ZERO,
+                        );
+                    });
+
                     view! {
-                        <div class="transcript">
+                        <h3 class="chat-header">"Chat with " {chat_label}</h3>
+                        <div class="transcript" node_ref=transcript_ref>
                             <For
                                 each=history
-                                key=|m| (m.from_me, m.text.clone())
+                                key=|m| m.id
                                 let(msg)
                             >
                                 <p class:from-me=msg.from_me class:from-peer=!msg.from_me>

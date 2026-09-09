@@ -75,16 +75,25 @@ the repo root (`E2E_STATE_FILE`, see `commands.rs` and
 each other no matter how many are running.
 
 In each window: paste the server's pubkey into the Connect screen. Once
-connected, your identity (routing token + Ed25519 key) is shown — that's
-what a peer needs to add you as a contact (stand-in for scanning a QR
-code, per the Micro-QR design in `doable-cryptographic-flow.md`).
+connected, your identity (name + routing token + Ed25519 key) is shown —
+the routing token + Ed25519 key are what a peer needs to add you as a
+contact (stand-in for scanning a QR code, per the Micro-QR design in
+`doable-cryptographic-flow.md`). The name is whatever you passed to
+`runpeer.sh` (`E2E_PEER_NAME`) — it rides along automatically as part of
+the KeyExchange the moment you connect to someone, so a peer's contact
+list shows "alice" instead of your hex token with no extra step on their
+end (see `Client::local_name`/`contact_names` in `code/client/src/lib.rs`).
 
 ### Testing messaging between peers
 
-1. In alice's window, copy her identity (routing token + Ed25519 key).
-2. In bob's window, paste those into "Add contact" and submit.
+1. In alice's window, copy her identity (routing token + Ed25519 key) —
+   just those two fields, same as before names existed.
+2. In bob's window, paste those into "Add contact" and submit. As soon as
+   Alice's KeyExchange (and her auto-reply) round-trip, bob's contact list
+   shows "alice" by herself — nobody typed her name in on bob's side.
 3. Repeat in the other direction: copy bob's identity, add it as a
-   contact in alice's window.
+   contact in alice's window, and her contact list will pick up "bob" the
+   same way.
 4. Once both sides have sent a connection request to each other, each
    window's contact list should flip that contact's status from
    "pending" to "established" — at that point you can select the contact

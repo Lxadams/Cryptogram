@@ -18,6 +18,10 @@ pub struct ClientStateDto {
     pub pending_contacts: HashMap<String, String>,
     pub peer_kyber_keys: HashMap<String, String>,
     pub seen_session_keys: Vec<String>,
+    /// Peer display names learned via KeyExchange. Older state files
+    /// predate this field entirely.
+    #[serde(default)]
+    pub contact_names: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -34,12 +38,19 @@ pub struct UserIdentityDto {
 #[derive(Serialize, Deserialize)]
 pub struct SymmetricSessionStateDto {
     pub root_key: String,
+    // Older state files predate the send/recv chain key split and only have
+    // a single `chain_key`; `into_client` mirrors it into both directions
+    // when `recv_chain_key` is absent.
+    #[serde(alias = "chain_key")]
     pub send_chain_key: String,
+    #[serde(default)]
     pub recv_chain_key: String,
     pub send_count: u64,
     pub recv_count: u64,
     pub peer_kyber_pub: Option<String>,
     pub skip_dict: HashMap<u64, String>,
+    // Older state files predate the PQ-inject replay cache.
+    #[serde(default)]
     pub pq_inject_replay_cache: HashSet<String>,
 }
 
@@ -109,6 +120,11 @@ impl ClientStateDto {
 
         let seen_session_keys = client.seen_session_keys.iter().map(hex::encode).collect();
 
+        let mut contact_names = HashMap::new();
+        for (token, name) in &client.contact_names {
+            contact_names.insert(hex::encode(token), name.clone());
+        }
+
         Self {
             identity,
             server_addr: client.server_addr.to_string(),
@@ -117,6 +133,7 @@ impl ClientStateDto {
             pending_contacts,
             peer_kyber_keys,
             seen_session_keys,
+            contact_names,
         }
     }
 
@@ -171,8 +188,16 @@ impl ClientStateDto {
             let mut sc_key = [0u8; 32];
             hex::decode_to_slice(&dto_state.send_chain_key, &mut sc_key)?;
 
-            let mut rc_key = [0u8; 32];
-            hex::decode_to_slice(&dto_state.recv_chain_key, &mut rc_key)?;
+            // Pre-split state files have no recv_chain_key at all (`#[serde(default)]`
+            // leaves it empty) — mirror send into recv, matching the old
+            // single-chain-key behavior this session was saved under.
+            let rc_key = if dto_state.recv_chain_key.is_empty() {
+                sc_key
+            } else {
+                let mut rc_key = [0u8; 32];
+                hex::decode_to_slice(&dto_state.recv_chain_key, &mut rc_key)?;
+                rc_key
+            };
 
             let pkp = if let Some(pk_hex) = dto_state.peer_kyber_pub {
                 Some(
@@ -238,6 +263,13 @@ impl ClientStateDto {
             seen_session_keys.insert(key);
         }
 
+        let mut contact_names = HashMap::new();
+        for (hex_tok, name) in self.contact_names {
+            let mut tok = [0u8; 16];
+            hex::decode_to_slice(&hex_tok, &mut tok)?;
+            contact_names.insert(tok, name);
+        }
+
         Ok(Client {
             identity,
             server_addr,
@@ -247,6 +279,8 @@ impl ClientStateDto {
             pending_contacts,
             peer_kyber_keys,
             seen_session_keys,
+            local_name: String::new(), // always re-supplied at launch, not persisted
+            contact_names,
             inbox: Vec::new(), // transient handoff buffer, not persisted
         })
     }

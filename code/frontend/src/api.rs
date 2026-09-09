@@ -47,12 +47,14 @@ fn js_error_to_string(v: &JsValue) -> String {
 pub struct IdentityDto {
     pub routing_token: String,
     pub ed25519_public: String,
+    pub name: Option<String>,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct ContactDto {
     pub token: String,
     pub status: String,
+    pub name: Option<String>,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
