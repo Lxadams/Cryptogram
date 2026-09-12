@@ -358,17 +358,46 @@ fn ContactPanel(
                     {
                         let token = contact.token.clone();
                         let token_for_click = token.clone();
+                        // Deliberately NOT read from the `contact` snapshot `<For>`
+                        // handed us: its `key` above is (token, status, name), so
+                        // `online` flipping on its own wouldn't change the key and
+                        // `<For>` would never re-render this item — the dot would
+                        // freeze at whatever `online` was the instant this contact
+                        // first became "established" (almost always false, since
+                        // that happens well before the first presence ping). Look
+                        // it up live from `contacts` instead, same pattern as
+                        // `chat_label` below, so it updates every poll regardless
+                        // of what `<For>` thinks changed.
+                        let token_for_dot = token.clone();
+                        let dot_status = move || {
+                            contacts
+                                .get()
+                                .into_iter()
+                                .find(|c| c.token == token_for_dot)
+                                .filter(|c| c.status == "established")
+                                .map(|c| c.online)
+                        };
                         view! {
                             <li
                                 class:selected=move || selected.get().as_deref() == Some(token.as_str())
                                 on:click=move |_| selected.set(Some(token_for_click.clone()))
                             >
-                                {match &contact.name {
-                                    Some(name) => view! { <span class="contact-name">{name.clone()}</span> }.into_any(),
-                                    None => view! {
-                                        <code>{contact.token.chars().take(8).collect::<String>()}"..."</code>
-                                    }.into_any(),
-                                }}
+                                <span class="contact-label">
+                                    {move || dot_status().map(|online| view! {
+                                        <span
+                                            class="presence-dot"
+                                            class:online=online
+                                            class:offline=!online
+                                            title=if online { "Online" } else { "Offline" }
+                                        ></span>
+                                    })}
+                                    {match &contact.name {
+                                        Some(name) => view! { <span class="contact-name">{name.clone()}</span> }.into_any(),
+                                        None => view! {
+                                            <code>{contact.token.chars().take(8).collect::<String>()}"..."</code>
+                                        }.into_any(),
+                                    }}
+                                </span>
                                 <span class=format!("status status-{}", contact.status)>
                                     {contact.status.clone()}
                                 </span>

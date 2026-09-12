@@ -55,6 +55,7 @@ pub struct ContactDto {
     pub token: String,
     pub status: String,
     pub name: Option<String>,
+    pub online: bool,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]

@@ -311,3 +311,81 @@ impl PQInjectPayload {
             .map_err(|_| anyhow!("Signature verification failed"))
     }
 }
+
+// ============================================================
+// PresencePayload (0x06) — 104 bytes
+// ============================================================
+
+/// A lightweight "I'm still here" signal sent periodically to each
+/// established contact so their client can show an online/offline marker.
+/// Deliberately outside the E2E double ratchet (unlike 0x01 Msg) — it
+/// doesn't need confidentiality (liveness isn't secret, and the relay
+/// already sees routing-token traffic patterns), only authenticity and
+/// freshness, so it's just signed like KeyExchange/PQInject rather than
+/// consuming a ratchet step (which would also trigger PQ re-injection
+/// every `PQ_INJECT_INTERVAL` pings for no reason).
+pub struct PresencePayload {
+    pub routing_token: RoutingToken,
+    pub target_token: RoutingToken,
+    pub timestamp: u64,
+    pub signature: Signature,
+}
+
+impl PresencePayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(104);
+        out.extend_from_slice(&self.routing_token); // 0..16
+        out.extend_from_slice(&self.target_token); // 16..32
+        out.extend_from_slice(&self.timestamp.to_be_bytes()); // 32..40
+        out.extend_from_slice(&self.signature.to_bytes()); // 40..104
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 104 {
+            return Err(anyhow!("Invalid presence payload size"));
+        }
+        let mut routing_token = [0u8; 16];
+        routing_token.copy_from_slice(&bytes[0..16]);
+        let mut target_token = [0u8; 16];
+        target_token.copy_from_slice(&bytes[16..32]);
+        let mut ts_arr = [0u8; 8];
+        ts_arr.copy_from_slice(&bytes[32..40]);
+        let timestamp = u64::from_be_bytes(ts_arr);
+        let signature = Signature::from_bytes(bytes[40..104].try_into().unwrap());
+        Ok(Self {
+            routing_token,
+            target_token,
+            timestamp,
+            signature,
+        })
+    }
+
+    pub fn generate(identity: &UserIdentity, target_token: RoutingToken) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut msg = Vec::with_capacity(40);
+        msg.extend_from_slice(&identity.routing_token);
+        msg.extend_from_slice(&target_token);
+        msg.extend_from_slice(&timestamp.to_be_bytes());
+        let signature = identity.ed25519_secret.sign(&msg);
+        Self {
+            routing_token: identity.routing_token,
+            target_token,
+            timestamp,
+            signature,
+        }
+    }
+
+    pub fn verify(&self, ed25519_pub: &VerifyingKey) -> Result<()> {
+        let mut msg = Vec::with_capacity(40);
+        msg.extend_from_slice(&self.routing_token);
+        msg.extend_from_slice(&self.target_token);
+        msg.extend_from_slice(&self.timestamp.to_be_bytes());
+        ed25519_pub
+            .verify(&msg, &self.signature)
+            .map_err(|_| anyhow!("Signature verification failed"))
+    }
+}

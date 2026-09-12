@@ -281,7 +281,8 @@ impl ClientStateDto {
             seen_session_keys,
             local_name: String::new(), // always re-supplied at launch, not persisted
             contact_names,
-            inbox: Vec::new(), // transient handoff buffer, not persisted
+            inbox: Vec::new(),      // transient handoff buffer, not persisted
+            last_seen: HashMap::new(), // live status, not persisted — see Client::last_seen
         })
     }
 }

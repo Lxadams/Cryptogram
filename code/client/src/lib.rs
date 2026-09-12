@@ -7,7 +7,7 @@ use pqcrypto_kyber::kyber768::*;
 use pqcrypto_traits::kem::{PublicKey as _, SharedSecret as _};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, net::SocketAddr};
 use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
@@ -215,6 +215,13 @@ pub struct Client {
     /// `drain_inbox()` instead. Intentionally not persisted to disk: this is
     /// a transient handoff buffer, not session state.
     pub inbox: Vec<(RoutingToken, Vec<u8>)>,
+    /// Last time we heard *anything* authenticated from this peer — a real
+    /// chat message or a presence ping (see `PresencePayload`), both update
+    /// this. Front ends use it to show an online/offline marker. Like
+    /// `inbox`, this is live local state, not persisted: it should always
+    /// start empty ("unknown/offline") on relaunch rather than showing a
+    /// stale "online" from a previous run.
+    pub last_seen: HashMap<RoutingToken, Instant>,
 }
 
 impl Client {
@@ -234,6 +241,7 @@ impl Client {
             local_name: String::new(),
             contact_names: HashMap::new(),
             inbox: Vec::new(),
+            last_seen: HashMap::new(),
         }
     }
 
@@ -241,6 +249,27 @@ impl Client {
     /// `(sender_routing_token, plaintext)` pairs in arrival order.
     pub fn drain_inbox(&mut self) -> Vec<(RoutingToken, Vec<u8>)> {
         std::mem::take(&mut self.inbox)
+    }
+
+    /// True if `token` has sent us a chat message or presence ping within
+    /// the last `freshness` window. A local liveness heuristic for the UI
+    /// only — not part of the protocol's trust model.
+    pub fn is_online(&self, token: &RoutingToken, freshness: Duration) -> bool {
+        self.last_seen
+            .get(token)
+            .is_some_and(|seen| seen.elapsed() < freshness)
+    }
+
+    /// Build a signed presence ping for `target_token` (see
+    /// `PresencePayload`) and link-encrypt it for the relay, the same way
+    /// `create_encrypted_packet` does for a chat message. Deliberately
+    /// outside the E2E double ratchet — see the doc comment on
+    /// `PresencePayload` for why.
+    pub fn generate_presence_packet(&self, target_token: RoutingToken) -> Vec<u8> {
+        let payload = PresencePayload::generate(&self.identity, target_token);
+        let mut inner = vec![0x06];
+        inner.extend_from_slice(&payload.to_bytes());
+        self.wrap_link_encryption(target_token, &inner)
     }
 
     pub fn save(&self) {
@@ -526,6 +555,7 @@ impl Client {
                         // Also hand it to any polling consumer (e.g. a GUI) —
                         // see the `inbox` field doc comment above.
                         self.inbox.push((sender_token, pt));
+                        self.last_seen.insert(sender_token, Instant::now());
                     } else {
                         println!(
                             ">> Received packet from {} but decryption failed (out of sync?).",
@@ -733,6 +763,40 @@ impl Client {
                         }
                     } else {
                         println!(">> PQInject received but sender unknown (not in contacts).");
+                    }
+                }
+                Ok(None)
+            }
+            0x06 => {
+                // Presence ping — see PresencePayload's doc comment. Only
+                // ever updates `last_seen`; never reaches `inbox`.
+                if let Ok(presence) = PresencePayload::from_bytes(pkt_data) {
+                    if presence
+                        .target_token
+                        .ct_eq(&self.identity.routing_token)
+                        .unwrap_u8()
+                        == 0
+                    {
+                        println!(
+                            ">> [SECURITY ALERT] Dropped Presence ping! Bound to different target."
+                        );
+                        return Ok(None);
+                    }
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let time_diff = now.max(presence.timestamp) - now.min(presence.timestamp);
+                    if time_diff > MAX_TIMESTAMP_DRIFT {
+                        println!(">> [SECURITY ALERT] Dropped Presence ping! Timestamp is stale.");
+                        return Ok(None);
+                    }
+                    if let Some(sender_pub) = self.pending_contacts.get(&presence.routing_token) {
+                        if presence.verify(sender_pub).is_ok() {
+                            self.last_seen.insert(presence.routing_token, Instant::now());
+                        } else {
+                            println!(">> [SECURITY ALERT] Presence ping signature invalid!");
+                        }
                     }
                 }
                 Ok(None)
@@ -2116,5 +2180,130 @@ mod tests {
         let charlie_sess = alice.e2e_sessions.get(&charlie_token).unwrap();
         assert_eq!(charlie_sess.recv_count, 3);
         assert!(charlie_sess.skip_dict.is_empty());
+    }
+
+    // ==========================================
+    // Presence Ping Tests
+    // ==========================================
+
+    /// Runs the same 3-way handshake as `test_full_3way_handshake` and
+    /// returns the two established clients, to avoid repeating the setup
+    /// in every presence test below.
+    fn established_pair() -> (Client, Client) {
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut alice = Client::new(server_addr);
+        let mut bob = Client::new(server_addr);
+
+        alice
+            .pending_contacts
+            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
+        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let mut kx_inner = vec![0x02];
+        kx_inner.extend_from_slice(&alice_kx.to_bytes());
+        let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
+        let inner = strip_link(&bob_reply, &bob.link_master_key);
+        let alice_reply = alice.handle_incoming_packet(&inner).unwrap().unwrap();
+        let inner2 = strip_link(&alice_reply, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner2).unwrap();
+
+        (alice, bob)
+    }
+
+    #[test]
+    fn test_presence_ping_marks_peer_online() {
+        let (alice, mut bob) = established_pair();
+        let freshness = Duration::from_secs(60);
+
+        assert!(
+            !bob.is_online(&alice.identity.routing_token, freshness),
+            "must be offline before any ping has arrived"
+        );
+
+        let ping = alice.generate_presence_packet(bob.identity.routing_token);
+        let inner = strip_link(&ping, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner).unwrap();
+
+        assert!(
+            bob.is_online(&alice.identity.routing_token, freshness),
+            "must be online immediately after a valid ping"
+        );
+        assert!(
+            bob.drain_inbox().is_empty(),
+            "a presence ping must never surface as a chat message"
+        );
+    }
+
+    #[test]
+    fn test_presence_ping_expires_after_freshness_window() {
+        let (alice, mut bob) = established_pair();
+        let tiny_freshness = Duration::from_millis(20);
+
+        let ping = alice.generate_presence_packet(bob.identity.routing_token);
+        let inner = strip_link(&ping, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner).unwrap();
+        assert!(bob.is_online(&alice.identity.routing_token, tiny_freshness));
+
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            !bob.is_online(&alice.identity.routing_token, tiny_freshness),
+            "must go offline once the freshness window has elapsed"
+        );
+    }
+
+    #[test]
+    fn test_chat_message_also_marks_peer_online() {
+        let (mut alice, mut bob) = established_pair();
+        let freshness = Duration::from_secs(60);
+
+        let (msg_pkt, _) = alice
+            .create_encrypted_packet(bob.identity.routing_token, b"hi")
+            .unwrap();
+        let inner = strip_link(&msg_pkt, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner).unwrap();
+
+        assert!(bob.is_online(&alice.identity.routing_token, freshness));
+    }
+
+    #[test]
+    fn test_presence_ping_rejects_wrong_target() {
+        let (alice, mut bob) = established_pair();
+        let mallory = Client::new("127.0.0.1:4430".parse().unwrap());
+
+        // A ping Alice generated for someone else must not mark her online
+        // to Bob if somehow routed to him.
+        let misdirected = alice.generate_presence_packet(mallory.identity.routing_token);
+        let inner = strip_link(&misdirected, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner).unwrap();
+
+        assert!(!bob.is_online(&alice.identity.routing_token, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_presence_ping_rejects_unknown_sender() {
+        // Bob has no session/pending_contacts entry for a stranger — a
+        // ping claiming to be from them must be silently dropped, not
+        // marked online.
+        let mut bob = Client::new("127.0.0.1:4430".parse().unwrap());
+        let stranger = Client::new("127.0.0.1:4430".parse().unwrap());
+
+        let ping = PresencePayload::generate(&stranger.identity, bob.identity.routing_token);
+        let mut inner = vec![0x06];
+        inner.extend_from_slice(&ping.to_bytes());
+        bob.handle_incoming_packet(&inner).unwrap();
+
+        assert!(!bob.is_online(&stranger.identity.routing_token, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_presence_payload_serialization_roundtrip() {
+        let alice_id = UserIdentity::generate();
+        let bob_token = [7u8; 16];
+        let payload = PresencePayload::generate(&alice_id, bob_token);
+        let bytes = payload.to_bytes();
+        assert_eq!(bytes.len(), 104);
+        let parsed = PresencePayload::from_bytes(&bytes).unwrap();
+        assert!(parsed.verify(&alice_id.ed25519_public).is_ok());
+        assert_eq!(parsed.routing_token, alice_id.routing_token);
+        assert_eq!(parsed.target_token, bob_token);
     }
 }

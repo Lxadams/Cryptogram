@@ -21,6 +21,17 @@ fn server_addr_raw() -> String {
     std::env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:4430".to_string())
 }
 
+/// How often we send a presence ping to each established contact.
+/// Independent of `spawn_keepalive_loop`'s 15s NAT-mapping keepalive —
+/// that one's timing-critical against router UDP timeouts, this one is
+/// just a UI-freshness tradeoff and free to differ.
+const PRESENCE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A contact counts as "online" if we've heard from them (ping or chat
+/// message) within this long. A little over 2x the ping interval, so one
+/// dropped UDP packet doesn't immediately flip the marker to offline.
+const PRESENCE_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(45);
+
 #[derive(Serialize, Clone)]
 pub struct IdentityDto {
     pub routing_token: String,
@@ -40,6 +51,10 @@ pub struct ContactDto {
     /// Locally-entered display name for this contact, if one was given
     /// when adding them (see `connect_to_peer`'s `name` argument).
     pub name: Option<String>,
+    /// True if we've heard a presence ping or chat message from this
+    /// contact within `PRESENCE_FRESHNESS`. Always false for a merely
+    /// "pending" contact — there's no session to ping over yet.
+    pub online: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -112,7 +127,8 @@ pub async fn bootstrap(
     });
 
     spawn_receive_loop(app.clone(), socket.clone());
-    spawn_keepalive_loop(app, socket);
+    spawn_keepalive_loop(app.clone(), socket.clone());
+    spawn_presence_loop(app, socket);
 
     Ok(identity)
 }
@@ -147,6 +163,38 @@ fn spawn_keepalive_loop(app: AppHandle, socket: Arc<UdpSocket>) {
             let server_addr = rt.client.server_addr;
             drop(guard);
             let _ = socket.send_to(&sync_packet, server_addr).await;
+        }
+    });
+}
+
+/// Background task: send a signed presence ping (see `PresencePayload`) to
+/// every established contact on a fixed interval, so peers can show an
+/// online/offline marker. Separate from `spawn_keepalive_loop` on purpose
+/// — that one sends a single fixed packet to the relay and touches no
+/// protocol state, this one fans out to N contacts and advances no ratchet
+/// state either (pings are signed, not E2E-encrypted), so the two loops
+/// have nothing meaningful to share beyond both being timers.
+fn spawn_presence_loop(app: AppHandle, socket: Arc<UdpSocket>) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let mut ticker = tokio::time::interval(PRESENCE_PING_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let guard = state.runtime.lock().await;
+            let Some(rt) = guard.as_ref() else {
+                continue;
+            };
+            let server_addr = rt.client.server_addr;
+            let packets: Vec<Vec<u8>> = rt
+                .client
+                .e2e_sessions
+                .keys()
+                .map(|&token| rt.client.generate_presence_packet(token))
+                .collect();
+            drop(guard);
+            for packet in packets {
+                let _ = socket.send_to(&packet, server_addr).await;
+            }
         }
     });
 }
@@ -224,18 +272,22 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
             token: hex::encode(token),
             status: "pending".to_string(),
             name: rt.client.contact_names.get(token).cloned(),
+            online: false,
         })
         .collect();
 
     for token in rt.client.e2e_sessions.keys() {
         let token_hex = hex::encode(token);
+        let online = rt.client.is_online(token, PRESENCE_FRESHNESS);
         if let Some(existing) = contacts.iter_mut().find(|c| c.token == token_hex) {
             existing.status = "established".to_string();
+            existing.online = online;
         } else {
             contacts.push(ContactDto {
                 token: token_hex,
                 status: "established".to_string(),
                 name: rt.client.contact_names.get(token).cloned(),
+                online,
             });
         }
     }
