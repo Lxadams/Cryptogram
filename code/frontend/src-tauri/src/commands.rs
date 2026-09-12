@@ -111,9 +111,44 @@ pub async fn bootstrap(
         socket: socket.clone(),
     });
 
-    spawn_receive_loop(app, socket);
+    spawn_receive_loop(app.clone(), socket.clone());
+    spawn_keepalive_loop(app, socket);
 
     Ok(identity)
+}
+
+/// Background task: periodically resend an empty `sync` packet to the relay
+/// (the same packet type `perform_handshake` sends once at bootstrap).
+///
+/// This only matters once the relay and client are on different machines.
+/// The relay learns/refreshes our real `ip:port` purely from the source
+/// address of our packets, and its own record has a long TTL (see
+/// `METADATA_TTL` in `code/server/src/stores.rs`) — but that's irrelevant if
+/// our *own* NAT/router UDP mapping expires first, which home/campus
+/// routers typically do within 30-60s of silence. Without this, bootstrap
+/// (an immediate round trip on a fresh mapping) succeeds, but any peer
+/// packet routed to us minutes later gets silently dropped by our own
+/// router before it ever reaches this process. Resending well under that
+/// window keeps the mapping (and the relay's record) alive for as long as
+/// the app runs. Purely client-side — the relay already handles a resent
+/// sync packet identically to the first one.
+fn spawn_keepalive_loop(app: AppHandle, socket: Arc<UdpSocket>) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        ticker.tick().await; // first tick fires immediately; skip it, bootstrap just synced
+        loop {
+            ticker.tick().await;
+            let guard = state.runtime.lock().await;
+            let Some(rt) = guard.as_ref() else {
+                continue;
+            };
+            let sync_packet = rt.client.generate_sync_packet();
+            let server_addr = rt.client.server_addr;
+            drop(guard);
+            let _ = socket.send_to(&sync_packet, server_addr).await;
+        }
+    });
 }
 
 /// Background task: read inbound UDP packets for as long as the app runs,
