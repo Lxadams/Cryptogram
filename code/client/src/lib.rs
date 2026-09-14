@@ -793,7 +793,8 @@ impl Client {
                     }
                     if let Some(sender_pub) = self.pending_contacts.get(&presence.routing_token) {
                         if presence.verify(sender_pub).is_ok() {
-                            self.last_seen.insert(presence.routing_token, Instant::now());
+                            self.last_seen
+                                .insert(presence.routing_token, Instant::now());
                         } else {
                             println!(">> [SECURITY ALERT] Presence ping signature invalid!");
                         }
@@ -1375,7 +1376,8 @@ mod tests {
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
 
         // Step 1: Alice sends KeyExchange to Bob
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap();
@@ -1465,7 +1467,8 @@ mod tests {
         alice
             .pending_contacts
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
@@ -1909,7 +1912,8 @@ mod tests {
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
 
         // Alice sends KX, Bob replies, Alice sends SessionEstablish
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
@@ -2197,7 +2201,8 @@ mod tests {
         alice
             .pending_contacts
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
