@@ -1,0 +1,56 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: server
+    ports:
+      - "443:443/udp"
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - server_identity:/data
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    depends_on:
+      - server
+    environment:
+      - SERVER_ADDR=server:443
+      - RUST_LOG=info
+    volumes:
+      - client_state:/data
+    stdin_open: true
+    tty: true
+    # Interactive REPL — run with `docker compose run`, not `up`. The relay
+    # prints "Server Static Pubkey: <hex>" on boot (`docker compose logs
+    # server`); pass it here since the client authenticates the relay's
+    # identity during the handshake. Left blank by default (rather than a
+    # hard Compose-level requirement) so `docker compose up server` etc.
+    # aren't blocked by this var being unset — the binary itself rejects a
+    # missing/short key with a clear "must be 32 bytes" error if you forget:
+    #   SERVER_PUBKEY=<hex> docker compose run --rm client
+    command: ["${SERVER_PUBKEY:-}"]
+
+  # Build-only: compiles the Tauri desktop shell into a Linux .deb/AppImage.
+  # Final stage is FROM scratch (no shell, no CMD/ENTRYPOINT) — there's
+  # nothing to run, so it's kept out of a plain `docker compose up` via the
+  # profile gate. Build and extract the bundle with:
+  #   docker compose build frontend-builder
+  #   docker compose create frontend-builder
+  #   docker cp $(docker compose ps -a -q frontend-builder):/bundle ./frontend-bundle
+  #   docker compose rm -f frontend-builder
+  # (or skip Compose and use `docker buildx build --target artifacts
+  # --output type=local,...` directly — see frontend/Dockerfile's header)
+  frontend-builder:
+    profiles: ["build-only"]
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+
+volumes:
+  server_identity:
+  client_state:

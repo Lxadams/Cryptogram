@@ -81,7 +81,6 @@ impl ClientStateDto {
 
         let mut e2e_sessions = HashMap::new();
         for (token, state) in &client.e2e_sessions {
-
             let mut skip_dict = HashMap::new();
             for (k, v) in &state.skip_dict {
                 skip_dict.insert(*k, hex::encode(v));
@@ -209,7 +208,6 @@ impl ClientStateDto {
                 None
             };
 
-
             let mut skip_dict = HashMap::new();
             for (k, v) in dto_state.skip_dict {
                 let mut mk = [0u8; 32];
@@ -222,7 +220,6 @@ impl ClientStateDto {
                 hex::decode_to_slice(&hex_sig, &mut sig)?;
                 pq_inject_replay_cache.insert(sig);
             }
-
 
             e2e_sessions.insert(
                 tok,
@@ -284,7 +281,8 @@ impl ClientStateDto {
             seen_session_keys,
             local_name: String::new(), // always re-supplied at launch, not persisted
             contact_names,
-            inbox: Vec::new(), // transient handoff buffer, not persisted
+            inbox: Vec::new(),         // transient handoff buffer, not persisted
+            last_seen: HashMap::new(), // live status, not persisted — see Client::last_seen
         })
     }
 }

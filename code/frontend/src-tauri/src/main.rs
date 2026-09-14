@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-  e2e_messenger_lib::run();
+    e2e_messenger_lib::run();
 }

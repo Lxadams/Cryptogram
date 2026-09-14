@@ -5,17 +5,32 @@
 //! serializable DTOs back.
 
 use crate::state::{AppState, ClientRuntime};
-use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-use client::{Client, ClientStateDto, TYPE_DATA, perform_handshake, state_file_path};
+use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
+use client::{perform_handshake, state_file_path, Client, ClientStateDto, TYPE_DATA};
 use ed25519_dalek::VerifyingKey;
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
 use tauri::{AppHandle, Manager, State};
 use tokio::net::UdpSocket;
 
-/// The relay (server) this prototype always talks to. Hardcoded for now —
-/// same assumption the CLI makes (`127.0.0.1:4430`, see runserver.sh).
-const SERVER_ADDR: &str = "127.0.0.1:4430";
+/// The relay (server) this prototype talks to. Defaults to the CLI's own
+/// local-dev default (`127.0.0.1:4430`, see runserver.sh); override with
+/// the `SERVER_ADDR` env var (e.g. a deployed EC2 host's `<ip>:443`) —
+/// mirrors the same override on the CLI (see code/client/src/main.rs).
+fn server_addr_raw() -> String {
+    std::env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:4430".to_string())
+}
+
+/// How often we send a presence ping to each established contact.
+/// Independent of `spawn_keepalive_loop`'s 15s NAT-mapping keepalive —
+/// that one's timing-critical against router UDP timeouts, this one is
+/// just a UI-freshness tradeoff and free to differ.
+const PRESENCE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A contact counts as "online" if we've heard from them (ping or chat
+/// message) within this long. A little over 2x the ping interval, so one
+/// dropped UDP packet doesn't immediately flip the marker to offline.
+const PRESENCE_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(45);
 
 #[derive(Serialize, Clone)]
 pub struct IdentityDto {
@@ -36,6 +51,10 @@ pub struct ContactDto {
     /// Locally-entered display name for this contact, if one was given
     /// when adding them (see `connect_to_peer`'s `name` argument).
     pub name: Option<String>,
+    /// True if we've heard a presence ping or chat message from this
+    /// contact within `PRESENCE_FRESHNESS`. Always false for a merely
+    /// "pending" contact — there's no session to ping over yet.
+    pub online: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -70,7 +89,12 @@ pub async fn bootstrap(
     let server_pub =
         VerifyingKey::from_bytes(&arr).map_err(|_| "Invalid server public key".to_string())?;
 
-    let server_addr: SocketAddr = SERVER_ADDR.parse().expect("hardcoded address is valid");
+    let server_addr_raw = server_addr_raw();
+    let server_addr: SocketAddr = tokio::net::lookup_host(&server_addr_raw)
+        .await
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or_else(|| format!("Could not resolve SERVER_ADDR: {server_addr_raw}"))?;
 
     // Resume a previous identity if one was saved, otherwise mint a new one
     // — identical fallback logic to the CLI.
@@ -102,9 +126,77 @@ pub async fn bootstrap(
         socket: socket.clone(),
     });
 
-    spawn_receive_loop(app, socket);
+    spawn_receive_loop(app.clone(), socket.clone());
+    spawn_keepalive_loop(app.clone(), socket.clone());
+    spawn_presence_loop(app, socket);
 
     Ok(identity)
+}
+
+/// Background task: periodically resend an empty `sync` packet to the relay
+/// (the same packet type `perform_handshake` sends once at bootstrap).
+///
+/// This only matters once the relay and client are on different machines.
+/// The relay learns/refreshes our real `ip:port` purely from the source
+/// address of our packets, and its own record has a long TTL (see
+/// `METADATA_TTL` in `code/server/src/stores.rs`) — but that's irrelevant if
+/// our *own* NAT/router UDP mapping expires first, which home/campus
+/// routers typically do within 30-60s of silence. Without this, bootstrap
+/// (an immediate round trip on a fresh mapping) succeeds, but any peer
+/// packet routed to us minutes later gets silently dropped by our own
+/// router before it ever reaches this process. Resending well under that
+/// window keeps the mapping (and the relay's record) alive for as long as
+/// the app runs. Purely client-side — the relay already handles a resent
+/// sync packet identically to the first one.
+fn spawn_keepalive_loop(app: AppHandle, socket: Arc<UdpSocket>) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        ticker.tick().await; // first tick fires immediately; skip it, bootstrap just synced
+        loop {
+            ticker.tick().await;
+            let guard = state.runtime.lock().await;
+            let Some(rt) = guard.as_ref() else {
+                continue;
+            };
+            let sync_packet = rt.client.generate_sync_packet();
+            let server_addr = rt.client.server_addr;
+            drop(guard);
+            let _ = socket.send_to(&sync_packet, server_addr).await;
+        }
+    });
+}
+
+/// Background task: send a signed presence ping (see `PresencePayload`) to
+/// every established contact on a fixed interval, so peers can show an
+/// online/offline marker. Separate from `spawn_keepalive_loop` on purpose
+/// — that one sends a single fixed packet to the relay and touches no
+/// protocol state, this one fans out to N contacts and advances no ratchet
+/// state either (pings are signed, not E2E-encrypted), so the two loops
+/// have nothing meaningful to share beyond both being timers.
+fn spawn_presence_loop(app: AppHandle, socket: Arc<UdpSocket>) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let mut ticker = tokio::time::interval(PRESENCE_PING_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let guard = state.runtime.lock().await;
+            let Some(rt) = guard.as_ref() else {
+                continue;
+            };
+            let server_addr = rt.client.server_addr;
+            let packets: Vec<Vec<u8>> = rt
+                .client
+                .e2e_sessions
+                .keys()
+                .map(|&token| rt.client.generate_presence_packet(token))
+                .collect();
+            drop(guard);
+            for packet in packets {
+                let _ = socket.send_to(&packet, server_addr).await;
+            }
+        }
+    });
 }
 
 /// Background task: read inbound UDP packets for as long as the app runs,
@@ -180,18 +272,22 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
             token: hex::encode(token),
             status: "pending".to_string(),
             name: rt.client.contact_names.get(token).cloned(),
+            online: false,
         })
         .collect();
 
     for token in rt.client.e2e_sessions.keys() {
         let token_hex = hex::encode(token);
+        let online = rt.client.is_online(token, PRESENCE_FRESHNESS);
         if let Some(existing) = contacts.iter_mut().find(|c| c.token == token_hex) {
             existing.status = "established".to_string();
+            existing.online = online;
         } else {
             contacts.push(ContactDto {
                 token: token_hex,
                 status: "established".to_string(),
                 name: rt.client.contact_names.get(token).cloned(),
+                online,
             });
         }
     }

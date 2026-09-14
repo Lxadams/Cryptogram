@@ -50,6 +50,6 @@ main():
 ```
 
 ## Other implementation details
-- Listens on port 4430 (localhost for development)
+- Listens on `127.0.0.1:4430` by default (localhost, for development without `sudo`). Override with the `BIND_ADDR` env var — the Docker image sets `BIND_ADDR=0.0.0.0:443`.
 - Server has zero knowledge of user IDs or E2E keys
 - All message payloads are stored encrypted in RAM only

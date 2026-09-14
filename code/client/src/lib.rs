@@ -7,9 +7,9 @@ use pqcrypto_kyber::kyber768::*;
 use pqcrypto_traits::kem::{PublicKey as _, SharedSecret as _};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
-use subtle::ConstantTimeEq;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, net::SocketAddr};
+use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 
@@ -215,6 +215,13 @@ pub struct Client {
     /// `drain_inbox()` instead. Intentionally not persisted to disk: this is
     /// a transient handoff buffer, not session state.
     pub inbox: Vec<(RoutingToken, Vec<u8>)>,
+    /// Last time we heard *anything* authenticated from this peer — a real
+    /// chat message or a presence ping (see `PresencePayload`), both update
+    /// this. Front ends use it to show an online/offline marker. Like
+    /// `inbox`, this is live local state, not persisted: it should always
+    /// start empty ("unknown/offline") on relaunch rather than showing a
+    /// stale "online" from a previous run.
+    pub last_seen: HashMap<RoutingToken, Instant>,
 }
 
 impl Client {
@@ -234,6 +241,7 @@ impl Client {
             local_name: String::new(),
             contact_names: HashMap::new(),
             inbox: Vec::new(),
+            last_seen: HashMap::new(),
         }
     }
 
@@ -241,6 +249,27 @@ impl Client {
     /// `(sender_routing_token, plaintext)` pairs in arrival order.
     pub fn drain_inbox(&mut self) -> Vec<(RoutingToken, Vec<u8>)> {
         std::mem::take(&mut self.inbox)
+    }
+
+    /// True if `token` has sent us a chat message or presence ping within
+    /// the last `freshness` window. A local liveness heuristic for the UI
+    /// only — not part of the protocol's trust model.
+    pub fn is_online(&self, token: &RoutingToken, freshness: Duration) -> bool {
+        self.last_seen
+            .get(token)
+            .is_some_and(|seen| seen.elapsed() < freshness)
+    }
+
+    /// Build a signed presence ping for `target_token` (see
+    /// `PresencePayload`) and link-encrypt it for the relay, the same way
+    /// `create_encrypted_packet` does for a chat message. Deliberately
+    /// outside the E2E double ratchet — see the doc comment on
+    /// `PresencePayload` for why.
+    pub fn generate_presence_packet(&self, target_token: RoutingToken) -> Vec<u8> {
+        let payload = PresencePayload::generate(&self.identity, target_token);
+        let mut inner = vec![0x06];
+        inner.extend_from_slice(&payload.to_bytes());
+        self.wrap_link_encryption(target_token, &inner)
     }
 
     pub fn save(&self) {
@@ -254,7 +283,10 @@ impl Client {
         let client_ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
         let client_ephemeral_public = X25519PublicKey::from(&client_ephemeral_secret);
         // Sign the ephemeral X25519 public key with our Ed25519 identity
-        let signature = self.identity.ed25519_secret.sign(client_ephemeral_public.as_bytes());
+        let signature = self
+            .identity
+            .ed25519_secret
+            .sign(client_ephemeral_public.as_bytes());
         let mut packet = vec![TYPE_HANDSHAKE_INIT];
         packet.extend_from_slice(&self.session_id);
         packet.extend_from_slice(client_ephemeral_public.as_bytes());
@@ -369,7 +401,7 @@ impl Client {
             recv_count: 0,
             peer_kyber_pub: Some(peer_kyber_copy),
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
 
         let est_payload = SessionEstablishPayload::generate(
@@ -415,7 +447,7 @@ impl Client {
             recv_count: 0,
             peer_kyber_pub: peer_kyber,
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
         self.e2e_sessions.insert(est.routing_token, session_state);
         self.save();
@@ -523,6 +555,7 @@ impl Client {
                         // Also hand it to any polling consumer (e.g. a GUI) —
                         // see the `inbox` field doc comment above.
                         self.inbox.push((sender_token, pt));
+                        self.last_seen.insert(sender_token, Instant::now());
                     } else {
                         println!(
                             ">> Received packet from {} but decryption failed (out of sync?).",
@@ -541,7 +574,12 @@ impl Client {
                 // KeyExchange
                 if let Ok(kx) = KeyExchangePayload::from_bytes(pkt_data) {
                     if kx.verify(&kx.ed25519_public).is_ok() {
-                        if kx.target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
+                        if kx
+                            .target_token
+                            .ct_eq(&self.identity.routing_token)
+                            .unwrap_u8()
+                            == 0
+                        {
                             println!(
                                 ">> [SECURITY ALERT] Dropped KeyExchange! It was bound to a different target."
                             );
@@ -563,7 +601,9 @@ impl Client {
                         let is_initiator = self.pending_contacts.contains_key(&peer_token);
 
                         if !is_initiator && self.pending_contacts.len() > 50 {
-                            println!(">> [SECURITY ALERT] Dropped KeyExchange! Too many pending contacts.");
+                            println!(
+                                ">> [SECURITY ALERT] Dropped KeyExchange! Too many pending contacts."
+                            );
                             return Ok(None);
                         }
 
@@ -623,7 +663,12 @@ impl Client {
                 // SessionEstablish
 
                 if let Ok(est) = SessionEstablishPayload::from_bytes(pkt_data) {
-                    if est.target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
+                    if est
+                        .target_token
+                        .ct_eq(&self.identity.routing_token)
+                        .unwrap_u8()
+                        == 0
+                    {
                         println!(
                             ">> [SECURITY ALERT] Dropped SessionEstablish! Bound to different target."
                         );
@@ -643,14 +688,15 @@ impl Client {
                     if let Some(alice_pub) = self.pending_contacts.get(&est.routing_token) {
                         if est.verify(alice_pub).is_ok() {
                             if !self.seen_session_keys.insert(est.eph_x25519_pub.to_bytes()) {
-                                println!(">> [SECURITY ALERT] Dropped SessionEstablish! Replay detected (key already seen).");
+                                println!(
+                                    ">> [SECURITY ALERT] Dropped SessionEstablish! Replay detected (key already seen)."
+                                );
                                 return Ok(None);
                             }
                             if self.seen_session_keys.len() > 1000 {
                                 self.seen_session_keys.clear();
                             }
                             self.accept_session_est(&est);
-
                         } else {
                             println!(">> [SECURITY ALERT] SessionEstablish signature invalid!");
                         }
@@ -663,7 +709,12 @@ impl Client {
             0x05 => {
                 // PQ Inject
                 if let Ok(pqi) = PQInjectPayload::from_bytes(pkt_data) {
-                    if pqi.target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
+                    if pqi
+                        .target_token
+                        .ct_eq(&self.identity.routing_token)
+                        .unwrap_u8()
+                        == 0
+                    {
                         println!(
                             ">> [SECURITY ALERT] Dropped PQInject! Bound to different target."
                         );
@@ -686,7 +737,9 @@ impl Client {
                             if let Some(session) = self.e2e_sessions.get_mut(&pqi.routing_token) {
                                 let sig_bytes = pqi.signature.to_bytes();
                                 if session.pq_inject_replay_cache.contains(&sig_bytes) {
-                                    println!(">> [SECURITY ALERT] Dropped PQInject! Replay detected.");
+                                    println!(
+                                        ">> [SECURITY ALERT] Dropped PQInject! Replay detected."
+                                    );
                                     return Ok(None);
                                 }
                                 if session.pq_inject_replay_cache.len() > 1000 {
@@ -710,6 +763,41 @@ impl Client {
                         }
                     } else {
                         println!(">> PQInject received but sender unknown (not in contacts).");
+                    }
+                }
+                Ok(None)
+            }
+            0x06 => {
+                // Presence ping — see PresencePayload's doc comment. Only
+                // ever updates `last_seen`; never reaches `inbox`.
+                if let Ok(presence) = PresencePayload::from_bytes(pkt_data) {
+                    if presence
+                        .target_token
+                        .ct_eq(&self.identity.routing_token)
+                        .unwrap_u8()
+                        == 0
+                    {
+                        println!(
+                            ">> [SECURITY ALERT] Dropped Presence ping! Bound to different target."
+                        );
+                        return Ok(None);
+                    }
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let time_diff = now.max(presence.timestamp) - now.min(presence.timestamp);
+                    if time_diff > MAX_TIMESTAMP_DRIFT {
+                        println!(">> [SECURITY ALERT] Dropped Presence ping! Timestamp is stale.");
+                        return Ok(None);
+                    }
+                    if let Some(sender_pub) = self.pending_contacts.get(&presence.routing_token) {
+                        if presence.verify(sender_pub).is_ok() {
+                            self.last_seen
+                                .insert(presence.routing_token, Instant::now());
+                        } else {
+                            println!(">> [SECURITY ALERT] Presence ping signature invalid!");
+                        }
                     }
                 }
                 Ok(None)
@@ -942,7 +1030,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -952,7 +1040,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
         for i in 0..10 {
             let alice_mk = alice_state.symmetric_ratchet();
@@ -972,7 +1060,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
         let mut seen_keys = std::collections::HashSet::new();
         for _ in 0..100 {
@@ -1261,7 +1349,7 @@ mod tests {
             peer_kyber_pub: None,
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: HashSet::new(),
+            pq_inject_replay_cache: HashSet::new(),
         };
         for _ in 0..5 {
             no_pq_state.symmetric_ratchet();
@@ -1288,7 +1376,8 @@ mod tests {
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
 
         // Step 1: Alice sends KeyExchange to Bob
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap();
@@ -1378,7 +1467,8 @@ mod tests {
         alice
             .pending_contacts
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
@@ -1564,15 +1654,15 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: std::collections::HashSet::new(),
         };
-        
+
         let mk1 = alice_state.symmetric_ratchet();
         let mk2 = alice_state.symmetric_ratchet();
         let mk3 = alice_state.symmetric_ratchet();
-        
+
         let c1 = XChaCha20Poly1305::new(Key::from_slice(&mk1));
         let c2 = XChaCha20Poly1305::new(Key::from_slice(&mk2));
         let c3 = XChaCha20Poly1305::new(Key::from_slice(&mk3));
-        
+
         let nonce = XNonce::from_slice(&[0u8; 24]);
         let ct1 = c1.encrypt(nonce, b"msg1".as_ref()).unwrap();
         let ct2 = c2.encrypt(nonce, b"msg2".as_ref()).unwrap();
@@ -1618,7 +1708,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: std::collections::HashSet::new(),
         };
-        
+
         // Receive packet with seq_no 150 (exceeds MAX_SKIP_DICT_ENTRIES of 100)
         for _ in 0..151 {
             alice_state.symmetric_ratchet();
@@ -1629,7 +1719,10 @@ mod tests {
         let ct150 = cipher.encrypt(nonce, b"msg150".as_ref()).unwrap();
 
         let pt = bob_state.try_decrypt(150, nonce, &ct150);
-        assert!(pt.is_none(), "Should drop packet that skips more than 100 seq nums");
+        assert!(
+            pt.is_none(),
+            "Should drop packet that skips more than 100 seq nums"
+        );
         assert_eq!(bob_state.recv_count, 0);
     }
 
@@ -1637,18 +1730,18 @@ mod tests {
     fn test_edge_case_pending_contacts_exhaustion() {
         let server_addr: std::net::SocketAddr = "127.0.0.1:4430".parse().unwrap();
         let mut bob = Client::new(server_addr);
-        
+
         // Flood with 55 KeyExchanges
         for _ in 0..55 {
             let alice_id = UserIdentity::generate();
             let payload = KeyExchangePayload::generate(&alice_id, bob.identity.routing_token, "");
             let mut packet = vec![0x02];
             packet.extend_from_slice(&payload.to_bytes());
-            
+
             // Send
             let _ = bob.handle_incoming_packet(&packet);
         }
-        
+
         // Ensure bounded to 51 (inserts up to 50, drops if > 50 which allows 51)
         assert_eq!(bob.pending_contacts.len(), 51);
         assert_eq!(bob.peer_kyber_keys.len(), 51);
@@ -1658,11 +1751,12 @@ mod tests {
     fn test_edge_case_seen_session_keys_exhaustion() {
         let server_addr: std::net::SocketAddr = "127.0.0.1:4430".parse().unwrap();
         let mut bob = Client::new(server_addr);
-        
+
         // Insert a dummy pending contact to allow verification
         let alice_id = UserIdentity::generate();
-        bob.pending_contacts.insert(alice_id.routing_token, alice_id.ed25519_public);
-        
+        bob.pending_contacts
+            .insert(alice_id.routing_token, alice_id.ed25519_public);
+
         // Flood with 1050 SessionEstablish payloads
         for _ in 0..1050 {
             let eph_sec = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
@@ -1674,13 +1768,13 @@ mod tests {
                 kyber_ct,
                 eph_pub,
             );
-            
+
             let mut packet = vec![0x04];
             packet.extend_from_slice(&payload.to_bytes());
-            
+
             let _ = bob.handle_incoming_packet(&packet);
         }
-        
+
         // Ensure bounded to 1000 or cleared
         assert!(bob.seen_session_keys.len() <= 1000);
     }
@@ -1768,7 +1862,10 @@ mod tests {
         let mut packet = vec![0x02];
         packet.extend_from_slice(&payload.to_bytes());
         let result = bob.handle_incoming_packet(&packet).unwrap();
-        assert!(result.is_none(), "Stale timestamp must cause packet to be dropped");
+        assert!(
+            result.is_none(),
+            "Stale timestamp must cause packet to be dropped"
+        );
         // Bob should NOT have added alice to pending_contacts
         assert!(
             !bob.pending_contacts.contains_key(&alice_id.routing_token),
@@ -1792,7 +1889,10 @@ mod tests {
         packet.extend_from_slice(&payload.to_bytes());
 
         let result = bob.handle_incoming_packet(&packet).unwrap();
-        assert!(result.is_none(), "Misbinding must cause packet to be dropped");
+        assert!(
+            result.is_none(),
+            "Misbinding must cause packet to be dropped"
+        );
         assert!(
             !bob.pending_contacts.contains_key(&alice_id.routing_token),
             "Misbinding must not create a pending contact"
@@ -1812,7 +1912,8 @@ mod tests {
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
 
         // Alice sends KX, Bob replies, Alice sends SessionEstablish
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
@@ -2083,5 +2184,131 @@ mod tests {
         let charlie_sess = alice.e2e_sessions.get(&charlie_token).unwrap();
         assert_eq!(charlie_sess.recv_count, 3);
         assert!(charlie_sess.skip_dict.is_empty());
+    }
+
+    // ==========================================
+    // Presence Ping Tests
+    // ==========================================
+
+    /// Runs the same 3-way handshake as `test_full_3way_handshake` and
+    /// returns the two established clients, to avoid repeating the setup
+    /// in every presence test below.
+    fn established_pair() -> (Client, Client) {
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut alice = Client::new(server_addr);
+        let mut bob = Client::new(server_addr);
+
+        alice
+            .pending_contacts
+            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let mut kx_inner = vec![0x02];
+        kx_inner.extend_from_slice(&alice_kx.to_bytes());
+        let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
+        let inner = strip_link(&bob_reply, &bob.link_master_key);
+        let alice_reply = alice.handle_incoming_packet(&inner).unwrap().unwrap();
+        let inner2 = strip_link(&alice_reply, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner2).unwrap();
+
+        (alice, bob)
+    }
+
+    #[test]
+    fn test_presence_ping_marks_peer_online() {
+        let (alice, mut bob) = established_pair();
+        let freshness = Duration::from_secs(60);
+
+        assert!(
+            !bob.is_online(&alice.identity.routing_token, freshness),
+            "must be offline before any ping has arrived"
+        );
+
+        let ping = alice.generate_presence_packet(bob.identity.routing_token);
+        let inner = strip_link(&ping, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner).unwrap();
+
+        assert!(
+            bob.is_online(&alice.identity.routing_token, freshness),
+            "must be online immediately after a valid ping"
+        );
+        assert!(
+            bob.drain_inbox().is_empty(),
+            "a presence ping must never surface as a chat message"
+        );
+    }
+
+    #[test]
+    fn test_presence_ping_expires_after_freshness_window() {
+        let (alice, mut bob) = established_pair();
+        let tiny_freshness = Duration::from_millis(20);
+
+        let ping = alice.generate_presence_packet(bob.identity.routing_token);
+        let inner = strip_link(&ping, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner).unwrap();
+        assert!(bob.is_online(&alice.identity.routing_token, tiny_freshness));
+
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            !bob.is_online(&alice.identity.routing_token, tiny_freshness),
+            "must go offline once the freshness window has elapsed"
+        );
+    }
+
+    #[test]
+    fn test_chat_message_also_marks_peer_online() {
+        let (mut alice, mut bob) = established_pair();
+        let freshness = Duration::from_secs(60);
+
+        let (msg_pkt, _) = alice
+            .create_encrypted_packet(bob.identity.routing_token, b"hi")
+            .unwrap();
+        let inner = strip_link(&msg_pkt, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner).unwrap();
+
+        assert!(bob.is_online(&alice.identity.routing_token, freshness));
+    }
+
+    #[test]
+    fn test_presence_ping_rejects_wrong_target() {
+        let (alice, mut bob) = established_pair();
+        let mallory = Client::new("127.0.0.1:4430".parse().unwrap());
+
+        // A ping Alice generated for someone else must not mark her online
+        // to Bob if somehow routed to him.
+        let misdirected = alice.generate_presence_packet(mallory.identity.routing_token);
+        let inner = strip_link(&misdirected, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner).unwrap();
+
+        assert!(!bob.is_online(&alice.identity.routing_token, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_presence_ping_rejects_unknown_sender() {
+        // Bob has no session/pending_contacts entry for a stranger — a
+        // ping claiming to be from them must be silently dropped, not
+        // marked online.
+        let mut bob = Client::new("127.0.0.1:4430".parse().unwrap());
+        let stranger = Client::new("127.0.0.1:4430".parse().unwrap());
+
+        let ping = PresencePayload::generate(&stranger.identity, bob.identity.routing_token);
+        let mut inner = vec![0x06];
+        inner.extend_from_slice(&ping.to_bytes());
+        bob.handle_incoming_packet(&inner).unwrap();
+
+        assert!(!bob.is_online(&stranger.identity.routing_token, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_presence_payload_serialization_roundtrip() {
+        let alice_id = UserIdentity::generate();
+        let bob_token = [7u8; 16];
+        let payload = PresencePayload::generate(&alice_id, bob_token);
+        let bytes = payload.to_bytes();
+        assert_eq!(bytes.len(), 104);
+        let parsed = PresencePayload::from_bytes(&bytes).unwrap();
+        assert!(parsed.verify(&alice_id.ed25519_public).is_ok());
+        assert_eq!(parsed.routing_token, alice_id.routing_token);
+        assert_eq!(parsed.target_token, bob_token);
     }
 }

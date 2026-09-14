@@ -1,0 +1,68 @@
+# .github/workflows/deploy.yml
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - production
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t server:latest -f code/server/Dockerfile code
+
+      - name: Save image to tar
+        run: docker save server:latest | gzip > server.tar.gz
+
+      - name: Save image to artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-image
+          path: server.tar.gz
+          retention-days: 2
+
+      - name: Copy image to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          source: "server.tar.gz"
+          target: "/home/ubuntu/"
+
+      - name: Load and run container on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          script: |
+            set -e
+            gunzip -f /home/ubuntu/server.tar.gz
+            docker load -i /home/ubuntu/server.tar
+            docker stop server || true
+            docker rm server || true
+            # server_identity is a named volume, not a bind mount: it's
+            # created once on first run and then persists across every
+            # `docker rm`+`run` this script does on later deploys, so the
+            # server's Ed25519 identity (and the pubkey clients trust)
+            # doesn't change every time you push to production.
+            docker run -d \
+              --name server \
+              --restart unless-stopped \
+              -p 443:443/udp \
+              -v server_identity:/data \
+              -e RUST_LOG=info \
+              server:latest
+            rm /home/ubuntu/server.tar
+            docker image prune -f
+            sleep 2
+            docker logs server --tail 20

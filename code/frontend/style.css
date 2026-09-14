@@ -241,6 +241,28 @@ button:disabled {
   font-weight: 600;
 }
 
+.contact-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.presence-dot {
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+}
+
+.presence-dot.online {
+  background: var(--ok);
+}
+
+.presence-dot.offline {
+  background: var(--error);
+}
+
 .chat-header {
   margin: 0 0 0.75rem 0;
 }
