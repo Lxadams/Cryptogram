@@ -5,8 +5,10 @@
 //! relay server over a real UDP socket.
 //!
 //! Screens:
-//! 1. Connect  — enter the relay's Ed25519 pubkey, perform the link handshake.
-//! 2. Main     — show our own identity, manage contacts, chat with one peer.
+//! 1. Login    — choose a username + passcode, resolving which saved
+//!               identity (if any) to use. See `LoginScreen`'s doc comment.
+//! 2. Connect  — enter the relay's Ed25519 pubkey, perform the link handshake.
+//! 3. Main     — show our own identity, manage contacts, chat with one peer.
 //!
 //! State lives in a handful of top-level signals passed down as props,
 //! rather than a router or global store — deliberately simple for a
@@ -150,10 +152,87 @@ fn CopyButton(value: String) -> impl IntoView {
     }
 }
 
+/// A passcode `<input>` with a small icon button to toggle between masked
+/// dots and plaintext while typing — shared by the Login and Create
+/// Identity screens' passcode field(s) instead of duplicating this control
+/// three times.
+#[component]
+fn PasswordInput(value: RwSignal<String>, placeholder: &'static str) -> impl IntoView {
+    let visible = RwSignal::new(false);
+
+    view! {
+        <div class="password-field">
+            <input
+                type=move || if visible.get() { "text" } else { "password" }
+                placeholder=placeholder
+                prop:value=move || value.get()
+                on:input=move |ev| value.set(event_target_value(&ev))
+            />
+            <button
+                type="button"
+                class="visibility-toggle"
+                title=move || if visible.get() { "Hide passcode" } else { "Show passcode" }
+                on:click=move |_| visible.update(|v| *v = !*v)
+            >
+                {move || if visible.get() {
+                    view! {
+                        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M2 8s2.5-4.5 6-4.5S14 8 14 8s-2.5 4.5-6 4.5S2 8 2 8z" />
+                            <circle cx="8" cy="8" r="1.7" />
+                            <path d="M2.5 2.5l11 11" />
+                        </svg>
+                    }.into_any()
+                } else {
+                    view! {
+                        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M2 8s2.5-4.5 6-4.5S14 8 14 8s-2.5 4.5-6 4.5S2 8 2 8z" />
+                            <circle cx="8" cy="8" r="1.7" />
+                        </svg>
+                    }.into_any()
+                }}
+            </button>
+        </div>
+    }
+}
+
+/// Which of the two pre-login screens is showing. Kept separate from
+/// `login`/`identity` (which gate Connect/Main) since navigating between
+/// Login and Create Identity never involves either of those — it's purely
+/// a UI choice, no backend call happens until one of the two forms submits.
+#[derive(Clone, Copy, PartialEq)]
+enum AuthScreen {
+    Login,
+    CreateIdentity,
+}
+
 #[component]
 pub fn App() -> impl IntoView {
-    // `None` until `bootstrap` succeeds — gates which screen renders.
+    let auth_screen = RwSignal::new(AuthScreen::Login);
+    // Username to prefill on the Login screen right after a successful
+    // Create Identity, so the user isn't retyping what they just chose.
+    let just_created = RwSignal::new(None::<String>);
+    // Username to prefill on the Create Identity screen when the user gets
+    // there via Login's "create a new identity?" prompt (see LoginScreen),
+    // so they're not retyping the username that didn't exist yet.
+    let prefill_create_username = RwSignal::new(None::<String>);
+    // `None` until `login` succeeds — gates the Login/Create Identity screens.
+    let login = RwSignal::new(None::<api::LoginDto>);
+    // `None` until `bootstrap` succeeds — gates the Connect screen. Reset
+    // together with `login` by `log_out`, below.
     let identity = RwSignal::new(None::<api::IdentityDto>);
+
+    // Tears down the backend session (stops background tasks, releases the
+    // identity's session lock — see `logout`'s doc comment in commands.rs)
+    // and sends the UI back to the Login screen. Shown whenever `login` is
+    // `Some`, i.e. any screen past Login itself, so abandoning a stuck
+    // Connect screen works the same way as logging out from Main.
+    let log_out = move || {
+        leptos::task::spawn_local(async move {
+            let _ = api::logout().await;
+            identity.set(None);
+            login.set(None);
+        });
+    };
 
     let theme = RwSignal::new(initial_theme());
     Effect::new(move |_| apply_theme(theme.get()));
@@ -162,21 +241,359 @@ pub fn App() -> impl IntoView {
         <main class="app">
             <div class="app-header">
                 <h1>"E2E-Messenger"</h1>
-                <button
-                    class="theme-toggle"
-                    on:click=move |_| theme.update(|t| *t = t.flipped())
-                >
-                    {move || match theme.get() {
-                        Theme::Dark => "Light mode",
-                        Theme::Light => "Dark mode",
-                    }}
-                </button>
+                <div class="header-actions">
+                    {move || login.get().is_some().then(|| view! {
+                        <button class="theme-toggle" on:click=move |_| log_out()>
+                            "Log out"
+                        </button>
+                    })}
+                    <button
+                        class="theme-toggle"
+                        on:click=move |_| theme.update(|t| *t = t.flipped())
+                    >
+                        {move || match theme.get() {
+                            Theme::Dark => "Light mode",
+                            Theme::Light => "Dark mode",
+                        }}
+                    </button>
+                </div>
             </div>
-            {move || match identity.get() {
-                None => view! { <ConnectScreen identity=identity /> }.into_any(),
-                Some(id) => view! { <MainScreen identity=id /> }.into_any(),
+            {move || match (login.get(), identity.get()) {
+                (None, _) => match auth_screen.get() {
+                    AuthScreen::Login => view! {
+                        <LoginScreen
+                            login=login
+                            auth_screen=auth_screen
+                            just_created=just_created
+                            prefill_create_username=prefill_create_username
+                        />
+                    }.into_any(),
+                    AuthScreen::CreateIdentity => view! {
+                        <CreateIdentityScreen
+                            auth_screen=auth_screen
+                            just_created=just_created
+                            prefill_username=prefill_create_username
+                        />
+                    }.into_any(),
+                },
+                (Some(_), None) => view! { <ConnectScreen identity=identity /> }.into_any(),
+                (Some(_), Some(id)) => view! { <MainScreen identity=id /> }.into_any(),
             }}
         </main>
+    }
+}
+
+/// Screen 1 (default): log in with a username + passcode that already has a
+/// saved identity. This is a UI-layer gate only — see `hash_passcode`'s doc
+/// comment in `code/client/src/lib.rs` — it decides which pseudonym's
+/// identity file the Connect screen's `bootstrap` call will load next,
+/// nothing here touches the network. No saved identity for that username?
+/// The "Create identity" button hands off to `CreateIdentityScreen` instead
+/// of trying to create one inline.
+#[component]
+fn LoginScreen(
+    login: RwSignal<Option<api::LoginDto>>,
+    auth_screen: RwSignal<AuthScreen>,
+    just_created: RwSignal<Option<String>>,
+    prefill_create_username: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let known = RwSignal::new(Vec::<String>::new());
+
+    // Prefill (once) from a just-created identity, and surface a small
+    // confirmation hint — cleared as soon as the user edits the username,
+    // so it doesn't linger and describe a different name.
+    let pseudonym_input = RwSignal::new(just_created.get_untracked().unwrap_or_default());
+    let created_hint = RwSignal::new(just_created.get_untracked());
+
+    let passcode_input = RwSignal::new(String::new());
+    // Distinct from `error`: an unrecognized username is an expected outcome
+    // (see `api::LoginOutcome`'s doc comment), not a mistake to scold the
+    // user for — it gets its own message plus a direct path to fix it,
+    // rather than sharing the plain error paragraph below.
+    let unknown_username = RwSignal::new(None::<String>);
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+
+    // The "Existing identities" dropdown's current value — empty means
+    // nothing selected. Selecting an option also fills `pseudonym_input`
+    // (same effect the old clickable list had), and drives which identity
+    // the delete control (below) acts on.
+    let selected_existing = RwSignal::new(String::new());
+    // Whether the delete control is showing its "Delete? Yes/No" confirm
+    // (for whichever identity `selected_existing` names) instead of the
+    // usual delete icon.
+    let delete_confirm = RwSignal::new(None::<String>);
+    let delete_busy = RwSignal::new(false);
+
+    // Re-fetch on a timer, same pattern as MainScreen's contact/inbox
+    // polling — this machine's identities aren't scoped per peer window, so
+    // another peer deleting one (or creating one) should show up here
+    // without needing to leave and come back to this screen. If the
+    // identity currently selected/typed from a stale list just disappeared
+    // out from under the user (deleted elsewhere), clear it rather than
+    // leave the dropdown/delete control pointing at nothing.
+    let refresh_known = move || {
+        leptos::task::spawn_local(async move {
+            if let Ok(list) = api::list_pseudonyms().await {
+                let selected = selected_existing.get_untracked();
+                if !selected.is_empty() && !list.contains(&selected) {
+                    if pseudonym_input.get_untracked() == selected {
+                        pseudonym_input.set(String::new());
+                    }
+                    selected_existing.set(String::new());
+                    delete_confirm.set(None);
+                }
+                known.set(list);
+            }
+        });
+    };
+    refresh_known();
+    let _known_refresh = set_interval_with_handle(refresh_known, Duration::from_millis(1000));
+
+    let go_to_create_identity = move || {
+        let typed = pseudonym_input.get();
+        prefill_create_username.set((!typed.trim().is_empty()).then_some(typed));
+        auth_screen.set(AuthScreen::CreateIdentity);
+    };
+
+    let submit = move |_| {
+        let pseudonym = pseudonym_input.get();
+        let passcode = passcode_input.get();
+        if pseudonym.trim().is_empty() {
+            error.set(Some("Enter your username.".into()));
+            return;
+        }
+        if passcode.is_empty() {
+            error.set(Some("Enter your passcode.".into()));
+            return;
+        }
+        error.set(None);
+        unknown_username.set(None);
+        busy.set(true);
+        leptos::task::spawn_local(async move {
+            match api::login(&pseudonym, &passcode).await {
+                Ok(api::LoginOutcome::Success { pseudonym }) => {
+                    login.set(Some(api::LoginDto { pseudonym }))
+                }
+                Ok(api::LoginOutcome::UnknownUsername) => unknown_username.set(Some(pseudonym)),
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+
+    let confirm_delete = move |name: String| {
+        error.set(None);
+        delete_busy.set(true);
+        leptos::task::spawn_local(async move {
+            match api::delete_identity(&name).await {
+                Ok(()) => {
+                    known.update(|list| list.retain(|n| n != &name));
+                    if pseudonym_input.get_untracked() == name {
+                        pseudonym_input.set(String::new());
+                    }
+                    selected_existing.set(String::new());
+                    delete_confirm.set(None);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            delete_busy.set(false);
+        });
+    };
+
+    view! {
+        <section class="login-screen">
+            <p>"Log in with your username and passcode."</p>
+            {move || created_hint.get().map(|name| view! {
+                <p class="hint">"Identity \"" {name} "\" created — log in below."</p>
+            })}
+            {move || {
+                let names = known.get();
+                (!names.is_empty()).then(|| view! {
+                    <h3 class="identities-heading">"Existing identities"</h3>
+                    <div class="identity-select-row">
+                        <select
+                            class="identity-select"
+                            prop:value=move || selected_existing.get()
+                            on:change=move |ev| {
+                                let picked = event_target_value(&ev);
+                                selected_existing.set(picked.clone());
+                                pseudonym_input.set(picked);
+                                created_hint.set(None);
+                                unknown_username.set(None);
+                                delete_confirm.set(None);
+                            }
+                        >
+                            <option value="">"-- choose an identity --"</option>
+                            <For each=move || known.get() key=|n| n.clone() let(name)>
+                                <option value=name.clone()>{name.clone()}</option>
+                            </For>
+                        </select>
+                        {move || {
+                            let selected = selected_existing.get();
+                            (!selected.is_empty()).then(|| {
+                                if delete_confirm.get().as_deref() == Some(selected.as_str()) {
+                                    let yes_name = selected.clone();
+                                    view! {
+                                        <span class="identity-confirm">
+                                            "Delete?"
+                                            <button
+                                                type="button"
+                                                class="danger"
+                                                disabled=move || delete_busy.get()
+                                                on:click=move |_| confirm_delete(yes_name.clone())
+                                            >
+                                                "Yes"
+                                            </button>
+                                            <button
+                                                type="button"
+                                                class="secondary"
+                                                on:click=move |_| delete_confirm.set(None)
+                                            >
+                                                "No"
+                                            </button>
+                                        </span>
+                                    }.into_any()
+                                } else {
+                                    let trash_name = selected.clone();
+                                    view! {
+                                        <button
+                                            type="button"
+                                            class="icon-btn"
+                                            title="Delete this identity"
+                                            on:click=move |_| delete_confirm.set(Some(trash_name.clone()))
+                                        >
+                                            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+                                                <path d="M3 4.5h10" />
+                                                <path d="M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5" />
+                                                <path d="M4.5 4.5l.6 8a1 1 0 0 0 1 .9h3.8a1 1 0 0 0 1-.9l.6-8" />
+                                            </svg>
+                                        </button>
+                                    }.into_any()
+                                }
+                            })
+                        }}
+                    </div>
+                })
+            }}
+            <input
+                type="text"
+                placeholder="username"
+                prop:value=move || pseudonym_input.get()
+                on:input=move |ev| {
+                    pseudonym_input.set(event_target_value(&ev));
+                    created_hint.set(None);
+                    unknown_username.set(None);
+                    selected_existing.set(String::new());
+                }
+            />
+            <PasswordInput value=passcode_input placeholder="passcode" />
+            <div class="login-actions">
+                <button disabled=move || busy.get() on:click=submit>
+                    {move || if busy.get() { "..." } else { "Log in" }}
+                </button>
+                <button
+                    type="button"
+                    class="secondary"
+                    disabled=move || busy.get()
+                    on:click=move |_| go_to_create_identity()
+                >
+                    "Create identity"
+                </button>
+            </div>
+            {move || unknown_username.get().map(|name| view! {
+                <p class="error">
+                    "Username \"" {name} "\" does not exist. "
+                    <a href="#" on:click=move |ev| {
+                        ev.prevent_default();
+                        go_to_create_identity();
+                    }>
+                        "Create new identity?"
+                    </a>
+                </p>
+            })}
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        </section>
+    }
+}
+
+/// Screen 1b: mint a brand-new identity behind a chosen username + passcode.
+/// On success, hands back to `LoginScreen` rather than proceeding straight
+/// to Connect — the user logs in with what they just chose, same as any
+/// other identity. This is a UI-layer gate only, same caveat as
+/// `LoginScreen` — see `hash_passcode`'s doc comment in
+/// `code/client/src/lib.rs`.
+#[component]
+fn CreateIdentityScreen(
+    auth_screen: RwSignal<AuthScreen>,
+    just_created: RwSignal<Option<String>>,
+    /// Set by `LoginScreen` when it sends the user here because their typed
+    /// username didn't match any saved identity — carries that username
+    /// over so it doesn't need retyping.
+    prefill_username: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let pseudonym_input = RwSignal::new(prefill_username.get_untracked().unwrap_or_default());
+    let passcode_input = RwSignal::new(String::new());
+    let confirm_input = RwSignal::new(String::new());
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+
+    let submit = move |_| {
+        let pseudonym = pseudonym_input.get();
+        let passcode = passcode_input.get();
+        if pseudonym.trim().is_empty() {
+            error.set(Some("Choose a username first.".into()));
+            return;
+        }
+        if passcode.is_empty() {
+            error.set(Some("Choose a passcode first.".into()));
+            return;
+        }
+        if passcode != confirm_input.get() {
+            error.set(Some("Passcodes don't match.".into()));
+            return;
+        }
+        error.set(None);
+        busy.set(true);
+        let pseudonym_for_task = pseudonym.clone();
+        leptos::task::spawn_local(async move {
+            match api::create_identity(&pseudonym_for_task, &passcode).await {
+                Ok(()) => {
+                    just_created.set(Some(pseudonym_for_task));
+                    auth_screen.set(AuthScreen::Login);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+
+    view! {
+        <section class="login-screen">
+            <p>"Choose a username and passcode to create a new identity."</p>
+            <input
+                type="text"
+                placeholder="username"
+                prop:value=move || pseudonym_input.get()
+                on:input=move |ev| pseudonym_input.set(event_target_value(&ev))
+            />
+            <PasswordInput value=passcode_input placeholder="passcode" />
+            <PasswordInput value=confirm_input placeholder="confirm passcode" />
+            <div class="login-actions">
+                <button disabled=move || busy.get() on:click=submit>
+                    {move || if busy.get() { "..." } else { "Create identity" }}
+                </button>
+                <button
+                    type="button"
+                    class="secondary"
+                    disabled=move || busy.get()
+                    on:click=move |_| auth_screen.set(AuthScreen::Login)
+                >
+                    "Back to login"
+                </button>
+            </div>
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        </section>
     }
 }
 
@@ -283,12 +700,12 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
 /// add us as a contact. In a real build this would render as a QR code
 /// (see documentations/doable-cryptographic-flow.md, Micro-QR); this
 /// prototype just shows the hex so it can be copy-pasted between two
-/// running instances during local testing. `name` (set via
-/// `./runpeer.sh <name>`, see README) is shown here for your own
-/// reference only — it's sent automatically as part of the KeyExchange
-/// once you connect to someone, so peers see "alice" in their contact
-/// list without typing anything themselves (see `Client::local_name` /
-/// `contact_names` in code/client/src/lib.rs).
+/// running instances during local testing. `name` (chosen on the login
+/// screen) is shown here for your own reference only — it's sent
+/// automatically as part of the KeyExchange once you connect to someone,
+/// so peers see "alice" in their contact list without typing anything
+/// themselves (see `Client::local_name` / `contact_names` in
+/// code/client/src/lib.rs).
 #[component]
 fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
     view! {

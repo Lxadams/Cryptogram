@@ -90,6 +90,12 @@ h1 {
   letter-spacing: 0.02em;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .theme-toggle {
   background: transparent;
   color: var(--text);
@@ -137,6 +143,21 @@ button:disabled {
   cursor: default;
 }
 
+button.secondary {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.login-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.login-actions button {
+  flex: 1;
+}
+
 .hint {
   color: var(--muted);
   font-size: 0.9rem;
@@ -147,6 +168,11 @@ button:disabled {
   font-size: 0.9rem;
 }
 
+.error a {
+  color: var(--accent);
+}
+
+.login-screen,
 .connect-screen,
 .identity-card,
 .contact-panel,
@@ -156,6 +182,94 @@ button:disabled {
   border-radius: 10px;
   padding: 1rem;
   margin-bottom: 1rem;
+}
+
+.identities-heading {
+  font-size: 0.9rem;
+  color: var(--muted);
+  margin: 0 0 0.4rem;
+}
+
+.identity-select-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.identity-select {
+  flex: 1;
+  background: var(--sunken);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.5rem 0.7rem;
+  border-radius: 6px;
+}
+
+.identity-confirm {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 0.3rem;
+  border-radius: 6px;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.icon-btn:hover {
+  background: var(--hover);
+  color: var(--error);
+}
+
+button.danger {
+  background: var(--error);
+  color: white;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.identity-confirm button.secondary {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.password-field {
+  display: flex;
+  gap: 0.3rem;
+  margin-bottom: 0.5rem;
+}
+
+.password-field input {
+  margin-bottom: 0;
+}
+
+.visibility-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 0.3rem;
+  border-radius: 6px;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.visibility-toggle:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 
 .main-screen {

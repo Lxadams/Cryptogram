@@ -6,7 +6,7 @@
 //! sends/receives on.
 
 use client::Client;
-use std::sync::Arc;
+use std::{fs::File, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
 /// Everything needed to actually talk to the relay: the protocol state
@@ -15,6 +15,22 @@ use tokio::{net::UdpSocket, sync::Mutex};
 pub struct ClientRuntime {
     pub client: Client,
     pub socket: Arc<UdpSocket>,
+    /// Handles to the background tasks `bootstrap` spawned (receive,
+    /// keepalive, presence loops) — aborted by `logout` so they don't keep
+    /// running against an abandoned socket/identity after the user switches
+    /// identities without closing the whole app.
+    pub tasks: Vec<tauri::async_runtime::JoinHandle<()>>,
+}
+
+/// Which identity the `login` command resolved (pseudonym + passcode
+/// checked/created), waiting for `bootstrap` to actually load/create the
+/// `Client` from `state_path` and perform the relay handshake. Split into
+/// its own step because identity resolution (login) doesn't need the relay
+/// address, while `Client::new` for a brand-new identity currently does.
+#[derive(Clone)]
+pub struct PendingIdentity {
+    pub pseudonym: String,
+    pub state_path: String,
 }
 
 /// Tauri-managed application state (registered via `.manage(...)` in
@@ -24,4 +40,11 @@ pub struct ClientRuntime {
 #[derive(Default)]
 pub struct AppState {
     pub runtime: Mutex<Option<ClientRuntime>>,
+    pub pending_identity: Mutex<Option<PendingIdentity>>,
+    /// The open handle to the logged-in identity's `session.lock` file (see
+    /// `resolve_login` in `commands.rs`), held for as long as this process
+    /// runs so no other process can log into the same identity at the same
+    /// time. Never read after being set — its only job is to stay alive
+    /// (dropping it, e.g. on process exit, releases the OS-level lock).
+    pub identity_lock: Mutex<Option<File>>,
 }
