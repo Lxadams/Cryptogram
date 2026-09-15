@@ -87,7 +87,14 @@ struct LoginArgs<'a> {
 }
 
 pub async fn login(pseudonym: &str, passcode: &str) -> Result<LoginOutcome, String> {
-    call("login", &LoginArgs { pseudonym, passcode }).await
+    call(
+        "login",
+        &LoginArgs {
+            pseudonym,
+            passcode,
+        },
+    )
+    .await
 }
 
 pub async fn logout() -> Result<(), String> {
@@ -103,7 +110,10 @@ struct CreateIdentityArgs<'a> {
 pub async fn create_identity(pseudonym: &str, passcode: &str) -> Result<(), String> {
     call(
         "create_identity",
-        &CreateIdentityArgs { pseudonym, passcode },
+        &CreateIdentityArgs {
+            pseudonym,
+            passcode,
+        },
     )
     .await
 }

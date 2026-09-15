@@ -6,7 +6,9 @@
 
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
-use client::{hash_passcode, perform_handshake, verify_passcode, Client, ClientStateDto, TYPE_DATA};
+use client::{
+    hash_passcode, perform_handshake, verify_passcode, Client, ClientStateDto, TYPE_DATA,
+};
 use ed25519_dalek::VerifyingKey;
 use serde::Serialize;
 use std::{
@@ -59,9 +61,7 @@ fn sanitize_pseudonym(raw: &str) -> Result<String, String> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ' ');
     if !valid {
-        return Err(
-            "Username can only contain letters, numbers, spaces, '-' and '_'.".to_string(),
-        );
+        return Err("Username can only contain letters, numbers, spaces, '-' and '_'.".to_string());
     }
     Ok(trimmed.to_string())
 }
@@ -211,7 +211,11 @@ fn resolve_login(root: &Path, pseudonym: &str, passcode: &str) -> Result<LoginRe
     }
     let lock = try_acquire_session_lock(&lock_path)?;
 
-    Ok(LoginResolution::Success { pseudonym, state_path, lock })
+    Ok(LoginResolution::Success {
+        pseudonym,
+        state_path,
+        lock,
+    })
 }
 
 /// The filesystem-facing logic behind `create_identity`: mint a fresh
@@ -275,7 +279,11 @@ pub async fn login(
 ) -> Result<LoginOutcome, String> {
     let root = identities_root(&app)?;
     match resolve_login(&root, &pseudonym, &passcode)? {
-        LoginResolution::Success { pseudonym, state_path, lock } => {
+        LoginResolution::Success {
+            pseudonym,
+            state_path,
+            lock,
+        } => {
             *state.pending_identity.lock().await = Some(PendingIdentity {
                 pseudonym: pseudonym.clone(),
                 state_path: state_path.to_string_lossy().into_owned(),
@@ -294,7 +302,11 @@ pub async fn login(
 /// Identity screen sends them back to Login on success, where they log in
 /// with the username/passcode they just chose (see `resolve_create_identity`).
 #[tauri::command(rename_all = "snake_case")]
-pub async fn create_identity(app: AppHandle, pseudonym: String, passcode: String) -> Result<(), String> {
+pub async fn create_identity(
+    app: AppHandle,
+    pseudonym: String,
+    passcode: String,
+) -> Result<(), String> {
     resolve_create_identity(&identities_root(&app)?, &pseudonym, &passcode)
 }
 
@@ -334,7 +346,11 @@ mod tests {
         let root = scratch_dir("create_then_login");
         resolve_create_identity(&root, "alice", "hunter2").unwrap();
         match resolve_login(&root, "alice", "hunter2").unwrap() {
-            LoginResolution::Success { pseudonym, state_path, .. } => {
+            LoginResolution::Success {
+                pseudonym,
+                state_path,
+                ..
+            } => {
                 assert_eq!(pseudonym, "alice");
                 assert_eq!(state_path, root.join("alice").join("client_state.json"));
             }
@@ -349,11 +365,17 @@ mod tests {
         // Hold the lock as the "other process" would, by keeping the first
         // successful login's `File` alive for the duration of this test.
         let first = resolve_login(&root, "alice", "hunter2").unwrap();
-        let LoginResolution::Success { lock: _first_lock, .. } = first else {
+        let LoginResolution::Success {
+            lock: _first_lock, ..
+        } = first
+        else {
             panic!("expected a successful login");
         };
         let err = resolve_login(&root, "alice", "hunter2").unwrap_err();
-        assert_eq!(err, "This identity is already logged in elsewhere on this machine.");
+        assert_eq!(
+            err,
+            "This identity is already logged in elsewhere on this machine."
+        );
     }
 
     #[test]
@@ -376,11 +398,17 @@ mod tests {
         let root = scratch_dir("delete_while_locked");
         resolve_create_identity(&root, "alice", "hunter2").unwrap();
         let login = resolve_login(&root, "alice", "hunter2").unwrap();
-        let LoginResolution::Success { lock: _held_lock, .. } = login else {
+        let LoginResolution::Success {
+            lock: _held_lock, ..
+        } = login
+        else {
             panic!("expected a successful login");
         };
         let err = resolve_delete_identity(&root, "alice").unwrap_err();
-        assert_eq!(err, "This identity is already logged in elsewhere on this machine.");
+        assert_eq!(
+            err,
+            "This identity is already logged in elsewhere on this machine."
+        );
     }
 
     #[test]
@@ -495,8 +523,8 @@ pub async fn bootstrap(
     // Resume a previous identity if one was saved, otherwise mint a new one
     // — identical fallback logic to the CLI, just from a per-pseudonym path
     // instead of the single global default.
-    let mut client = ClientStateDto::load(&pending.state_path)
-        .unwrap_or_else(|_| Client::new(server_addr));
+    let mut client =
+        ClientStateDto::load(&pending.state_path).unwrap_or_else(|_| Client::new(server_addr));
     // `Client::new` defaults `state_path` to the global `state_file_path()`
     // (right for the CLI, which has no pending identity); rebind it here so
     // a freshly-created identity still saves to its own pseudonym's file,
@@ -570,7 +598,10 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
 /// window keeps the mapping (and the relay's record) alive for as long as
 /// the app runs. Purely client-side — the relay already handles a resent
 /// sync packet identically to the first one.
-fn spawn_keepalive_loop(app: AppHandle, socket: Arc<UdpSocket>) -> tauri::async_runtime::JoinHandle<()> {
+fn spawn_keepalive_loop(
+    app: AppHandle,
+    socket: Arc<UdpSocket>,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -596,7 +627,10 @@ fn spawn_keepalive_loop(app: AppHandle, socket: Arc<UdpSocket>) -> tauri::async_
 /// protocol state, this one fans out to N contacts and advances no ratchet
 /// state either (pings are signed, not E2E-encrypted), so the two loops
 /// have nothing meaningful to share beyond both being timers.
-fn spawn_presence_loop(app: AppHandle, socket: Arc<UdpSocket>) -> tauri::async_runtime::JoinHandle<()> {
+fn spawn_presence_loop(
+    app: AppHandle,
+    socket: Arc<UdpSocket>,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         let mut ticker = tokio::time::interval(PRESENCE_PING_INTERVAL);
@@ -626,7 +660,10 @@ fn spawn_presence_loop(app: AppHandle, socket: Arc<UdpSocket>) -> tauri::async_r
 /// client state machine — exactly what the CLI's spawned task does, just
 /// living here instead. Decrypted messages land in `Client::inbox`, which
 /// the frontend collects by polling `poll_inbox`.
-fn spawn_receive_loop(app: AppHandle, socket: Arc<UdpSocket>) -> tauri::async_runtime::JoinHandle<()> {
+fn spawn_receive_loop(
+    app: AppHandle,
+    socket: Arc<UdpSocket>,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         let mut buf = [0u8; 4096];
