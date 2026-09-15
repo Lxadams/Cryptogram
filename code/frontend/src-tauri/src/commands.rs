@@ -91,9 +91,12 @@ fn identity_paths(root: &Path, pseudonym: &str) -> (PathBuf, PathBuf, PathBuf) {
 /// dangling the way a "lock file that just means 'someone wrote this'"
 /// would be.
 fn try_acquire_session_lock(lock_path: &Path) -> Result<File, String> {
+    // `truncate(true)`: this file's content is never read, it's purely a
+    // lock target — nothing meaningful to preserve across opens.
     let file = fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(true)
         .open(lock_path)
         .map_err(|e| e.to_string())?;
     match file.try_lock() {

@@ -6,13 +6,13 @@
 //!
 //! Screens:
 //! 1. Login    — choose a username + passcode, resolving which saved
-//!               identity (if any) to use. See `LoginScreen`'s doc comment.
+//!    identity (if any) to use. See `LoginScreen`'s doc comment.
 //! 2. Connect  — enter the relay's Ed25519 pubkey, perform the link handshake.
 //! 3. Main     — show our own identity, manage contacts, chat with one peer.
 //!
 //! State lives in a handful of top-level signals passed down as props,
 //! rather than a router or global store — deliberately simple for a
-//! prototype with only two screens.
+//! prototype with three screens.
 
 use crate::api;
 use leptos::prelude::*;
