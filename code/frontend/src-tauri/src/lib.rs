@@ -10,6 +10,11 @@ pub fn run() {
         // frontend calls the `bootstrap` command with the relay's pubkey.
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            commands::login,
+            commands::logout,
+            commands::create_identity,
+            commands::delete_identity,
+            commands::list_pseudonyms,
             commands::bootstrap,
             commands::get_identity,
             commands::list_contacts,

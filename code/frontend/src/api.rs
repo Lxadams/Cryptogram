@@ -51,6 +51,22 @@ pub struct IdentityDto {
 }
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct LoginDto {
+    pub pseudonym: String,
+}
+
+/// Mirrors `LoginOutcome` in `src-tauri/src/commands.rs`. `UnknownUsername`
+/// is a normal `Ok` outcome, not an error, so the Login screen can offer
+/// "create a new identity?" instead of just showing an error string — see
+/// that type's doc comment for why.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LoginOutcome {
+    Success { pseudonym: String },
+    UnknownUsername,
+}
+
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct ContactDto {
     pub token: String,
     pub status: String,
@@ -62,6 +78,57 @@ pub struct ContactDto {
 pub struct IncomingMessageDto {
     pub from_token: String,
     pub text: String,
+}
+
+#[derive(Serialize)]
+struct LoginArgs<'a> {
+    pseudonym: &'a str,
+    passcode: &'a str,
+}
+
+pub async fn login(pseudonym: &str, passcode: &str) -> Result<LoginOutcome, String> {
+    call(
+        "login",
+        &LoginArgs {
+            pseudonym,
+            passcode,
+        },
+    )
+    .await
+}
+
+pub async fn logout() -> Result<(), String> {
+    call("logout", &()).await
+}
+
+#[derive(Serialize)]
+struct CreateIdentityArgs<'a> {
+    pseudonym: &'a str,
+    passcode: &'a str,
+}
+
+pub async fn create_identity(pseudonym: &str, passcode: &str) -> Result<(), String> {
+    call(
+        "create_identity",
+        &CreateIdentityArgs {
+            pseudonym,
+            passcode,
+        },
+    )
+    .await
+}
+
+pub async fn list_pseudonyms() -> Result<Vec<String>, String> {
+    call("list_pseudonyms", &()).await
+}
+
+#[derive(Serialize)]
+struct DeleteIdentityArgs<'a> {
+    pseudonym: &'a str,
+}
+
+pub async fn delete_identity(pseudonym: &str) -> Result<(), String> {
+    call("delete_identity", &DeleteIdentityArgs { pseudonym }).await
 }
 
 #[derive(Serialize)]

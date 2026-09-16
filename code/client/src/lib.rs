@@ -6,7 +6,7 @@ use hmac::{Hmac, Mac};
 use pqcrypto_kyber::kyber768::*;
 use pqcrypto_traits::kem::{PublicKey as _, SharedSecret as _};
 use rand_core::{OsRng, RngCore};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, net::SocketAddr};
 use subtle::ConstantTimeEq;
@@ -42,6 +42,42 @@ const MAX_TIMESTAMP_DRIFT: u64 = 300;
 /// cwd tricks.
 pub fn state_file_path() -> String {
     std::env::var("E2E_STATE_FILE").unwrap_or_else(|_| "client_state.json".to_string())
+}
+
+/// Hash a login passcode for storage as `identities/<pseudonym>/passcode.hash`.
+/// This is a UI-layer login gate only — it decides which pseudonym's
+/// (still-plaintext) `client_state.json` gets loaded, it does not encrypt
+/// anything at rest. Deliberately kept behind this one function so it can
+/// later be swapped for a real KDF (e.g. Argon2id) that also derives an
+/// actual encryption key, once chat history moves to a SQLCipher-backed
+/// store and a real vault key is needed — see the roadmap note on this.
+/// Format: `"<salt_hex>:<hash_hex>"`.
+pub fn hash_passcode(passcode: &str) -> String {
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let digest = passcode_digest(&salt, passcode);
+    format!("{}:{}", hex::encode(salt), hex::encode(digest))
+}
+
+/// Check `passcode` against a value previously produced by `hash_passcode`.
+/// Constant-time comparison so a passcode attempt can't be timed byte-by-byte
+/// against the stored hash.
+pub fn verify_passcode(passcode: &str, stored: &str) -> bool {
+    let Some((salt_hex, hash_hex)) = stored.split_once(':') else {
+        return false;
+    };
+    let (Ok(salt), Ok(expected)) = (hex::decode(salt_hex), hex::decode(hash_hex)) else {
+        return false;
+    };
+    let actual = passcode_digest(&salt, passcode);
+    bool::from(actual.as_slice().ct_eq(expected.as_slice()))
+}
+
+fn passcode_digest(salt: &[u8], passcode: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(passcode.as_bytes());
+    hasher.finalize().into()
 }
 
 // Request Types for Server
@@ -200,9 +236,19 @@ pub struct Client {
     pub pending_contacts: HashMap<RoutingToken, VerifyingKey>,
     pub peer_kyber_keys: HashMap<RoutingToken, PublicKey>,
     pub seen_session_keys: HashSet<[u8; 32]>,
-    /// This peer's own self-chosen display name (e.g. `./runpeer.sh alice`
-    /// sets it via `E2E_PEER_NAME`), sent with every outgoing KeyExchange so
-    /// peers can label us by name instead of hex. Empty if unset.
+    /// Where `save()` persists this exact instance — set at load/creation
+    /// time (see `ClientStateDto::load` and the frontend's `login` command,
+    /// which resolves this per-pseudonym under `identities/<pseudonym>/`).
+    /// Not part of `ClientStateDto`/the JSON on disk: a file's own path
+    /// isn't data that belongs inside itself, and it must be free to differ
+    /// between processes loading the same identity from different
+    /// locations. Defaults to the global `state_file_path()` so the CLI,
+    /// which has no per-pseudonym concept, keeps behaving exactly as before.
+    pub state_path: String,
+    /// This peer's own self-chosen display name, given at login (the
+    /// frontend's login screen sets this from the pseudonym typed there).
+    /// Sent with every outgoing KeyExchange so peers can label us by name
+    /// instead of hex. Empty if unset.
     pub local_name: String,
     /// Display names peers have told us about themselves, learned from the
     /// (signed) `name` field of their `KeyExchangePayload` — populated for
@@ -238,6 +284,7 @@ impl Client {
             pending_contacts: HashMap::new(),
             peer_kyber_keys: HashMap::new(),
             seen_session_keys: HashSet::new(),
+            state_path: state_file_path(),
             local_name: String::new(),
             contact_names: HashMap::new(),
             inbox: Vec::new(),
@@ -273,7 +320,7 @@ impl Client {
     }
 
     pub fn save(&self) {
-        if let Err(e) = ClientStateDto::save(self, &state_file_path()) {
+        if let Err(e) = ClientStateDto::save(self, &self.state_path) {
             tracing::error!("Failed to save state: {}", e);
         }
     }
@@ -845,6 +892,31 @@ mod tests {
         let link_cipher = XChaCha20Poly1305::new(Key::from_slice(link_key));
         let decrypted = link_cipher.decrypt(link_nonce, &packet[29..]).unwrap();
         decrypted[16..].to_vec() // strip routing token
+    }
+
+    #[test]
+    fn test_passcode_hash_roundtrip_and_rejection() {
+        let stored = hash_passcode("correct horse battery staple");
+        assert!(verify_passcode("correct horse battery staple", &stored));
+        assert!(!verify_passcode("wrong passcode", &stored));
+        assert!(!verify_passcode("", &stored));
+    }
+
+    #[test]
+    fn test_passcode_hash_is_salted() {
+        // Two hashes of the same passcode must differ (random salt) but
+        // both must still verify against that same passcode.
+        let a = hash_passcode("shared-secret");
+        let b = hash_passcode("shared-secret");
+        assert_ne!(a, b);
+        assert!(verify_passcode("shared-secret", &a));
+        assert!(verify_passcode("shared-secret", &b));
+    }
+
+    #[test]
+    fn test_passcode_verify_rejects_malformed_stored_value() {
+        assert!(!verify_passcode("anything", "not-the-expected-format"));
+        assert!(!verify_passcode("anything", ""));
     }
 
     // ==========================================

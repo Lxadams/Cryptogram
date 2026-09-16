@@ -1,3 +1,9 @@
 /.peers/
 /client_state.json
 /server_identity.json
+# The desktop app's login screen used to store per-pseudonym identities
+# under here (relative to cwd); it now uses the OS per-app data directory
+# instead (see identities_root() in code/frontend/src-tauri/src/commands.rs)
+# — kept ignored in case a stray copy from that earlier behavior reappears.
+/code/frontend/identities/
+/code/frontend/src-tauri/identities/
