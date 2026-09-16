@@ -16,15 +16,18 @@
 
 use crate::api;
 use leptos::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// One message in a conversation, for local display only. Not persisted —
-/// reloading the app loses history, same as the CLI (which only prints to
-/// a terminal that scrolls away). `Client`'s own state (sessions, ratchet
-/// keys) *is* persisted to client_state.json; only this UI-side transcript
-/// is ephemeral.
+/// One message in a conversation, for local display. The transcript held
+/// in this UI's `messages` signal is itself rebuilt each session (from a
+/// mix of persisted history and live traffic — see `MainScreen`), but the
+/// messages it displays are durable: every message sent or received is
+/// recorded to this identity's local SQLCipher-encrypted chat-history
+/// database as it's encrypted/decrypted (see `Client::history` in the
+/// `client` crate), independent of this peer's `client_state.json` session
+/// state and never shared with or dependent on the other peer's own copy.
 #[derive(Clone, Debug, PartialEq)]
 struct ChatMessage {
     /// Unique per message so the `<For>` transcript list can key on
@@ -40,6 +43,15 @@ struct ChatMessage {
 fn next_message_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Persisted chat-history rows get their own id namespace (top bit set) so
+/// they can never collide with `next_message_id()`'s locally-generated ids
+/// — both end up in the same `<For>` transcript list, which needs every id
+/// to be unique. `next_message_id` would need over 2^63 calls in one
+/// session to ever reach this range.
+fn history_message_id(row_id: i64) -> u64 {
+    (row_id as u64) | (1u64 << 63)
 }
 
 /// Light/dark preference. Applied to `<html data-theme="...">` (see
@@ -459,7 +471,7 @@ fn LoginScreen(
                                     view! {
                                         <button
                                             type="button"
-                                            class="icon-btn"
+                                            class="icon-btn danger"
                                             title="Delete this identity"
                                             on:click=move |_| delete_confirm.set(Some(trash_name.clone()))
                                         >
@@ -656,8 +668,56 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     let contacts = RwSignal::new(Vec::<api::ContactDto>::new());
     let selected = RwSignal::new(None::<String>);
     // token_hex -> transcript. Populated by both outgoing sends (added
-    // immediately, optimistically) and incoming polls (added on arrival).
+    // immediately, optimistically), incoming polls (added on arrival), and
+    // a one-time hydration from this peer's own persisted chat history the
+    // first time each contact is selected (see the Effect below) — that
+    // history is a full independent copy, so it's what makes a contact's
+    // past messages still show up here even if the peer lost their own
+    // state, deleted the conversation, or reconnected from scratch.
     let messages = RwSignal::new(HashMap::<String, Vec<ChatMessage>>::new());
+    let history_loaded_for = RwSignal::new(HashSet::<String>::new());
+
+    Effect::new(move |_| {
+        let Some(token) = selected.get() else {
+            return;
+        };
+        if history_loaded_for.get_untracked().contains(&token) {
+            return;
+        }
+        leptos::task::spawn_local(async move {
+            if let Ok(history) = api::chat_history(&token, 200).await {
+                // Merge, never replace: this fetch is async, and the 1s
+                // poll below keeps running concurrently — if a live
+                // message (e.g. one of Bob's) arrives via poll_inbox and
+                // gets pushed into `messages` while this fetch is still in
+                // flight, it must not be clobbered by this fetch's
+                // now-stale (pre-arrival) snapshot resolving afterward.
+                // History ids and live-generated ids are in disjoint
+                // numeric ranges (see `history_message_id`), so backfilled
+                // history is simply prepended ahead of whatever's already
+                // live in the list.
+                messages.update(|map| {
+                    let existing = map.entry(token.clone()).or_default();
+                    let existing_ids: std::collections::HashSet<u64> =
+                        existing.iter().map(|m| m.id).collect();
+                    let mut combined: Vec<ChatMessage> = history
+                        .into_iter()
+                        .map(|m| ChatMessage {
+                            id: history_message_id(m.id),
+                            from_me: m.from_me,
+                            text: m.text,
+                        })
+                        .filter(|m| !existing_ids.contains(&m.id))
+                        .collect();
+                    combined.append(existing);
+                    *existing = combined;
+                });
+                history_loaded_for.update(|set| {
+                    set.insert(token);
+                });
+            }
+        });
+    });
 
     // Poll the backend every second for contact-status changes and newly
     // decrypted messages. This is deliberately simple polling rather than
@@ -673,7 +733,19 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                 messages.update(|map| {
                     for msg in incoming {
                         map.entry(msg.from_token).or_default().push(ChatMessage {
-                            id: next_message_id(),
+                            // Use the backend's own chat-history row id when
+                            // there is one, so this live-delivered message
+                            // is identified the same way a later
+                            // `chat_history` fetch would identify it — see
+                            // `history_message_id`'s doc comment. Only
+                            // falls back to a local id if no history is
+                            // attached at all (shouldn't happen once logged
+                            // in, but this front end has no other way to
+                            // key the message if it does).
+                            id: msg
+                                .id
+                                .map(history_message_id)
+                                .unwrap_or_else(next_message_id),
                             from_me: false,
                             text: msg.text,
                         });
@@ -745,6 +817,12 @@ fn ContactPanel(
     let key_input = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
 
+    // Which contact (by token) is showing its "Remove?" confirm row instead
+    // of the usual remove icon — same inline-confirm pattern as the Login
+    // screen's identity delete. `None` means no confirm is open.
+    let remove_confirm = RwSignal::new(None::<String>);
+    let remove_busy = RwSignal::new(false);
+
     let on_add = move |_| {
         let token = token_input.get();
         let key = key_input.get();
@@ -760,6 +838,28 @@ fn ContactPanel(
                 token_input.set(String::new());
                 key_input.set(String::new());
             }
+        });
+    };
+
+    // Removing a contact also deletes its local chat history unconditionally
+    // (see `remove_contact`'s doc comment in commands.rs) — reconnecting to
+    // the same person starts a fresh conversation under a new token
+    // regardless, and there's no UI to view a removed contact's old history.
+    let do_remove = move |token: String| {
+        error.set(None);
+        remove_busy.set(true);
+        leptos::task::spawn_local(async move {
+            match api::remove_contact(&token).await {
+                Ok(()) => {
+                    contacts.update(|list| list.retain(|c| c.token != token));
+                    if selected.get_untracked().as_deref() == Some(token.as_str()) {
+                        selected.set(None);
+                    }
+                    remove_confirm.set(None);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            remove_busy.set(false);
         });
     };
 
@@ -794,6 +894,8 @@ fn ContactPanel(
                                 .filter(|c| c.status == "established")
                                 .map(|c| c.online)
                         };
+                        let token_for_remove = token.clone();
+                        let token_for_confirm = token.clone();
                         view! {
                             <li
                                 class:selected=move || selected.get().as_deref() == Some(token.as_str())
@@ -818,6 +920,50 @@ fn ContactPanel(
                                 <span class=format!("status status-{}", contact.status)>
                                     {contact.status.clone()}
                                 </span>
+                                {move || {
+                                    if remove_confirm.get().as_deref() == Some(token_for_confirm.as_str()) {
+                                        let remove_yes = token_for_confirm.clone();
+                                        view! {
+                                            <span class="identity-confirm" on:click=|ev| ev.stop_propagation()>
+                                                "Remove?"
+                                                <button
+                                                    type="button"
+                                                    class="danger"
+                                                    disabled=move || remove_busy.get()
+                                                    on:click=move |_| do_remove(remove_yes.clone())
+                                                >
+                                                    "Yes"
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    class="secondary"
+                                                    on:click=move |_| remove_confirm.set(None)
+                                                >
+                                                    "No"
+                                                </button>
+                                            </span>
+                                        }.into_any()
+                                    } else {
+                                        let remove_click = token_for_remove.clone();
+                                        view! {
+                                            <button
+                                                type="button"
+                                                class="icon-btn danger"
+                                                title="Remove this contact"
+                                                on:click=move |ev| {
+                                                    ev.stop_propagation();
+                                                    remove_confirm.set(Some(remove_click.clone()));
+                                                }
+                                            >
+                                                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+                                                    <path d="M3 4.5h10" />
+                                                    <path d="M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5" />
+                                                    <path d="M4.5 4.5l.6 8a1 1 0 0 0 1 .9h3.8a1 1 0 0 0 1-.9l.6-8" />
+                                                </svg>
+                                            </button>
+                                        }.into_any()
+                                    }
+                                }}
                             </li>
                         }
                     }
@@ -876,10 +1022,17 @@ fn ChatPanel(
         let text_for_history = text.clone();
         leptos::task::spawn_local(async move {
             match api::send_message(&token_for_task, &text).await {
-                Ok(()) => {
+                Ok(history_id) => {
                     messages.update(|map| {
                         map.entry(token_for_task).or_default().push(ChatMessage {
-                            id: next_message_id(),
+                            // Same reasoning as the incoming side in
+                            // `MainScreen::refresh` — use the backend's own
+                            // chat-history row id so this optimistic
+                            // display agrees with a later `chat_history`
+                            // fetch on what identifies this message.
+                            id: history_id
+                                .map(history_message_id)
+                                .unwrap_or_else(next_message_id),
                             from_me: true,
                             text: text_for_history,
                         });

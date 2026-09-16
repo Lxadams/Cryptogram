@@ -7,7 +7,8 @@
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
 use client::{
-    hash_passcode, perform_handshake, verify_passcode, Client, ClientStateDto, TYPE_DATA,
+    derive_vault_key, hash_passcode, perform_handshake, ChatHistory, Client, ClientStateDto,
+    TYPE_DATA,
 };
 use ed25519_dalek::VerifyingKey;
 use serde::Serialize;
@@ -19,6 +20,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager, State};
 use tokio::net::UdpSocket;
+use zeroize::Zeroize;
 
 /// Root directory identities are stored under: the OS-standard per-app data
 /// directory (e.g. `~/.local/share/<bundle-id>/identities` on Linux —
@@ -155,14 +157,34 @@ pub enum LoginOutcome {
 /// `client_state.json` path and the held session lock for `login` to stash
 /// in `AppState` — kept out of `LoginOutcome` itself since neither is ever
 /// meaningful to the frontend.
-#[derive(Debug)]
 enum LoginResolution {
     Success {
         pseudonym: String,
         state_path: PathBuf,
         lock: File,
+        vault_key: zeroize::Zeroizing<[u8; 32]>,
     },
     UnknownUsername,
+}
+
+// Manual `Debug` (rather than `#[derive(Debug)]`) so a test's `unwrap_err()`
+// can never accidentally print the raw vault key.
+impl std::fmt::Debug for LoginResolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoginResolution::Success {
+                pseudonym,
+                state_path,
+                ..
+            } => f
+                .debug_struct("Success")
+                .field("pseudonym", pseudonym)
+                .field("state_path", state_path)
+                .field("vault_key", &"[redacted]")
+                .finish(),
+            LoginResolution::UnknownUsername => write!(f, "UnknownUsername"),
+        }
+    }
 }
 
 /// Every pseudonym with a saved identity on this machine (i.e. every
@@ -209,15 +231,16 @@ fn resolve_login(root: &Path, pseudonym: &str, passcode: &str) -> Result<LoginRe
         return Ok(LoginResolution::UnknownUsername);
     }
     let stored = fs::read_to_string(&passcode_path).map_err(|e| e.to_string())?;
-    if !verify_passcode(passcode, &stored) {
+    let Some(vault_key) = derive_vault_key(passcode, &stored) else {
         return Err("Incorrect passcode.".to_string());
-    }
+    };
     let lock = try_acquire_session_lock(&lock_path)?;
 
     Ok(LoginResolution::Success {
         pseudonym,
         state_path,
         lock,
+        vault_key,
     })
 }
 
@@ -265,31 +288,39 @@ fn resolve_delete_identity(root: &Path, pseudonym: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Verify an existing pseudonym's passcode and stash which identity file
-/// `bootstrap` should load next in `AppState::pending_identity`. This is a
-/// UI-layer gate only (see `hash_passcode`'s doc comment) — it performs no
-/// network activity itself. Returns `LoginOutcome::UnknownUsername` (not an
-/// error) if the pseudonym has no saved identity yet — see `create_identity`
-/// for that. Also errors (a plain, generic-looking `Err`, same as a wrong
-/// passcode) if this identity is already logged in on another process — see
+/// Verify an existing pseudonym's passcode, derive its vault key (see
+/// `derive_vault_key` in the `client` crate), and stash both — along with
+/// which identity file `bootstrap` should load next — in
+/// `AppState::pending_identity`. Performs no network activity itself.
+/// Returns `LoginOutcome::UnknownUsername` (not an error) if the pseudonym
+/// has no saved identity yet — see `create_identity` for that. Also errors
+/// (a plain, generic-looking `Err`, same as a wrong passcode) if this
+/// identity is already logged in on another process — see
 /// `try_acquire_session_lock`.
+///
+/// The passcode itself is zeroized before this function returns — only its
+/// derived vault key is ever kept in memory beyond this call.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn login(
     app: AppHandle,
     state: State<'_, AppState>,
     pseudonym: String,
-    passcode: String,
+    mut passcode: String,
 ) -> Result<LoginOutcome, String> {
     let root = identities_root(&app)?;
-    match resolve_login(&root, &pseudonym, &passcode)? {
+    let result = resolve_login(&root, &pseudonym, &passcode);
+    passcode.zeroize();
+    match result? {
         LoginResolution::Success {
             pseudonym,
             state_path,
             lock,
+            vault_key,
         } => {
             *state.pending_identity.lock().await = Some(PendingIdentity {
                 pseudonym: pseudonym.clone(),
                 state_path: state_path.to_string_lossy().into_owned(),
+                vault_key,
             });
             // Held for the rest of this process's life — see
             // `AppState::identity_lock`'s doc comment.
@@ -308,9 +339,11 @@ pub async fn login(
 pub async fn create_identity(
     app: AppHandle,
     pseudonym: String,
-    passcode: String,
+    mut passcode: String,
 ) -> Result<(), String> {
-    resolve_create_identity(&identities_root(&app)?, &pseudonym, &passcode)
+    let result = resolve_create_identity(&identities_root(&app)?, &pseudonym, &passcode);
+    passcode.zeroize();
+    result
 }
 
 /// Permanently delete a saved identity. Does not require its passcode — see
@@ -440,6 +473,26 @@ mod tests {
     }
 
     #[test]
+    fn test_login_derives_a_vault_key_that_opens_chat_history() {
+        let root = scratch_dir("vault_key_opens_history");
+        resolve_create_identity(&root, "carol", "correct-passcode").unwrap();
+        let LoginResolution::Success { vault_key, .. } =
+            resolve_login(&root, "carol", "correct-passcode").unwrap()
+        else {
+            panic!("expected a successful login");
+        };
+        let db_path = root.join("carol").join("chat_history.sqlite");
+        let history = client::ChatHistory::open(&db_path, &vault_key).unwrap();
+        history.append([1u8; 16], true, "hi").unwrap();
+        assert_eq!(history.recent([1u8; 16], 10).unwrap().len(), 1);
+
+        // A second login attempt with the wrong passcode must not derive a
+        // key that can open the same database.
+        let err = resolve_login(&root, "carol", "wrong-passcode").unwrap_err();
+        assert_eq!(err, "Incorrect passcode.");
+    }
+
+    #[test]
     fn test_rejects_bad_input() {
         let root = scratch_dir("bad_input");
         assert!(resolve_create_identity(&root, "", "pw").is_err());
@@ -479,6 +532,20 @@ pub struct ContactDto {
 pub struct IncomingMessageDto {
     pub from_token: String,
     pub text: String,
+    /// Local chat-history row id (`None` if no history is attached) — see
+    /// `send_message`'s doc comment for why the frontend needs this instead
+    /// of minting its own id for a live-delivered message.
+    pub id: Option<i64>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct StoredMessageDto {
+    /// Local chat-history row id — stable per contact, safe to use as both
+    /// a list key and a "load older than this" pagination cursor.
+    pub id: i64,
+    pub from_me: bool,
+    pub text: String,
+    pub timestamp_ms: i64,
 }
 
 fn identity_dto(client: &Client) -> IdentityDto {
@@ -536,6 +603,16 @@ pub async fn bootstrap(
     // keeps this correct even if that ever changes.
     client.state_path = pending.state_path;
     client.local_name = pending.pseudonym;
+
+    // Chat history lives right next to client_state.json under the same
+    // identity directory, keyed by the vault key `login` already derived
+    // from the passcode — see `PendingIdentity::vault_key`'s doc comment.
+    let history_path = Path::new(&client.state_path)
+        .parent()
+        .expect("client.state_path always has a parent (an identity directory)")
+        .join("chat_history.sqlite");
+    client.history =
+        Some(ChatHistory::open(&history_path, &pending.vault_key).map_err(|e| e.to_string())?);
 
     let socket = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
@@ -792,15 +869,41 @@ pub async fn connect_to_peer(
     Ok(())
 }
 
+/// Permanently remove a contact, and its locally-persisted chat history
+/// with it — the local cleanup path for a stale entry (most commonly: a
+/// peer deleted and recreated their identity, so this contact now shares a
+/// name with a different, unrelated one — see `Client::forget_contact`'s
+/// doc comment for why this can only ever be a manual, local decision,
+/// never something the network can trigger).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Result<(), String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+
+    let token_bytes = hex::decode(token_hex.trim()).map_err(|_| "Bad token hex".to_string())?;
+    let token: [u8; 16] = token_bytes
+        .try_into()
+        .map_err(|_| "Routing token must be 16 bytes".to_string())?;
+
+    rt.client.forget_contact(token);
+    Ok(())
+}
+
 /// Encrypt and send an E2E message to an already-established session. Also
 /// sends a PQ ratchet-injection packet alongside, transparently, whenever
 /// `create_encrypted_packet` produces one (every 5th message).
+///
+/// Returns the message's local chat-history row id (`None` if no history is
+/// attached), so the frontend can label its own optimistic display of this
+/// message with the *same* id a later `chat_history` fetch would report for
+/// it — otherwise the two views disagree on what identifies "this message"
+/// and a merge between them can't tell they're the same one.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn send_message(
     state: State<'_, AppState>,
     token_hex: String,
     text: String,
-) -> Result<(), String> {
+) -> Result<Option<i64>, String> {
     let mut guard = state.runtime.lock().await;
     let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
 
@@ -813,6 +916,7 @@ pub async fn send_message(
         .client
         .create_encrypted_packet(token, text.as_bytes())
         .map_err(|e| e.to_string())?;
+    let history_id = rt.client.last_recorded_id;
 
     rt.socket
         .send_to(&msg_packet, rt.client.server_addr)
@@ -826,12 +930,15 @@ pub async fn send_message(
             .map_err(|e| e.to_string())?;
     }
 
-    Ok(())
+    Ok(history_id)
 }
 
 /// Collect any messages decrypted since the last poll. The frontend calls
 /// this on a timer (see `code/frontend/src/api.rs`) — there's no push
-/// channel wired up in this prototype, just polling.
+/// channel wired up in this prototype, just polling. Each message's `id` is
+/// its local chat-history row id (`None` if no history is attached) — see
+/// `send_message`'s doc comment for why this must line up with
+/// `chat_history`'s ids for the same message.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn poll_inbox(state: State<'_, AppState>) -> Result<Vec<IncomingMessageDto>, String> {
     let mut guard = state.runtime.lock().await;
@@ -841,9 +948,43 @@ pub async fn poll_inbox(state: State<'_, AppState>) -> Result<Vec<IncomingMessag
         .client
         .drain_inbox()
         .into_iter()
-        .map(|(token, bytes)| IncomingMessageDto {
+        .map(|(token, bytes, id)| IncomingMessageDto {
             from_token: hex::encode(token),
             text: String::from_utf8_lossy(&bytes).into_owned(),
+            id,
+        })
+        .collect())
+}
+
+/// The most recent `limit` locally-persisted messages with a contact,
+/// oldest first — ready to render top-to-bottom in a fresh transcript.
+/// This is the peer's own independent copy (see `ChatHistory`'s doc
+/// comment): it's unaffected by the other side losing their state,
+/// deleting the conversation, or reconnecting, since nothing about it is
+/// shared or synced between peers.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn chat_history(
+    state: State<'_, AppState>,
+    token_hex: String,
+    limit: i64,
+) -> Result<Vec<StoredMessageDto>, String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+
+    let token_bytes = hex::decode(token_hex.trim()).map_err(|_| "Bad token hex".to_string())?;
+    let token: [u8; 16] = token_bytes
+        .try_into()
+        .map_err(|_| "Routing token must be 16 bytes".to_string())?;
+
+    Ok(rt
+        .client
+        .history_for_contact(token, limit)
+        .into_iter()
+        .map(|m| StoredMessageDto {
+            id: m.id,
+            from_me: m.from_me,
+            text: m.text,
+            timestamp_ms: m.timestamp_ms,
         })
         .collect())
 }

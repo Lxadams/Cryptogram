@@ -19,8 +19,10 @@ pub fn run() {
             commands::get_identity,
             commands::list_contacts,
             commands::connect_to_peer,
+            commands::remove_contact,
             commands::send_message,
             commands::poll_inbox,
+            commands::chat_history,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {

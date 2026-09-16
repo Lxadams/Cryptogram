@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use ed25519_dalek::{SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
@@ -6,16 +7,19 @@ use hmac::{Hmac, Mac};
 use pqcrypto_kyber::kyber768::*;
 use pqcrypto_traits::kem::{PublicKey as _, SharedSecret as _};
 use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, net::SocketAddr};
 use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 pub mod packets;
 use packets::*;
+mod history;
 mod storage;
+pub use history::{ChatHistory, StoredMessage};
 use std::collections::HashSet;
 pub use storage::ClientStateDto;
 
@@ -44,40 +48,136 @@ pub fn state_file_path() -> String {
     std::env::var("E2E_STATE_FILE").unwrap_or_else(|_| "client_state.json".to_string())
 }
 
+// Argon2id parameters for every login secret derived below (OWASP's
+// baseline recommendation for Argon2id: ~19 MiB, 2 passes, single-threaded —
+// generous enough for a login gate, cheap enough not to make every app
+// launch feel slow). Stored alongside the salt in `passcode.hash` so tuning
+// these later doesn't invalidate identities created under the old values.
+const ARGON2_M_COST_KIB: u32 = 19_456;
+const ARGON2_T_COST: u32 = 2;
+const ARGON2_P_COST: u32 = 1;
+const ARGON2_SALT_LEN: usize = 16;
+const ARGON2_OUTPUT_LEN: usize = 32;
+
+// HKDF labels used to fan a single Argon2id output out into two
+// cryptographically independent secrets — see `derive_vault_key`'s doc
+// comment for why this matters.
+const VERIFIER_LABEL: &[u8] = b"e2e-messenger/login-verifier/v1";
+const VAULT_KEY_LABEL: &[u8] = b"e2e-messenger/vault-key/v1";
+
+/// Run Argon2id(passcode, salt) with the given (m_cost, t_cost, p_cost).
+/// This raw output is never itself stored or compared directly — every
+/// caller immediately fans it out through `hkdf_label` instead, so it never
+/// leaves this function.
+fn argon2_master_secret(
+    passcode: &str,
+    salt: &[u8],
+    params: (u32, u32, u32),
+) -> Option<Zeroizing<[u8; ARGON2_OUTPUT_LEN]>> {
+    let (m_cost, t_cost, p_cost) = params;
+    let argon2 = Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        Params::new(m_cost, t_cost, p_cost, Some(ARGON2_OUTPUT_LEN)).ok()?,
+    );
+    let mut out = Zeroizing::new([0u8; ARGON2_OUTPUT_LEN]);
+    argon2
+        .hash_password_into(passcode.as_bytes(), salt, out.as_mut())
+        .ok()?;
+    Some(out)
+}
+
+/// HKDF-SHA256-expand `master_secret` under `label` into a fresh 32-byte
+/// secret. `master_secret` is already high-entropy (an Argon2id output), so
+/// this only needs the Expand half of HKDF, not Extract.
+fn hkdf_label(master_secret: &[u8], label: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, master_secret);
+    let mut out = [0u8; 32];
+    hk.expand(label, &mut out)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    out
+}
+
+struct ParsedPasscodeHash {
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+    salt: Vec<u8>,
+    verifier: Vec<u8>,
+}
+
+fn parse_passcode_hash(stored: &str) -> Option<ParsedPasscodeHash> {
+    let mut parts = stored.split('$');
+    if parts.next()? != "argon2id" {
+        return None;
+    }
+    let m_cost: u32 = parts.next()?.parse().ok()?;
+    let t_cost: u32 = parts.next()?.parse().ok()?;
+    let p_cost: u32 = parts.next()?.parse().ok()?;
+    let salt = hex::decode(parts.next()?).ok()?;
+    let verifier = hex::decode(parts.next()?).ok()?;
+    if parts.next().is_some() {
+        return None; // trailing garbage
+    }
+    Some(ParsedPasscodeHash {
+        m_cost,
+        t_cost,
+        p_cost,
+        salt,
+        verifier,
+    })
+}
+
 /// Hash a login passcode for storage as `identities/<pseudonym>/passcode.hash`.
-/// This is a UI-layer login gate only — it decides which pseudonym's
-/// (still-plaintext) `client_state.json` gets loaded, it does not encrypt
-/// anything at rest. Deliberately kept behind this one function so it can
-/// later be swapped for a real KDF (e.g. Argon2id) that also derives an
-/// actual encryption key, once chat history moves to a SQLCipher-backed
-/// store and a real vault key is needed — see the roadmap note on this.
-/// Format: `"<salt_hex>:<hash_hex>"`.
+/// Real Argon2id KDF — besides gating login, this stored hash's salt/params
+/// are also what `derive_vault_key` recomputes from to unlock the identity's
+/// SQLCipher chat-history database.
+/// Format: `"argon2id$<m_cost>$<t_cost>$<p_cost>$<salt_hex>$<verifier_hex>"`.
 pub fn hash_passcode(passcode: &str) -> String {
-    let mut salt = [0u8; 16];
+    let mut salt = [0u8; ARGON2_SALT_LEN];
     OsRng.fill_bytes(&mut salt);
-    let digest = passcode_digest(&salt, passcode);
-    format!("{}:{}", hex::encode(salt), hex::encode(digest))
+    let ms = argon2_master_secret(
+        passcode,
+        &salt,
+        (ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST),
+    )
+    .expect("Argon2id params above are fixed constants and always valid");
+    let verifier = hkdf_label(ms.as_ref(), VERIFIER_LABEL);
+    format!(
+        "argon2id${ARGON2_M_COST_KIB}${ARGON2_T_COST}${ARGON2_P_COST}${}${}",
+        hex::encode(salt),
+        hex::encode(verifier)
+    )
 }
 
 /// Check `passcode` against a value previously produced by `hash_passcode`.
-/// Constant-time comparison so a passcode attempt can't be timed byte-by-byte
-/// against the stored hash.
 pub fn verify_passcode(passcode: &str, stored: &str) -> bool {
-    let Some((salt_hex, hash_hex)) = stored.split_once(':') else {
-        return false;
-    };
-    let (Ok(salt), Ok(expected)) = (hex::decode(salt_hex), hex::decode(hash_hex)) else {
-        return false;
-    };
-    let actual = passcode_digest(&salt, passcode);
-    bool::from(actual.as_slice().ct_eq(expected.as_slice()))
+    derive_vault_key(passcode, stored).is_some()
 }
 
-fn passcode_digest(salt: &[u8], passcode: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(salt);
-    hasher.update(passcode.as_bytes());
-    hasher.finalize().into()
+/// Recompute the Argon2id master secret `hash_passcode` derived at creation
+/// time and, only if it matches the stored login verifier, return the vault
+/// key used to unlock this identity's SQLCipher chat-history database.
+///
+/// The verifier and the vault key are independent HKDF-SHA256 expansions
+/// (different labels) of one Argon2id output that itself is never stored or
+/// returned — so an attacker who reads `passcode.hash` off disk (filesystem
+/// access without the passcode) learns neither the passcode nor the vault
+/// key, only the verifier, which cannot be used to derive the other label's
+/// output without redoing the (slow, salted) Argon2id computation from the
+/// real passcode.
+pub fn derive_vault_key(passcode: &str, stored: &str) -> Option<Zeroizing<[u8; 32]>> {
+    let parsed = parse_passcode_hash(stored)?;
+    let ms = argon2_master_secret(
+        passcode,
+        &parsed.salt,
+        (parsed.m_cost, parsed.t_cost, parsed.p_cost),
+    )?;
+    let verifier = hkdf_label(ms.as_ref(), VERIFIER_LABEL);
+    if !bool::from(verifier.as_slice().ct_eq(parsed.verifier.as_slice())) {
+        return None;
+    }
+    Some(Zeroizing::new(hkdf_label(ms.as_ref(), VAULT_KEY_LABEL)))
 }
 
 // Request Types for Server
@@ -260,7 +360,7 @@ pub struct Client {
     /// arrive), but a GUI front end has no console to print to — it polls
     /// `drain_inbox()` instead. Intentionally not persisted to disk: this is
     /// a transient handoff buffer, not session state.
-    pub inbox: Vec<(RoutingToken, Vec<u8>)>,
+    pub inbox: Vec<(RoutingToken, Vec<u8>, Option<i64>)>,
     /// Last time we heard *anything* authenticated from this peer — a real
     /// chat message or a presence ping (see `PresencePayload`), both update
     /// this. Front ends use it to show an online/offline marker. Like
@@ -268,6 +368,21 @@ pub struct Client {
     /// start empty ("unknown/offline") on relaunch rather than showing a
     /// stale "online" from a previous run.
     pub last_seen: HashMap<RoutingToken, Instant>,
+    /// This identity's local SQLCipher-backed chat history, if it's been
+    /// unlocked (see `derive_vault_key` and `ChatHistory::open`). `None`
+    /// until a caller attaches one — e.g. the CLI, which has no login/vault
+    /// key flow yet, simply never sets this, and every send/receive that
+    /// would otherwise record to it is a silent no-op.
+    pub history: Option<ChatHistory>,
+    /// The local chat-history row id `record_message` just wrote, if any —
+    /// a one-shot side channel so an outgoing send (a single call per
+    /// invocation, unlike `inbox`'s queue of possibly-several incoming
+    /// messages) can report the exact id a later history fetch would also
+    /// use for that same row, letting the frontend merge live and
+    /// persisted views of a contact's messages without mistaking one
+    /// message for two under two different synthetic ids. Not persisted;
+    /// meaningful only in the instant after `record_message` runs.
+    pub last_recorded_id: Option<i64>,
 }
 
 impl Client {
@@ -289,13 +404,76 @@ impl Client {
             contact_names: HashMap::new(),
             inbox: Vec::new(),
             last_seen: HashMap::new(),
+            history: None,
+            last_recorded_id: None,
         }
     }
 
     /// Take all messages received since the last call. Returns
-    /// `(sender_routing_token, plaintext)` pairs in arrival order.
-    pub fn drain_inbox(&mut self) -> Vec<(RoutingToken, Vec<u8>)> {
+    /// `(sender_routing_token, plaintext, local_history_row_id)` triples in
+    /// arrival order — the row id is `None` if no chat history is attached.
+    pub fn drain_inbox(&mut self) -> Vec<(RoutingToken, Vec<u8>, Option<i64>)> {
         std::mem::take(&mut self.inbox)
+    }
+
+    /// Persist one message to the local chat-history database, if one is
+    /// attached (see the `history` field doc comment), and stash its row id
+    /// in `last_recorded_id`. Failures are logged, not propagated — a full
+    /// disk or a locked file shouldn't block sending/receiving a message
+    /// over the wire, only its local record of it.
+    fn record_message(&mut self, token: RoutingToken, from_me: bool, plaintext: &[u8]) {
+        let Some(history) = &self.history else {
+            self.last_recorded_id = None;
+            return;
+        };
+        match history.append(token, from_me, &String::from_utf8_lossy(plaintext)) {
+            Ok(id) => self.last_recorded_id = Some(id),
+            Err(e) => {
+                tracing::error!("Failed to persist chat message to local history: {}", e);
+                self.last_recorded_id = None;
+            }
+        }
+    }
+
+    /// The most recent `limit` persisted messages with `token`, oldest
+    /// first, or empty if no chat history is attached (see the `history`
+    /// field doc comment).
+    pub fn history_for_contact(&self, token: RoutingToken, limit: i64) -> Vec<StoredMessage> {
+        self.history
+            .as_ref()
+            .and_then(|h| h.recent(token, limit).ok())
+            .unwrap_or_default()
+    }
+
+    /// Permanently remove `token` as a contact — drops any pending/
+    /// established session, its Kyber key, learned display name, and
+    /// presence state, then persists the change. This is the *local*
+    /// cleanup path for a stale contact (e.g. one whose identity was
+    /// deleted and recreated elsewhere, leaving this peer with two entries
+    /// for what is now a different identity under the same name) — it is
+    /// never triggered by anything arriving over the network. A message
+    /// (signed or not) claiming "delete my old self" can't be trusted: the
+    /// old identity's key is gone, so nothing could ever prove it came from
+    /// the same peer rather than an impersonator.
+    ///
+    /// Also deletes this contact's locally-persisted chat history —
+    /// unconditionally, not an opt-in choice: reconnecting to the same
+    /// person (a new KeyExchange under a new token) always starts a fresh
+    /// conversation regardless, and there is no UI path to view a removed
+    /// contact's old history anyway, so keeping it around after removal
+    /// would just be orphaned, inaccessible data.
+    pub fn forget_contact(&mut self, token: RoutingToken) {
+        self.pending_contacts.remove(&token);
+        self.e2e_sessions.remove(&token);
+        self.peer_kyber_keys.remove(&token);
+        self.contact_names.remove(&token);
+        self.last_seen.remove(&token);
+        self.save();
+        if let Some(history) = &self.history
+            && let Err(e) = history.delete_contact(token)
+        {
+            tracing::error!("Failed to delete local chat history for contact: {}", e);
+        }
     }
 
     /// True if `token` has sent us a chat message or presence ping within
@@ -556,6 +734,7 @@ impl Client {
         };
         // mutable borrow on self.e2e_sessions released
         self.save();
+        self.record_message(target_token, true, plaintext);
 
         // Phase 2: link-encrypt everything (immutable borrow on self)
         let msg_packet = self.wrap_link_encryption(target_token, &full_e2e_payload);
@@ -601,7 +780,8 @@ impl Client {
                         );
                         // Also hand it to any polling consumer (e.g. a GUI) —
                         // see the `inbox` field doc comment above.
-                        self.inbox.push((sender_token, pt));
+                        self.record_message(sender_token, false, &pt);
+                        self.inbox.push((sender_token, pt, self.last_recorded_id));
                         self.last_seen.insert(sender_token, Instant::now());
                     } else {
                         println!(
@@ -840,7 +1020,8 @@ impl Client {
                     }
                     if let Some(sender_pub) = self.pending_contacts.get(&presence.routing_token) {
                         if presence.verify(sender_pub).is_ok() {
-                            self.last_seen.insert(presence.routing_token, Instant::now());
+                            self.last_seen
+                                .insert(presence.routing_token, Instant::now());
                         } else {
                             println!(">> [SECURITY ALERT] Presence ping signature invalid!");
                         }
@@ -916,6 +1097,129 @@ mod tests {
     fn test_passcode_verify_rejects_malformed_stored_value() {
         assert!(!verify_passcode("anything", "not-the-expected-format"));
         assert!(!verify_passcode("anything", ""));
+    }
+
+    #[test]
+    fn test_derive_vault_key_matches_only_correct_passcode() {
+        let stored = hash_passcode("correct horse battery staple");
+        let key = derive_vault_key("correct horse battery staple", &stored);
+        assert!(key.is_some());
+        assert!(derive_vault_key("wrong passcode", &stored).is_none());
+        assert!(derive_vault_key("correct horse battery staple", "garbage").is_none());
+    }
+
+    #[test]
+    fn test_derive_vault_key_is_independent_of_stored_verifier() {
+        // The vault key must not be recoverable from the stored verifier
+        // alone (no passcode) — see `derive_vault_key`'s doc comment. This
+        // is a sanity check, not a proof: it just confirms the two labeled
+        // HKDF outputs actually differ for the same underlying secret.
+        let stored = hash_passcode("shared-secret");
+        let verifier_hex = stored.rsplit('$').next().unwrap();
+        let vault_key = derive_vault_key("shared-secret", &stored).unwrap();
+        assert_ne!(hex::encode(vault_key.as_ref()), verifier_hex);
+    }
+
+    #[test]
+    fn test_forget_contact_removes_session_and_history() {
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut client = Client::new(server_addr);
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!(
+            "e2e-messenger-forget-contact-test-{:x}.sqlite",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        client.history = Some(ChatHistory::open(&db_path, &[5u8; 32]).unwrap());
+
+        let contact = [8u8; 16];
+        client
+            .history
+            .as_ref()
+            .unwrap()
+            .append(contact, true, "hi")
+            .unwrap();
+        client
+            .pending_contacts
+            .insert(contact, SigningKey::from_bytes(&[9u8; 32]).verifying_key());
+
+        client.forget_contact(contact);
+        assert!(!client.pending_contacts.contains_key(&contact));
+        assert_eq!(client.history_for_contact(contact, 10).len(), 0);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// A frontend that shows both a live-delivered message (via
+    /// `create_encrypted_packet`'s side channel, or `drain_inbox`'s third
+    /// tuple element) and a later history-fetched one (via
+    /// `history_for_contact`) needs both to report the *same* id for the
+    /// same underlying row, or a naive merge of the two views will show one
+    /// message twice under two different synthetic ids. This test locks in
+    /// that the ids always agree, for both outgoing and incoming messages.
+    #[test]
+    fn test_live_and_historical_message_ids_agree() {
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut alice = Client::new(server_addr);
+        let mut bob = Client::new(server_addr);
+
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!(
+            "e2e-messenger-id-agreement-test-{:x}.sqlite",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        alice.history = Some(ChatHistory::open(&db_path, &[6u8; 32]).unwrap());
+
+        alice
+            .pending_contacts
+            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
+        let kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let mut kx_inner = vec![0x02];
+        kx_inner.extend_from_slice(&kx.to_bytes());
+        let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
+        let inner = strip_link(&bob_reply, &bob.link_master_key);
+        let alice_est = alice.handle_incoming_packet(&inner).unwrap().unwrap();
+        let inner_est = strip_link(&alice_est, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner_est).unwrap();
+
+        // Outgoing: the side-channel id must match what a history fetch
+        // reports for that same row.
+        alice
+            .create_encrypted_packet(bob.identity.routing_token, b"outgoing")
+            .unwrap();
+        let live_outgoing_id = alice.last_recorded_id.expect("history is attached");
+        let fetched = alice.history_for_contact(bob.identity.routing_token, 10);
+        assert_eq!(fetched.last().unwrap().id, live_outgoing_id);
+
+        // Incoming: `drain_inbox`'s third element must match too.
+        let (msg_packet, _) = bob
+            .create_encrypted_packet(alice.identity.routing_token, b"incoming")
+            .unwrap();
+        let inner_msg = strip_link(&msg_packet, &bob.link_master_key);
+        alice.handle_incoming_packet(&inner_msg).unwrap();
+        let (_, _, live_incoming_id) = alice.drain_inbox().pop().unwrap();
+        let fetched = alice.history_for_contact(bob.identity.routing_token, 10);
+        assert_eq!(fetched.last().unwrap().id, live_incoming_id.unwrap());
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_derive_vault_key_stable_across_calls() {
+        // Logging in twice with the same passcode must unlock the same
+        // database, i.e. the vault key must be deterministic given the
+        // same stored hash and passcode.
+        let stored = hash_passcode("shared-secret");
+        let a = derive_vault_key("shared-secret", &stored).unwrap();
+        let b = derive_vault_key("shared-secret", &stored).unwrap();
+        assert_eq!(a.as_ref(), b.as_ref());
     }
 
     // ==========================================
@@ -1447,7 +1751,8 @@ mod tests {
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
 
         // Step 1: Alice sends KeyExchange to Bob
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap();
@@ -1483,6 +1788,147 @@ mod tests {
         assert!(
             b_sess.peer_kyber_pub.is_some(),
             "Bob must have Alice's Kyber key"
+        );
+    }
+
+    /// Simulates "delete an identity, then create a new one with the same
+    /// display name and reconnect to an existing contact" (a real workflow
+    /// once the login screen's delete/create identity commands exist).
+    /// Recreating an identity mints a brand-new routing token — from the
+    /// surviving peer's (Bob's) perspective, "new Alice" is a completely
+    /// unrelated identity that happens to share a name, not a resumed
+    /// session. This test asserts what the protocol layer actually
+    /// guarantees in that situation: the new session establishes correctly
+    /// and works end-to-end, and Bob's old session for the deleted identity
+    /// is left completely intact rather than corrupted or silently merged.
+    /// It does *not* claim this is good UX — see the "duplicate contact"
+    /// follow-up work, which is a UI/contact-management concern layered on
+    /// top of this correct-but-confusing protocol behavior.
+    #[test]
+    fn test_reconnect_after_identity_recreation_creates_independent_session() {
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let mut alice1 = Client::new(server_addr);
+        let mut bob = Client::new(server_addr);
+        alice1.local_name = "alice".to_string();
+        bob.local_name = "bob".to_string();
+
+        // --- Baseline: Alice1 <-> Bob fully established, one message each way ---
+        alice1
+            .pending_contacts
+            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
+        let kx1 =
+            KeyExchangePayload::generate(&alice1.identity, bob.identity.routing_token, "alice");
+        let mut kx1_inner = vec![0x02];
+        kx1_inner.extend_from_slice(&kx1.to_bytes());
+        let bob_reply1 = bob.handle_incoming_packet(&kx1_inner).unwrap().unwrap();
+        let inner1 = strip_link(&bob_reply1, &bob.link_master_key);
+        let alice1_reply = alice1.handle_incoming_packet(&inner1).unwrap().unwrap();
+        let inner1b = strip_link(&alice1_reply, &alice1.link_master_key);
+        bob.handle_incoming_packet(&inner1b).unwrap();
+
+        assert!(
+            bob.e2e_sessions
+                .contains_key(&alice1.identity.routing_token)
+        );
+        assert!(
+            alice1
+                .e2e_sessions
+                .contains_key(&bob.identity.routing_token)
+        );
+        let bob_alice1_session_before = bob
+            .e2e_sessions
+            .get(&alice1.identity.routing_token)
+            .unwrap()
+            .root_key;
+
+        let (msg_to_bob, _) = alice1
+            .create_encrypted_packet(bob.identity.routing_token, b"hi bob, it's alice")
+            .unwrap();
+        let inner_msg = strip_link(&msg_to_bob, &alice1.link_master_key);
+        bob.handle_incoming_packet(&inner_msg).unwrap();
+        assert_eq!(bob.inbox.last().unwrap().1, b"hi bob, it's alice");
+
+        // --- Alice's identity is deleted and recreated: brand-new keys/token,
+        // same self-chosen name. Bob's own state is completely untouched. ---
+        let mut alice2 = Client::new(server_addr);
+        alice2.local_name = "alice".to_string();
+        assert_ne!(
+            alice2.identity.routing_token, alice1.identity.routing_token,
+            "a recreated identity must not reuse the old routing token"
+        );
+
+        // Alice2 re-adds Bob using his (unchanged) token/key, exactly like
+        // the ContactPanel's "Add contact" form / connect_to_peer command.
+        alice2
+            .pending_contacts
+            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
+        let kx2 =
+            KeyExchangePayload::generate(&alice2.identity, bob.identity.routing_token, "alice");
+        let mut kx2_inner = vec![0x02];
+        kx2_inner.extend_from_slice(&kx2.to_bytes());
+        let bob_reply2 = bob.handle_incoming_packet(&kx2_inner).unwrap().unwrap();
+        let inner2 = strip_link(&bob_reply2, &bob.link_master_key);
+        let alice2_reply = alice2.handle_incoming_packet(&inner2).unwrap().unwrap();
+        let inner2b = strip_link(&alice2_reply, &alice2.link_master_key);
+        bob.handle_incoming_packet(&inner2b).unwrap();
+
+        // Bob now has two independent sessions for "alice" — this is the
+        // "duplicate contact" the UI needs a remove-contact action for, not
+        // a protocol bug. Assert it's a clean duplicate, not corruption.
+        assert!(
+            bob.e2e_sessions
+                .contains_key(&alice1.identity.routing_token),
+            "Bob's old session must survive Alice's identity recreation"
+        );
+        assert!(
+            bob.e2e_sessions
+                .contains_key(&alice2.identity.routing_token),
+            "Bob must establish a fresh session with the recreated identity"
+        );
+        assert_eq!(
+            bob.e2e_sessions
+                .get(&alice1.identity.routing_token)
+                .unwrap()
+                .root_key,
+            bob_alice1_session_before,
+            "the old session's keys must be untouched by the new handshake"
+        );
+        assert!(
+            alice2
+                .e2e_sessions
+                .contains_key(&bob.identity.routing_token)
+        );
+
+        // --- The new session must work end-to-end, in both directions ---
+        let (msg_to_bob2, _) = alice2
+            .create_encrypted_packet(bob.identity.routing_token, b"hi bob, it's the new alice")
+            .unwrap();
+        let inner_msg2 = strip_link(&msg_to_bob2, &alice2.link_master_key);
+        bob.handle_incoming_packet(&inner_msg2).unwrap();
+        assert_eq!(bob.inbox.last().unwrap().1, b"hi bob, it's the new alice");
+
+        let (msg_to_alice2, _) = bob
+            .create_encrypted_packet(alice2.identity.routing_token, b"hi new alice, it's bob")
+            .unwrap();
+        let inner_msg3 = strip_link(&msg_to_alice2, &bob.link_master_key);
+        alice2.handle_incoming_packet(&inner_msg3).unwrap();
+        assert_eq!(alice2.inbox.last().unwrap().1, b"hi new alice, it's bob");
+
+        // --- Bob manually forgets the stale old-Alice contact ---
+        bob.forget_contact(alice1.identity.routing_token);
+        assert!(
+            !bob.e2e_sessions
+                .contains_key(&alice1.identity.routing_token),
+            "the old session must be gone after forget_contact"
+        );
+        assert!(
+            !bob.contact_names
+                .contains_key(&alice1.identity.routing_token)
+        );
+        assert!(
+            bob.e2e_sessions
+                .contains_key(&alice2.identity.routing_token),
+            "forgetting the old contact must not disturb the new one"
         );
     }
 
@@ -1537,7 +1983,8 @@ mod tests {
         alice
             .pending_contacts
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
@@ -1981,7 +2428,8 @@ mod tests {
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
 
         // Alice sends KX, Bob replies, Alice sends SessionEstablish
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
@@ -2269,7 +2717,8 @@ mod tests {
         alice
             .pending_contacts
             .insert(bob.identity.routing_token, bob.identity.ed25519_public);
-        let alice_kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let alice_kx =
+            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&alice_kx.to_bytes());
         let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
