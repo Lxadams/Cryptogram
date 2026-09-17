@@ -8,6 +8,7 @@
 use client::Client;
 use std::{fs::File, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
+use zeroize::Zeroizing;
 
 /// Everything needed to actually talk to the relay: the protocol state
 /// machine plus the socket it was handshaked on. `None` until the
@@ -31,6 +32,13 @@ pub struct ClientRuntime {
 pub struct PendingIdentity {
     pub pseudonym: String,
     pub state_path: String,
+    /// Derived once from the login passcode (see `derive_vault_key` in the
+    /// `client` crate) and carried forward only as this key — the passcode
+    /// itself is zeroized and dropped inside the `login` command, never
+    /// stored in `AppState`. `bootstrap` uses this to open the identity's
+    /// SQLCipher chat-history database. `Zeroizing` wipes it from memory
+    /// once `bootstrap` takes it (or on logout, whichever comes first).
+    pub vault_key: Zeroizing<[u8; 32]>,
 }
 
 /// Tauri-managed application state (registered via `.manage(...)` in

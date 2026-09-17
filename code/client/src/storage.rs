@@ -1,12 +1,14 @@
 use crate::{Client, SymmetricSessionState, UserIdentity};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use pqcrypto_kyber::kyber768::{PublicKey, SecretKey};
 use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 #[derive(Serialize, Deserialize)]
@@ -284,6 +286,155 @@ impl ClientStateDto {
             contact_names,
             inbox: Vec::new(),         // transient handoff buffer, not persisted
             last_seen: HashMap::new(), // live status, not persisted — see Client::last_seen
+            history: None,             // attached separately once a vault key is available
+            last_recorded_id: None,
+            identity_store: None, // attached separately once a vault key is available
         })
+    }
+}
+
+/// SQLCipher-backed replacement for the plaintext `client_state.json` file:
+/// this identity's own Ed25519/X25519/Kyber secrets and e2e session state,
+/// encrypted at rest with the same Argon2id-derived vault key that unlocks
+/// `ChatHistory` (see `derive_vault_key`) — one passcode unlocks both
+/// stores. Deliberately a single JSON blob in a one-row table rather than a
+/// real relational schema: `ClientStateDto` is already the natural unit
+/// this is always read and written as a whole, so a key-value table adds
+/// nothing a real column layout would justify (same reasoning `ChatHistory`
+/// uses per-message, just applied to a single row here).
+pub struct IdentityStateStore {
+    conn: Connection,
+}
+
+impl IdentityStateStore {
+    /// Open (creating if absent) the SQLCipher database at `db_path`, keyed
+    /// by `vault_key`. Fails fast on the wrong key — see `ChatHistory::open`'s
+    /// doc comment for why the canary read matters.
+    pub fn open(db_path: &Path, vault_key: &[u8; 32]) -> Result<Self> {
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("opening identity state db at {}", db_path.display()))?;
+        conn.pragma_update(None, "key", format!("x'{}'", hex::encode(vault_key)))?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .context("incorrect vault key, or corrupt identity state database")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS client_state (
+                id INTEGER PRIMARY KEY CHECK (id = 0),
+                json TEXT NOT NULL
+            );",
+        )?;
+        Ok(Self { conn })
+    }
+
+    /// Persist `client`'s current state, overwriting whatever was saved
+    /// before.
+    pub fn save(&self, client: &Client) -> Result<()> {
+        let dto = ClientStateDto::from_client(client);
+        let json = serde_json::to_string(&dto)?;
+        self.conn.execute(
+            "INSERT INTO client_state (id, json) VALUES (0, ?1)
+             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+            params![json],
+        )?;
+        Ok(())
+    }
+
+    /// Load the previously-saved `Client`, if any. `state_path` is stamped
+    /// onto the result exactly like `ClientStateDto::load` does — see
+    /// `Client::state_path`'s doc comment.
+    pub fn load(&self, state_path: &str) -> Result<Client> {
+        let json: String = self
+            .conn
+            .query_row("SELECT json FROM client_state WHERE id = 0", [], |row| {
+                row.get(0)
+            })
+            .context("no saved identity in this database yet")?;
+        let dto: ClientStateDto = serde_json::from_str(&json)?;
+        dto.into_client(state_path)
+    }
+}
+
+#[cfg(test)]
+mod identity_state_store_tests {
+    use super::*;
+    use crate::Client;
+    use std::net::SocketAddr;
+
+    struct ScratchDb(std::path::PathBuf);
+
+    impl ScratchDb {
+        fn new(name: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "e2e-messenger-identity-state-test-{name}-{:x}.sqlite",
+                rand_suffix()
+            ));
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn rand_suffix() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:4430".parse().unwrap()
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip_preserves_identity() {
+        let db = ScratchDb::new("roundtrip");
+        let key = [5u8; 32];
+        let store = IdentityStateStore::open(&db.0, &key).unwrap();
+
+        let original = Client::new(test_addr());
+        let original_token = original.identity.routing_token;
+        store.save(&original).unwrap();
+
+        let loaded = store.load(&db.0.to_string_lossy()).unwrap();
+        assert_eq!(loaded.identity.routing_token, original_token);
+    }
+
+    #[test]
+    fn test_state_survives_reopen_with_same_key() {
+        let db = ScratchDb::new("reopen");
+        let key = [6u8; 32];
+        let original_token;
+        {
+            let store = IdentityStateStore::open(&db.0, &key).unwrap();
+            let client = Client::new(test_addr());
+            original_token = client.identity.routing_token;
+            store.save(&client).unwrap();
+        }
+        let reopened = IdentityStateStore::open(&db.0, &key).unwrap();
+        let loaded = reopened.load(&db.0.to_string_lossy()).unwrap();
+        assert_eq!(loaded.identity.routing_token, original_token);
+    }
+
+    #[test]
+    fn test_wrong_key_fails_to_open() {
+        let db = ScratchDb::new("wrongkey");
+        {
+            let store = IdentityStateStore::open(&db.0, &[1u8; 32]).unwrap();
+            store.save(&Client::new(test_addr())).unwrap();
+        }
+        assert!(IdentityStateStore::open(&db.0, &[2u8; 32]).is_err());
+    }
+
+    #[test]
+    fn test_load_before_any_save_errors() {
+        let db = ScratchDb::new("empty");
+        let store = IdentityStateStore::open(&db.0, &[3u8; 32]).unwrap();
+        assert!(store.load(&db.0.to_string_lossy()).is_err());
     }
 }

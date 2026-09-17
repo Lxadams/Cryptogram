@@ -78,6 +78,18 @@ pub struct ContactDto {
 pub struct IncomingMessageDto {
     pub from_token: String,
     pub text: String,
+    /// Local chat-history row id (`None` if no history is attached) — the
+    /// same id a `chat_history` fetch reports for this same message, so the
+    /// frontend can merge live and persisted views without duplicating it.
+    pub id: Option<i64>,
+}
+
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct StoredMessageDto {
+    pub id: i64,
+    pub from_me: bool,
+    pub text: String,
+    pub timestamp_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -167,15 +179,44 @@ pub async fn connect_to_peer(token_hex: &str, ed25519_hex: &str) -> Result<(), S
 }
 
 #[derive(Serialize)]
+struct RemoveContactArgs<'a> {
+    token_hex: &'a str,
+}
+
+/// Permanently remove a contact locally (session/pending/name), and its
+/// locally-persisted chat history with it — the cleanup path for a stale
+/// duplicate, e.g. after the other side deleted and recreated their
+/// identity.
+pub async fn remove_contact(token_hex: &str) -> Result<(), String> {
+    call("remove_contact", &RemoveContactArgs { token_hex }).await
+}
+
+#[derive(Serialize)]
 struct SendMessageArgs<'a> {
     token_hex: &'a str,
     text: &'a str,
 }
 
-pub async fn send_message(token_hex: &str, text: &str) -> Result<(), String> {
+/// Returns the sent message's local chat-history row id (`None` if no
+/// history is attached), for the frontend to label its optimistic display
+/// of this message with the same id `chat_history` would later report.
+pub async fn send_message(token_hex: &str, text: &str) -> Result<Option<i64>, String> {
     call("send_message", &SendMessageArgs { token_hex, text }).await
 }
 
 pub async fn poll_inbox() -> Result<Vec<IncomingMessageDto>, String> {
     call("poll_inbox", &()).await
+}
+
+#[derive(Serialize)]
+struct ChatHistoryArgs<'a> {
+    token_hex: &'a str,
+    limit: i64,
+}
+
+/// This peer's own locally-persisted history with a contact — survives the
+/// other side losing their state, deleting the conversation, or
+/// reconnecting, since nothing about it is shared/synced between peers.
+pub async fn chat_history(token_hex: &str, limit: i64) -> Result<Vec<StoredMessageDto>, String> {
+    call("chat_history", &ChatHistoryArgs { token_hex, limit }).await
 }

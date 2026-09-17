@@ -232,6 +232,20 @@ button.secondary {
   color: var(--error);
 }
 
+/* A destructive icon action (delete identity, remove contact) should read
+   as dangerous at rest, not only on hover — a plain outline icon in the
+   muted color was too easy to miss entirely. */
+.icon-btn.danger {
+  background: color-mix(in srgb, var(--error) 15%, transparent);
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.icon-btn.danger:hover {
+  background: var(--error);
+  color: white;
+}
+
 button.danger {
   background: var(--error);
   color: white;
@@ -335,11 +349,23 @@ button.danger {
 
 .contact-list li {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   padding: 0.5rem;
   border-radius: 6px;
   cursor: pointer;
+}
+
+/* The contact list is a narrow sidebar column (see .columns) — the
+   remove-contact confirm (name/status + a "Remove?" prompt and up to three
+   buttons) doesn't fit on one line next to those, so it wraps onto a full
+   width row of its own underneath instead of overlapping them. */
+.contact-list li .identity-confirm {
+  flex-basis: 100%;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  margin-top: 0.3rem;
 }
 
 .contact-list li:hover {
