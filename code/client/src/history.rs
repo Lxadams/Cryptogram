@@ -4,7 +4,7 @@
 //! ever had — there is no shared/synced history between peers (matches how
 //! `identities/<pseudonym>/` already works: everything under it is local to
 //! this machine and this identity only). The database lives right next to
-//! `client_state.json` under the same identity directory, keyed by the same
+//! `client_state.sqlite` under the same identity directory, keyed by the same
 //! Argon2id-derived vault key the login passcode unlocks (see
 //! `derive_vault_key` in `lib.rs`).
 //!

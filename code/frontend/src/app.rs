@@ -26,7 +26,7 @@ use std::time::Duration;
 /// messages it displays are durable: every message sent or received is
 /// recorded to this identity's local SQLCipher-encrypted chat-history
 /// database as it's encrypted/decrypted (see `Client::history` in the
-/// `client` crate), independent of this peer's `client_state.json` session
+/// `client` crate), independent of this peer's `client_state.sqlite` session
 /// state and never shared with or dependent on the other peer's own copy.
 #[derive(Clone, Debug, PartialEq)]
 struct ChatMessage {

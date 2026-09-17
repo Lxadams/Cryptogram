@@ -8,7 +8,7 @@ use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
 use client::{
     derive_vault_key, hash_passcode, perform_handshake, ChatHistory, Client, ClientStateDto,
-    TYPE_DATA,
+    IdentityStateStore, TYPE_DATA,
 };
 use ed25519_dalek::VerifyingKey;
 use serde::Serialize;
@@ -68,12 +68,15 @@ fn sanitize_pseudonym(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// `(client_state.json path, passcode.hash path, session.lock path)` for a
+/// `(client_state.sqlite path, passcode.hash path, session.lock path)` for a
 /// given (already sanitized) pseudonym under `root` (see `identities_root`).
+/// `client_state.sqlite` is the SQLCipher-encrypted identity store, keyed
+/// by the same vault key as `chat_history.sqlite` — see
+/// `load_or_migrate_identity_state`.
 fn identity_paths(root: &Path, pseudonym: &str) -> (PathBuf, PathBuf, PathBuf) {
     let dir = root.join(pseudonym);
     (
-        dir.join("client_state.json"),
+        dir.join("client_state.sqlite"),
         dir.join("passcode.hash"),
         dir.join("session.lock"),
     )
@@ -154,7 +157,7 @@ pub enum LoginOutcome {
 }
 
 /// Internal counterpart to `LoginOutcome` that also carries the resolved
-/// `client_state.json` path and the held session lock for `login` to stash
+/// `client_state.sqlite` path and the held session lock for `login` to stash
 /// in `AppState` — kept out of `LoginOutcome` itself since neither is ever
 /// meaningful to the frontend.
 enum LoginResolution {
@@ -288,6 +291,48 @@ fn resolve_delete_identity(root: &Path, pseudonym: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Open (or create) `state_path`'s SQLCipher-encrypted identity store,
+/// keyed by the vault key `login` already derived from the passcode — the
+/// exact same key that unlocks `chat_history.sqlite` (see `ChatHistory::open`),
+/// so one login unlocks both stores.
+///
+/// One-time migration: an identity created before this store existed has
+/// its secrets sitting in a plaintext sibling `client_state.json` instead.
+/// If no encrypted store exists yet but that legacy file does, this loads
+/// it, writes an encrypted copy, and deletes the plaintext original. This
+/// is a real migration rather than the "force recreation" precedent used
+/// for the old SHA-256 `passcode.hash` format — that format change couldn't
+/// be migrated because a one-way hash can't be recomputed without the raw
+/// passcode, but the legacy `client_state.json` is fully readable JSON, so
+/// there's no reason to make the user re-generate their identity (and lose
+/// every peer's record of their public keys) just to protect it at rest.
+fn load_or_migrate_identity_state(
+    state_path: &Path,
+    vault_key: &[u8; 32],
+    server_addr: SocketAddr,
+) -> Result<Client, String> {
+    let store = IdentityStateStore::open(state_path, vault_key).map_err(|e| e.to_string())?;
+
+    if let Ok(mut client) = store.load(&state_path.to_string_lossy()) {
+        client.identity_store = Some(store);
+        return Ok(client);
+    }
+
+    let legacy_path = state_path.with_file_name("client_state.json");
+    let mut client = if legacy_path.is_file() {
+        let legacy_client =
+            ClientStateDto::load(&legacy_path.to_string_lossy()).map_err(|e| e.to_string())?;
+        store.save(&legacy_client).map_err(|e| e.to_string())?;
+        let _ = fs::remove_file(&legacy_path);
+        legacy_client
+    } else {
+        Client::new(server_addr)
+    };
+    client.state_path = state_path.to_string_lossy().into_owned();
+    client.identity_store = Some(store);
+    Ok(client)
+}
+
 /// Verify an existing pseudonym's passcode, derive its vault key (see
 /// `derive_vault_key` in the `client` crate), and stash both — along with
 /// which identity file `bootstrap` should load next — in
@@ -388,7 +433,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(pseudonym, "alice");
-                assert_eq!(state_path, root.join("alice").join("client_state.json"));
+                assert_eq!(state_path, root.join("alice").join("client_state.sqlite"));
             }
             LoginResolution::UnknownUsername => panic!("expected a successful login"),
         }
@@ -503,6 +548,86 @@ mod tests {
         assert!(resolve_login(&root, "dave", "").is_err());
     }
 
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:4430".parse().unwrap()
+    }
+
+    #[test]
+    fn test_load_or_migrate_creates_fresh_identity_when_nothing_exists() {
+        let root = scratch_dir("fresh_identity");
+        resolve_create_identity(&root, "alice", "hunter2").unwrap();
+        let LoginResolution::Success {
+            state_path,
+            vault_key,
+            ..
+        } = resolve_login(&root, "alice", "hunter2").unwrap()
+        else {
+            panic!("expected a successful login");
+        };
+
+        let client = load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        assert_eq!(client.state_path, state_path.to_string_lossy());
+        assert!(state_path.is_file());
+    }
+
+    #[test]
+    fn test_load_or_migrate_reopens_previously_saved_encrypted_state() {
+        let root = scratch_dir("reopen_encrypted");
+        resolve_create_identity(&root, "alice", "hunter2").unwrap();
+        let LoginResolution::Success {
+            state_path,
+            vault_key,
+            ..
+        } = resolve_login(&root, "alice", "hunter2").unwrap()
+        else {
+            panic!("expected a successful login");
+        };
+
+        let first = load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        let original_token = first.identity.routing_token;
+        first.save();
+
+        let second = load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        assert_eq!(second.identity.routing_token, original_token);
+    }
+
+    #[test]
+    fn test_load_or_migrate_upgrades_legacy_plaintext_state_and_deletes_it() {
+        let root = scratch_dir("migrate_legacy");
+        resolve_create_identity(&root, "alice", "hunter2").unwrap();
+        let LoginResolution::Success {
+            state_path,
+            vault_key,
+            ..
+        } = resolve_login(&root, "alice", "hunter2").unwrap()
+        else {
+            panic!("expected a successful login");
+        };
+
+        // Simulate a pre-migration identity: a plaintext client_state.json
+        // sibling, no client_state.sqlite yet.
+        let legacy_path = state_path.with_file_name("client_state.json");
+        let legacy_client = Client::new(test_addr());
+        let legacy_token = legacy_client.identity.routing_token;
+        ClientStateDto::save(&legacy_client, &legacy_path.to_string_lossy()).unwrap();
+        assert!(!state_path.is_file());
+
+        let migrated =
+            load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        assert_eq!(migrated.identity.routing_token, legacy_token);
+        assert!(state_path.is_file());
+        assert!(
+            !legacy_path.is_file(),
+            "plaintext client_state.json should be removed after migration"
+        );
+
+        // And the migrated identity is now readable from the encrypted
+        // store alone, without the plaintext file.
+        let reloaded =
+            load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        assert_eq!(reloaded.identity.routing_token, legacy_token);
+    }
+
     #[test]
     fn test_list_pseudonyms_reflects_created_identities() {
         let root = scratch_dir("list_pseudonyms");
@@ -590,21 +715,16 @@ pub async fn bootstrap(
         .clone()
         .ok_or("Log in first")?;
 
-    // Resume a previous identity if one was saved, otherwise mint a new one
-    // — identical fallback logic to the CLI, just from a per-pseudonym path
-    // instead of the single global default.
-    let mut client =
-        ClientStateDto::load(&pending.state_path).unwrap_or_else(|_| Client::new(server_addr));
-    // `Client::new` defaults `state_path` to the global `state_file_path()`
-    // (right for the CLI, which has no pending identity); rebind it here so
-    // a freshly-created identity still saves to its own pseudonym's file,
-    // not the shared default. A loaded identity already matches, since it
-    // was just loaded from this same path, but setting it unconditionally
-    // keeps this correct even if that ever changes.
-    client.state_path = pending.state_path;
+    // Resume a previous identity if one was saved (migrating it out of the
+    // legacy plaintext file if needed), otherwise mint a new one.
+    let mut client = load_or_migrate_identity_state(
+        Path::new(&pending.state_path),
+        &pending.vault_key,
+        server_addr,
+    )?;
     client.local_name = pending.pseudonym;
 
-    // Chat history lives right next to client_state.json under the same
+    // Chat history lives right next to client_state.sqlite under the same
     // identity directory, keyed by the vault key `login` already derived
     // from the passcode — see `PendingIdentity::vault_key`'s doc comment.
     let history_path = Path::new(&client.state_path)

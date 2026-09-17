@@ -21,7 +21,7 @@ mod history;
 mod storage;
 pub use history::{ChatHistory, StoredMessage};
 use std::collections::HashSet;
-pub use storage::ClientStateDto;
+pub use storage::{ClientStateDto, IdentityStateStore};
 
 type HmacSha256 = Hmac<Sha256>;
 pub type SessionId = [u8; 4];
@@ -374,6 +374,13 @@ pub struct Client {
     /// key flow yet, simply never sets this, and every send/receive that
     /// would otherwise record to it is a silent no-op.
     pub history: Option<ChatHistory>,
+    /// This identity's own SQLCipher-backed replacement for the plaintext
+    /// `client_state.json`, if it's been unlocked — keyed by the exact same
+    /// vault key as `history`, so one passcode unlocks both stores. `None`
+    /// until a caller attaches one (the CLI never does, same as `history`),
+    /// in which case `save()` falls back to the legacy plaintext
+    /// `ClientStateDto::save`/`state_path` path unchanged.
+    pub identity_store: Option<IdentityStateStore>,
     /// The local chat-history row id `record_message` just wrote, if any —
     /// a one-shot side channel so an outgoing send (a single call per
     /// invocation, unlike `inbox`'s queue of possibly-several incoming
@@ -405,6 +412,7 @@ impl Client {
             inbox: Vec::new(),
             last_seen: HashMap::new(),
             history: None,
+            identity_store: None,
             last_recorded_id: None,
         }
     }
@@ -497,8 +505,17 @@ impl Client {
         self.wrap_link_encryption(target_token, &inner)
     }
 
+    /// Persist identity/session state to `identity_store` if one is
+    /// attached (the SQLCipher-encrypted path), otherwise fall back to the
+    /// legacy plaintext `client_state.json` at `state_path` — mirrors how
+    /// `record_message` treats `history` as optional. Failures are logged,
+    /// not propagated, same as `record_message`.
     pub fn save(&self) {
-        if let Err(e) = ClientStateDto::save(self, &self.state_path) {
+        let result = match &self.identity_store {
+            Some(store) => store.save(self),
+            None => ClientStateDto::save(self, &self.state_path),
+        };
+        if let Err(e) = result {
             tracing::error!("Failed to save state: {}", e);
         }
     }
