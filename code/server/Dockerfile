@@ -1,6 +1,5 @@
 FROM rust:1-slim AS builder
 WORKDIR /app
-COPY utils ./utils
 COPY server/Cargo.toml server/Cargo.lock ./server/
 COPY server/src ./server/src
 WORKDIR /app/server

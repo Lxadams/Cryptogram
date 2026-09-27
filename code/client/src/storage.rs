@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use pqcrypto_kyber::kyber768::{PublicKey, SecretKey};
 use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -338,18 +338,27 @@ impl IdentityStateStore {
         Ok(())
     }
 
-    /// Load the previously-saved `Client`, if any. `state_path` is stamped
-    /// onto the result exactly like `ClientStateDto::load` does — see
-    /// `Client::state_path`'s doc comment.
-    pub fn load(&self, state_path: &str) -> Result<Client> {
-        let json: String = self
+    /// Load the previously-saved `Client`. `Ok(None)` means nothing has been
+    /// saved yet; an `Err` means something *was* saved but couldn't be read
+    /// back (corrupt row, or a format this build doesn't understand). The
+    /// distinction matters: callers mint a fresh identity only for `None`,
+    /// never on an error, or a read failure would silently replace the
+    /// user's real identity. `state_path` is stamped onto the result exactly
+    /// like `ClientStateDto::load` does — see `Client::state_path`'s doc
+    /// comment.
+    pub fn load(&self, state_path: &str) -> Result<Option<Client>> {
+        let json: Option<String> = self
             .conn
             .query_row("SELECT json FROM client_state WHERE id = 0", [], |row| {
                 row.get(0)
             })
-            .context("no saved identity in this database yet")?;
-        let dto: ClientStateDto = serde_json::from_str(&json)?;
-        dto.into_client(state_path)
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let dto: ClientStateDto =
+            serde_json::from_str(&json).context("saved identity state is unreadable")?;
+        dto.into_client(state_path).map(Some)
     }
 }
 
@@ -401,7 +410,7 @@ mod identity_state_store_tests {
         let original_token = original.identity.routing_token;
         store.save(&original).unwrap();
 
-        let loaded = store.load(&db.0.to_string_lossy()).unwrap();
+        let loaded = store.load(&db.0.to_string_lossy()).unwrap().unwrap();
         assert_eq!(loaded.identity.routing_token, original_token);
     }
 
@@ -417,7 +426,7 @@ mod identity_state_store_tests {
             store.save(&client).unwrap();
         }
         let reopened = IdentityStateStore::open(&db.0, &key).unwrap();
-        let loaded = reopened.load(&db.0.to_string_lossy()).unwrap();
+        let loaded = reopened.load(&db.0.to_string_lossy()).unwrap().unwrap();
         assert_eq!(loaded.identity.routing_token, original_token);
     }
 
@@ -432,9 +441,23 @@ mod identity_state_store_tests {
     }
 
     #[test]
-    fn test_load_before_any_save_errors() {
+    fn test_load_before_any_save_is_none() {
         let db = ScratchDb::new("empty");
         let store = IdentityStateStore::open(&db.0, &[3u8; 32]).unwrap();
+        assert!(store.load(&db.0.to_string_lossy()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_unreadable_saved_state_is_an_error_not_none() {
+        let db = ScratchDb::new("corrupt");
+        let store = IdentityStateStore::open(&db.0, &[4u8; 32]).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO client_state (id, json) VALUES (0, ?1)",
+                params!["{ not a client state"],
+            )
+            .unwrap();
         assert!(store.load(&db.0.to_string_lossy()).is_err());
     }
 }

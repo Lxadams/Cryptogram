@@ -214,7 +214,11 @@ button.secondary {
   color: var(--muted);
 }
 
-.icon-btn {
+/* Small square icon buttons: shared base for delete/remove, show-passcode
+   and copy. Hover colours differ per kind. */
+.icon-btn,
+.visibility-toggle,
+.copy-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -268,20 +272,8 @@ button.danger {
   margin-bottom: 0;
 }
 
-.visibility-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--muted);
-  padding: 0.3rem;
-  border-radius: 6px;
-  cursor: pointer;
-  line-height: 0;
-}
-
-.visibility-toggle:hover {
+.visibility-toggle:hover,
+.copy-btn:hover {
   background: var(--hover);
   color: var(--text);
 }
@@ -309,24 +301,6 @@ button.danger {
   align-items: center;
   gap: 0.4rem;
   flex-wrap: wrap;
-}
-
-.copy-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--muted);
-  padding: 0.3rem;
-  border-radius: 6px;
-  cursor: pointer;
-  line-height: 0;
-}
-
-.copy-btn:hover {
-  background: var(--hover);
-  color: var(--text);
 }
 
 .copy-btn.copied {

@@ -6,6 +6,77 @@ use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
+// Every signed payload below has the same shape on the wire:
+//
+//   [16-byte sender token | 16-byte target token | 8-byte BE timestamp |
+//    payload-specific fields... | 64-byte Ed25519 signature]
+//
+// and the signature covers everything before it. So each payload only
+// defines `signed_bytes()` (the part before the signature); `to_bytes()`,
+// `verify()` and signing in `generate()` are all derived from that one
+// function, which is what keeps the signed and serialized layouts from ever
+// drifting apart.
+
+const TOKEN_LEN: usize = 16;
+/// Sender token + target token + timestamp.
+const HEADER_LEN: usize = TOKEN_LEN * 2 + 8;
+const SIG_LEN: usize = 64;
+const KYBER_PUB_LEN: usize = 1184;
+const KYBER_CT_LEN: usize = 1088;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn write_header(
+    out: &mut Vec<u8>,
+    routing_token: &RoutingToken,
+    target_token: &RoutingToken,
+    timestamp: u64,
+) {
+    out.extend_from_slice(routing_token);
+    out.extend_from_slice(target_token);
+    out.extend_from_slice(&timestamp.to_be_bytes());
+}
+
+/// Splits a received payload into its header fields, the payload-specific
+/// middle, and the trailing signature — after checking it's exactly
+/// `total_len` bytes.
+fn split_payload<'a>(
+    bytes: &'a [u8],
+    total_len: usize,
+    what: &str,
+) -> Result<(RoutingToken, RoutingToken, u64, &'a [u8], Signature)> {
+    if bytes.len() != total_len {
+        return Err(anyhow!("Invalid {what} payload size"));
+    }
+    let routing_token = bytes[0..16].try_into().unwrap();
+    let target_token = bytes[16..32].try_into().unwrap();
+    let timestamp = u64::from_be_bytes(bytes[32..40].try_into().unwrap());
+    let body = &bytes[HEADER_LEN..total_len - SIG_LEN];
+    let signature = Signature::from_bytes(bytes[total_len - SIG_LEN..].try_into().unwrap());
+    Ok((routing_token, target_token, timestamp, body, signature))
+}
+
+fn check_signature(signed: &[u8], signature: &Signature, key: &VerifyingKey) -> Result<()> {
+    key.verify(signed, signature)
+        .map_err(|_| anyhow!("Signature verification failed"))
+}
+
+fn with_signature(mut signed: Vec<u8>, signature: &Signature) -> Vec<u8> {
+    signed.extend_from_slice(&signature.to_bytes());
+    signed
+}
+
+/// Placeholder a payload is built with in `generate()` before its real
+/// signature (which covers the rest of the payload) is computed.
+fn unsigned() -> Signature {
+    Signature::from_bytes(&[0u8; SIG_LEN])
+}
+
 // ============================================================
 // KeyExchangePayload (0x02) — 1384 bytes
 // ============================================================
@@ -14,6 +85,7 @@ use x25519_dalek::PublicKey as X25519PublicKey;
 /// `KeyExchangePayload`. Plenty for a pseudonym (e.g. "alice"); longer
 /// names are truncated by `encode_name`.
 const NAME_LEN: usize = 32;
+const KX_LEN: usize = HEADER_LEN + 32 + 32 + KYBER_PUB_LEN + NAME_LEN + SIG_LEN;
 
 /// Right-pads `name`'s UTF-8 bytes into a fixed `NAME_LEN` buffer,
 /// truncating on a char boundary if it doesn't fit.
@@ -42,49 +114,42 @@ pub struct KeyExchangePayload {
     pub ed25519_public: VerifyingKey,
     pub x25519_public: X25519PublicKey,
     pub kyber_public: PublicKey,
-    /// Sender's self-chosen display name (e.g. set via
-    /// `./runpeer.sh alice`), empty if none was set. Part of the signed
-    /// message, so a blind relay can't tamper with or inject one.
+    /// Sender's self-chosen display name (their login username), empty if
+    /// none was set. Part of the signed message, so a blind relay can't
+    /// tamper with or inject one.
     pub name: String,
     pub signature: Signature,
 }
 
 impl KeyExchangePayload {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1384);
-        out.extend_from_slice(&self.routing_token);
-        out.extend_from_slice(&self.target_token);
-        out.extend_from_slice(&self.timestamp.to_be_bytes());
+    fn signed_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(KX_LEN);
+        write_header(
+            &mut out,
+            &self.routing_token,
+            &self.target_token,
+            self.timestamp,
+        );
         out.extend_from_slice(self.ed25519_public.as_bytes());
         out.extend_from_slice(self.x25519_public.as_bytes());
         out.extend_from_slice(self.kyber_public.as_bytes());
         out.extend_from_slice(&encode_name(&self.name));
-        out.extend_from_slice(&self.signature.to_bytes());
         out
     }
 
+    pub fn to_bytes(&self) -> Vec<u8> {
+        with_signature(self.signed_bytes(), &self.signature)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != 1384 {
-            return Err(anyhow!("Invalid key exchange payload size"));
-        }
-        let mut routing_token = [0u8; 16];
-        routing_token.copy_from_slice(&bytes[0..16]);
-        let mut target_token = [0u8; 16];
-        target_token.copy_from_slice(&bytes[16..32]);
-        let mut ts_arr = [0u8; 8];
-        ts_arr.copy_from_slice(&bytes[32..40]);
-        let timestamp = u64::from_be_bytes(ts_arr);
-        let mut ed_arr = [0u8; 32];
-        ed_arr.copy_from_slice(&bytes[40..72]);
-        let ed25519_public =
-            VerifyingKey::from_bytes(&ed_arr).map_err(|_| anyhow!("Invalid Ed25519"))?;
-        let mut x_arr = [0u8; 32];
-        x_arr.copy_from_slice(&bytes[72..104]);
-        let x25519_public = X25519PublicKey::from(x_arr);
-        let kyber_public =
-            PublicKey::from_bytes(&bytes[104..1288]).map_err(|_| anyhow!("Invalid Kyber"))?;
-        let name = decode_name(&bytes[1288..1320]);
-        let signature = Signature::from_bytes(bytes[1320..1384].try_into().unwrap());
+        let (routing_token, target_token, timestamp, body, signature) =
+            split_payload(bytes, KX_LEN, "key exchange")?;
+        let ed25519_public = VerifyingKey::from_bytes(body[0..32].try_into().unwrap())
+            .map_err(|_| anyhow!("Invalid Ed25519"))?;
+        let x25519_public = X25519PublicKey::from(<[u8; 32]>::try_from(&body[32..64]).unwrap());
+        let kyber_public = PublicKey::from_bytes(&body[64..64 + KYBER_PUB_LEN])
+            .map_err(|_| anyhow!("Invalid Kyber"))?;
+        let name = decode_name(&body[64 + KYBER_PUB_LEN..]);
         Ok(Self {
             routing_token,
             target_token,
@@ -98,49 +163,30 @@ impl KeyExchangePayload {
     }
 
     pub fn generate(identity: &UserIdentity, target_token: RoutingToken, name: &str) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mut msg = Vec::with_capacity(1320);
-        msg.extend_from_slice(&identity.routing_token);
-        msg.extend_from_slice(&target_token);
-        msg.extend_from_slice(&timestamp.to_be_bytes());
-        msg.extend_from_slice(identity.ed25519_public.as_bytes());
-        msg.extend_from_slice(identity.x25519_public.as_bytes());
-        msg.extend_from_slice(identity.kyber_public.as_bytes());
-        msg.extend_from_slice(&encode_name(name));
-        let signature = identity.ed25519_secret.sign(&msg);
-        Self {
+        let mut payload = Self {
             routing_token: identity.routing_token,
             target_token,
-            timestamp,
+            timestamp: now_secs(),
             ed25519_public: identity.ed25519_public,
             x25519_public: identity.x25519_public,
             kyber_public: identity.kyber_public,
             name: name.to_string(),
-            signature,
-        }
+            signature: unsigned(),
+        };
+        payload.signature = identity.ed25519_secret.sign(&payload.signed_bytes());
+        payload
     }
 
     pub fn verify(&self, verifier: &VerifyingKey) -> Result<()> {
-        let mut msg = Vec::with_capacity(1320);
-        msg.extend_from_slice(&self.routing_token);
-        msg.extend_from_slice(&self.target_token);
-        msg.extend_from_slice(&self.timestamp.to_be_bytes());
-        msg.extend_from_slice(self.ed25519_public.as_bytes());
-        msg.extend_from_slice(self.x25519_public.as_bytes());
-        msg.extend_from_slice(self.kyber_public.as_bytes());
-        msg.extend_from_slice(&encode_name(&self.name));
-        verifier
-            .verify(&msg, &self.signature)
-            .map_err(|_| anyhow!("Signature verification failed"))
+        check_signature(&self.signed_bytes(), &self.signature, verifier)
     }
 }
 
 // ============================================================
 // SessionEstablishPayload (0x04) — 1224 bytes
 // ============================================================
+
+const EST_LEN: usize = HEADER_LEN + KYBER_CT_LEN + 32 + SIG_LEN;
 
 pub struct SessionEstablishPayload {
     pub routing_token: RoutingToken,
@@ -152,34 +198,30 @@ pub struct SessionEstablishPayload {
 }
 
 impl SessionEstablishPayload {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1224);
-        out.extend_from_slice(&self.routing_token);
-        out.extend_from_slice(&self.target_token);
-        out.extend_from_slice(&self.timestamp.to_be_bytes());
+    fn signed_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(EST_LEN);
+        write_header(
+            &mut out,
+            &self.routing_token,
+            &self.target_token,
+            self.timestamp,
+        );
         out.extend_from_slice(self.kyber_ct.as_bytes());
         out.extend_from_slice(self.eph_x25519_pub.as_bytes());
-        out.extend_from_slice(&self.signature.to_bytes());
         out
     }
 
+    pub fn to_bytes(&self) -> Vec<u8> {
+        with_signature(self.signed_bytes(), &self.signature)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != 1224 {
-            return Err(anyhow!("Invalid session establish payload size"));
-        }
-        let mut routing_token = [0u8; 16];
-        routing_token.copy_from_slice(&bytes[0..16]);
-        let mut target_token = [0u8; 16];
-        target_token.copy_from_slice(&bytes[16..32]);
-        let mut ts_arr = [0u8; 8];
-        ts_arr.copy_from_slice(&bytes[32..40]);
-        let timestamp = u64::from_be_bytes(ts_arr);
-        let kyber_ct =
-            Ciphertext::from_bytes(&bytes[40..1128]).map_err(|_| anyhow!("Invalid Kyber CT"))?;
-        let mut x_arr = [0u8; 32];
-        x_arr.copy_from_slice(&bytes[1128..1160]);
-        let eph_x25519_pub = X25519PublicKey::from(x_arr);
-        let signature = Signature::from_bytes(bytes[1160..1224].try_into().unwrap());
+        let (routing_token, target_token, timestamp, body, signature) =
+            split_payload(bytes, EST_LEN, "session establish")?;
+        let kyber_ct = Ciphertext::from_bytes(&body[..KYBER_CT_LEN])
+            .map_err(|_| anyhow!("Invalid Kyber CT"))?;
+        let eph_x25519_pub =
+            X25519PublicKey::from(<[u8; 32]>::try_from(&body[KYBER_CT_LEN..]).unwrap());
         Ok(Self {
             routing_token,
             target_token,
@@ -196,43 +238,28 @@ impl SessionEstablishPayload {
         kyber_ct: Ciphertext,
         eph_x25519_pub: X25519PublicKey,
     ) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mut msg = Vec::with_capacity(1160);
-        msg.extend_from_slice(&identity.routing_token);
-        msg.extend_from_slice(&target_token);
-        msg.extend_from_slice(&timestamp.to_be_bytes());
-        msg.extend_from_slice(kyber_ct.as_bytes());
-        msg.extend_from_slice(eph_x25519_pub.as_bytes());
-        let signature = identity.ed25519_secret.sign(&msg);
-        Self {
+        let mut payload = Self {
             routing_token: identity.routing_token,
             target_token,
-            timestamp,
+            timestamp: now_secs(),
             kyber_ct,
             eph_x25519_pub,
-            signature,
-        }
+            signature: unsigned(),
+        };
+        payload.signature = identity.ed25519_secret.sign(&payload.signed_bytes());
+        payload
     }
 
     pub fn verify(&self, ed25519_pub: &VerifyingKey) -> Result<()> {
-        let mut msg = Vec::with_capacity(1160);
-        msg.extend_from_slice(&self.routing_token);
-        msg.extend_from_slice(&self.target_token);
-        msg.extend_from_slice(&self.timestamp.to_be_bytes());
-        msg.extend_from_slice(self.kyber_ct.as_bytes());
-        msg.extend_from_slice(self.eph_x25519_pub.as_bytes());
-        ed25519_pub
-            .verify(&msg, &self.signature)
-            .map_err(|_| anyhow!("Signature verification failed"))
+        check_signature(&self.signed_bytes(), &self.signature, ed25519_pub)
     }
 }
 
 // ============================================================
 // PQInjectPayload (0x05) — 1192 bytes
 // ============================================================
+
+const PQI_LEN: usize = HEADER_LEN + KYBER_CT_LEN + SIG_LEN;
 
 pub struct PQInjectPayload {
     pub routing_token: RoutingToken,
@@ -243,30 +270,26 @@ pub struct PQInjectPayload {
 }
 
 impl PQInjectPayload {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1192);
-        out.extend_from_slice(&self.routing_token); // 0..16
-        out.extend_from_slice(&self.target_token); // 16..32
-        out.extend_from_slice(&self.timestamp.to_be_bytes()); // 32..40
-        out.extend_from_slice(self.kyber_ct.as_bytes()); // 40..1128
-        out.extend_from_slice(&self.signature.to_bytes()); // 1128..1192
+    fn signed_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PQI_LEN);
+        write_header(
+            &mut out,
+            &self.routing_token,
+            &self.target_token,
+            self.timestamp,
+        );
+        out.extend_from_slice(self.kyber_ct.as_bytes());
         out
     }
 
+    pub fn to_bytes(&self) -> Vec<u8> {
+        with_signature(self.signed_bytes(), &self.signature)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != 1192 {
-            return Err(anyhow!("Invalid PQ inject payload size"));
-        }
-        let mut routing_token = [0u8; 16];
-        routing_token.copy_from_slice(&bytes[0..16]);
-        let mut target_token = [0u8; 16];
-        target_token.copy_from_slice(&bytes[16..32]);
-        let mut ts_arr = [0u8; 8];
-        ts_arr.copy_from_slice(&bytes[32..40]);
-        let timestamp = u64::from_be_bytes(ts_arr);
-        let kyber_ct =
-            Ciphertext::from_bytes(&bytes[40..1128]).map_err(|_| anyhow!("Invalid Kyber CT"))?;
-        let signature = Signature::from_bytes(bytes[1128..1192].try_into().unwrap());
+        let (routing_token, target_token, timestamp, body, signature) =
+            split_payload(bytes, PQI_LEN, "PQ inject")?;
+        let kyber_ct = Ciphertext::from_bytes(body).map_err(|_| anyhow!("Invalid Kyber CT"))?;
         Ok(Self {
             routing_token,
             target_token,
@@ -281,40 +304,27 @@ impl PQInjectPayload {
         target_token: RoutingToken,
         kyber_ct: Ciphertext,
     ) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mut msg = Vec::with_capacity(1128);
-        msg.extend_from_slice(&identity.routing_token);
-        msg.extend_from_slice(&target_token);
-        msg.extend_from_slice(&timestamp.to_be_bytes());
-        msg.extend_from_slice(kyber_ct.as_bytes());
-        let signature = identity.ed25519_secret.sign(&msg);
-        Self {
+        let mut payload = Self {
             routing_token: identity.routing_token,
             target_token,
-            timestamp,
+            timestamp: now_secs(),
             kyber_ct,
-            signature,
-        }
+            signature: unsigned(),
+        };
+        payload.signature = identity.ed25519_secret.sign(&payload.signed_bytes());
+        payload
     }
 
     pub fn verify(&self, ed25519_pub: &VerifyingKey) -> Result<()> {
-        let mut msg = Vec::with_capacity(1128);
-        msg.extend_from_slice(&self.routing_token);
-        msg.extend_from_slice(&self.target_token);
-        msg.extend_from_slice(&self.timestamp.to_be_bytes());
-        msg.extend_from_slice(self.kyber_ct.as_bytes());
-        ed25519_pub
-            .verify(&msg, &self.signature)
-            .map_err(|_| anyhow!("Signature verification failed"))
+        check_signature(&self.signed_bytes(), &self.signature, ed25519_pub)
     }
 }
 
 // ============================================================
 // PresencePayload (0x06) — 104 bytes
 // ============================================================
+
+const PRESENCE_LEN: usize = HEADER_LEN + SIG_LEN;
 
 /// A lightweight "I'm still here" signal sent periodically to each
 /// established contact so their client can show an online/offline marker.
@@ -332,27 +342,24 @@ pub struct PresencePayload {
 }
 
 impl PresencePayload {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(104);
-        out.extend_from_slice(&self.routing_token); // 0..16
-        out.extend_from_slice(&self.target_token); // 16..32
-        out.extend_from_slice(&self.timestamp.to_be_bytes()); // 32..40
-        out.extend_from_slice(&self.signature.to_bytes()); // 40..104
+    fn signed_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PRESENCE_LEN);
+        write_header(
+            &mut out,
+            &self.routing_token,
+            &self.target_token,
+            self.timestamp,
+        );
         out
     }
 
+    pub fn to_bytes(&self) -> Vec<u8> {
+        with_signature(self.signed_bytes(), &self.signature)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != 104 {
-            return Err(anyhow!("Invalid presence payload size"));
-        }
-        let mut routing_token = [0u8; 16];
-        routing_token.copy_from_slice(&bytes[0..16]);
-        let mut target_token = [0u8; 16];
-        target_token.copy_from_slice(&bytes[16..32]);
-        let mut ts_arr = [0u8; 8];
-        ts_arr.copy_from_slice(&bytes[32..40]);
-        let timestamp = u64::from_be_bytes(ts_arr);
-        let signature = Signature::from_bytes(bytes[40..104].try_into().unwrap());
+        let (routing_token, target_token, timestamp, _body, signature) =
+            split_payload(bytes, PRESENCE_LEN, "presence")?;
         Ok(Self {
             routing_token,
             target_token,
@@ -362,30 +369,60 @@ impl PresencePayload {
     }
 
     pub fn generate(identity: &UserIdentity, target_token: RoutingToken) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mut msg = Vec::with_capacity(40);
-        msg.extend_from_slice(&identity.routing_token);
-        msg.extend_from_slice(&target_token);
-        msg.extend_from_slice(&timestamp.to_be_bytes());
-        let signature = identity.ed25519_secret.sign(&msg);
-        Self {
+        let mut payload = Self {
             routing_token: identity.routing_token,
             target_token,
-            timestamp,
-            signature,
-        }
+            timestamp: now_secs(),
+            signature: unsigned(),
+        };
+        payload.signature = identity.ed25519_secret.sign(&payload.signed_bytes());
+        payload
     }
 
     pub fn verify(&self, ed25519_pub: &VerifyingKey) -> Result<()> {
-        let mut msg = Vec::with_capacity(40);
-        msg.extend_from_slice(&self.routing_token);
-        msg.extend_from_slice(&self.target_token);
-        msg.extend_from_slice(&self.timestamp.to_be_bytes());
-        ed25519_pub
-            .verify(&msg, &self.signature)
-            .map_err(|_| anyhow!("Signature verification failed"))
+        check_signature(&self.signed_bytes(), &self.signature, ed25519_pub)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire sizes are part of the protocol (peers running older builds
+    /// must still parse these), so pin them against the documented values.
+    #[test]
+    fn payload_sizes_match_the_wire_format() {
+        assert_eq!(KX_LEN, 1384);
+        assert_eq!(EST_LEN, 1224);
+        assert_eq!(PQI_LEN, 1192);
+        assert_eq!(PRESENCE_LEN, 104);
+    }
+
+    /// Byte-for-byte layout pin: the same fields concatenated by hand, in
+    /// the order the original (pre-refactor) implementation wrote them.
+    #[test]
+    fn key_exchange_bytes_match_the_original_layout() {
+        let identity = UserIdentity::generate();
+        let target = [9u8; 16];
+        let kx = KeyExchangePayload::generate(&identity, target, "alice");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&identity.routing_token);
+        expected.extend_from_slice(&target);
+        expected.extend_from_slice(&kx.timestamp.to_be_bytes());
+        expected.extend_from_slice(identity.ed25519_public.as_bytes());
+        expected.extend_from_slice(identity.x25519_public.as_bytes());
+        expected.extend_from_slice(identity.kyber_public.as_bytes());
+        expected.extend_from_slice(&encode_name("alice"));
+        identity
+            .ed25519_public
+            .verify(&expected, &kx.signature)
+            .expect("signature covers exactly the original signed layout");
+        expected.extend_from_slice(&kx.signature.to_bytes());
+
+        assert_eq!(kx.to_bytes(), expected);
+        let parsed = KeyExchangePayload::from_bytes(&expected).unwrap();
+        assert_eq!(parsed.name, "alice");
+        assert!(parsed.verify(&identity.ed25519_public).is_ok());
     }
 }
