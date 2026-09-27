@@ -11,8 +11,6 @@ js-sys = "0.3.103"
 # `csr` = client-side rendering: compile straight to WASM and run entirely
 # in the browser/webview, no server-rendering feature needed here.
 leptos = { version = "0.8.20", features = ["csr"] }
-# Client-side routing between UI screens (identity, contacts, chat, etc.).
-leptos_router = "0.8.15"
 # QR encode (contact code -> SVG, for "Present QR code") and decode (camera
 # frame -> text, for "Scan QR code"). Both pure Rust, so they compile to the
 # same WASM on every platform — no per-device scanner plugin. Default

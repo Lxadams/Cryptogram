@@ -5,14 +5,13 @@
 //! serializable DTOs back.
 
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
-use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
 use client::{
-    derive_vault_key, hash_passcode, perform_handshake, ChatHistory, Client, ClientStateDto,
-    IdentityStateStore, TYPE_DATA,
+    derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
+    ChatHistory, Client, ClientStateDto, IdentityStateStore, RoutingToken,
 };
-use ed25519_dalek::VerifyingKey;
 use serde::Serialize;
 use std::{
+    collections::HashSet,
     fs::{self, File, TryLockError},
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -111,6 +110,12 @@ fn try_acquire_session_lock(lock_path: &Path) -> Result<File, String> {
         }
         Err(TryLockError::Error(e)) => Err(e.to_string()),
     }
+}
+
+/// `client::parse_routing_token` with the `String` error every command here
+/// returns.
+fn parse_token(token_hex: &str) -> Result<RoutingToken, String> {
+    parse_routing_token(token_hex).map_err(|e| e.to_string())
 }
 
 /// The relay (server) this prototype talks to. Defaults to the CLI's own
@@ -313,7 +318,19 @@ fn load_or_migrate_identity_state(
 ) -> Result<Client, String> {
     let store = IdentityStateStore::open(state_path, vault_key).map_err(|e| e.to_string())?;
 
-    if let Ok(mut client) = store.load(&state_path.to_string_lossy()) {
+    // A load *error* (as opposed to `None`, nothing saved yet) is surfaced
+    // rather than falling through to `Client::new` below — `bootstrap` saves
+    // right after this, so falling through would silently overwrite the
+    // user's real identity with a brand-new one.
+    let loaded = store
+        .load(&state_path.to_string_lossy())
+        .map_err(|e| format!("Couldn't load this identity's saved state: {e:#}"))?;
+    if let Some(mut client) = loaded {
+        // The relay address comes from this launch (`SERVER_ADDR`), not
+        // from whatever was saved when the identity was created —
+        // otherwise an identity first used against a local relay could
+        // never be pointed at a deployed one.
+        client.server_addr = server_addr;
         client.identity_store = Some(store);
         return Ok(client);
     }
@@ -328,6 +345,7 @@ fn load_or_migrate_identity_state(
     } else {
         Client::new(server_addr)
     };
+    client.server_addr = server_addr;
     client.state_path = state_path.to_string_lossy().into_owned();
     client.identity_store = Some(store);
     Ok(client)
@@ -592,6 +610,29 @@ mod tests {
     }
 
     #[test]
+    fn test_load_or_migrate_uses_this_launchs_relay_address_not_the_saved_one() {
+        let root = scratch_dir("relay_address_override");
+        resolve_create_identity(&root, "alice", "hunter2").unwrap();
+        let LoginResolution::Success {
+            state_path,
+            vault_key,
+            ..
+        } = resolve_login(&root, "alice", "hunter2").unwrap()
+        else {
+            panic!("expected a successful login");
+        };
+
+        // Created (and saved) against a local relay...
+        let first = load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        first.save();
+
+        // ...then relaunched pointing at a deployed one.
+        let deployed: SocketAddr = "3.25.64.73:443".parse().unwrap();
+        let second = load_or_migrate_identity_state(&state_path, &vault_key, deployed).unwrap();
+        assert_eq!(second.server_addr, deployed);
+    }
+
+    #[test]
     fn test_load_or_migrate_upgrades_legacy_plaintext_state_and_deletes_it() {
         let root = scratch_dir("migrate_legacy");
         resolve_create_identity(&root, "alice", "hunter2").unwrap();
@@ -644,8 +685,8 @@ pub struct ContactDto {
     /// "established" once the PQXDH session handshake completed, otherwise
     /// "pending" (KeyExchange sent/received, waiting on SessionEstablish).
     pub status: String,
-    /// Locally-entered display name for this contact, if one was given
-    /// when adding them (see `connect_to_peer`'s `name` argument).
+    /// The display name this contact chose for themselves, learned from
+    /// their KeyExchange (see `Client::contact_names`), if they set one.
     pub name: Option<String>,
     /// True if we've heard a presence ping or chat message from this
     /// contact within `PRESENCE_FRESHNESS`. Always false for a merely
@@ -691,13 +732,8 @@ pub async fn bootstrap(
     state: State<'_, AppState>,
     server_pubkey_hex: String,
 ) -> Result<IdentityDto, String> {
-    let server_pub_bytes = hex::decode(server_pubkey_hex.trim())
-        .map_err(|_| "Server public key must be hex".to_string())?;
-    let arr: [u8; 32] = server_pub_bytes
-        .try_into()
-        .map_err(|_| "Server public key must be 32 bytes (64 hex chars)".to_string())?;
     let server_pub =
-        VerifyingKey::from_bytes(&arr).map_err(|_| "Invalid server public key".to_string())?;
+        parse_verifying_key(&server_pubkey_hex).map_err(|e| format!("Server public key: {e}"))?;
 
     let server_addr_raw = server_addr_raw();
     let server_addr: SocketAddr = tokio::net::lookup_host(&server_addr_raw)
@@ -868,51 +904,29 @@ fn spawn_receive_loop(
         let state = app.state::<AppState>();
         let mut buf = [0u8; 4096];
         loop {
-            let (len, _addr) = match socket.recv_from(&mut buf).await {
-                Ok(v) => v,
-                Err(_) => continue,
+            let len = match socket.recv_from(&mut buf).await {
+                Ok((len, _addr)) => len,
+                // Back off briefly rather than spinning a core if the
+                // socket keeps erroring (e.g. repeated ICMP "port
+                // unreachable" resets on some platforms).
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             };
-            if len < 1 + 4 + 24 + 16 || buf[0] != TYPE_DATA {
-                continue;
-            }
 
             let mut guard = state.runtime.lock().await;
             let Some(rt) = guard.as_mut() else {
                 continue;
             };
-
-            let mut session_id = [0u8; 4];
-            session_id.copy_from_slice(&buf[1..5]);
-            if session_id != rt.client.session_id {
-                continue;
-            }
-
-            let mut nonce_bytes = [0u8; 24];
-            nonce_bytes.copy_from_slice(&buf[5..29]);
-            let link_nonce = XNonce::from_slice(&nonce_bytes);
-            let ciphertext = &buf[29..len];
-            let link_cipher = XChaCha20Poly1305::new(Key::from_slice(&rt.client.link_master_key));
-
-            let Ok(decrypted) = link_cipher.decrypt(link_nonce, ciphertext) else {
+            let Some(e2e_payload) = rt.client.open_link_packet(&buf[..len]) else {
                 continue;
             };
-            if decrypted.len() < 16 {
-                continue;
-            }
-
-            let e2e_payload = &decrypted[16..];
-            if let Ok(Some(reply)) = rt.client.handle_incoming_packet(e2e_payload) {
+            if let Ok(Some(reply)) = rt.client.handle_incoming_packet(&e2e_payload) {
                 let _ = socket.send_to(&reply, rt.client.server_addr).await;
             }
         }
     })
-}
-
-#[tauri::command(rename_all = "snake_case")]
-pub async fn get_identity(state: State<'_, AppState>) -> Result<IdentityDto, String> {
-    let guard = state.runtime.lock().await;
-    let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
-    Ok(identity_dto(&rt.client))
 }
 
 /// Union of `pending_contacts` (KeyExchange in flight) and `e2e_sessions`
@@ -923,33 +937,32 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
     let guard = state.runtime.lock().await;
     let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
 
-    let mut contacts: Vec<ContactDto> = rt
-        .client
+    let client = &rt.client;
+    let tokens: HashSet<&RoutingToken> = client
         .pending_contacts
         .keys()
-        .map(|token| ContactDto {
-            token: hex::encode(token),
-            status: "pending".to_string(),
-            name: rt.client.contact_names.get(token).cloned(),
-            online: false,
+        .chain(client.e2e_sessions.keys())
+        .collect();
+    let mut contacts: Vec<ContactDto> = tokens
+        .into_iter()
+        .map(|token| {
+            let established = client.e2e_sessions.contains_key(token);
+            ContactDto {
+                token: hex::encode(token),
+                status: if established {
+                    "established"
+                } else {
+                    "pending"
+                }
+                .to_string(),
+                name: client.contact_names.get(token).cloned(),
+                online: established && client.is_online(token, PRESENCE_FRESHNESS),
+            }
         })
         .collect();
-
-    for token in rt.client.e2e_sessions.keys() {
-        let token_hex = hex::encode(token);
-        let online = rt.client.is_online(token, PRESENCE_FRESHNESS);
-        if let Some(existing) = contacts.iter_mut().find(|c| c.token == token_hex) {
-            existing.status = "established".to_string();
-            existing.online = online;
-        } else {
-            contacts.push(ContactDto {
-                token: token_hex,
-                status: "established".to_string(),
-                name: rt.client.contact_names.get(token).cloned(),
-                online,
-            });
-        }
-    }
+    // A stable order (by name, then token) so the list doesn't reshuffle
+    // between polls — hash-map iteration order is arbitrary.
+    contacts.sort_by(|a, b| (&a.name, &a.token).cmp(&(&b.name, &b.token)));
 
     Ok(contacts)
 }
@@ -967,17 +980,9 @@ pub async fn connect_to_peer(
     let mut guard = state.runtime.lock().await;
     let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
 
-    let token_bytes = hex::decode(token_hex.trim()).map_err(|_| "Bad token hex".to_string())?;
-    let token: [u8; 16] = token_bytes
-        .try_into()
-        .map_err(|_| "Routing token must be 16 bytes".to_string())?;
+    let token = parse_token(&token_hex)?;
 
-    let ed_bytes = hex::decode(ed25519_hex.trim()).map_err(|_| "Bad key hex".to_string())?;
-    let ed_arr: [u8; 32] = ed_bytes
-        .try_into()
-        .map_err(|_| "Ed25519 key must be 32 bytes".to_string())?;
-    let peer_ed25519 =
-        VerifyingKey::from_bytes(&ed_arr).map_err(|_| "Invalid Ed25519 key".to_string())?;
+    let peer_ed25519 = parse_verifying_key(&ed25519_hex).map_err(|e| e.to_string())?;
 
     rt.client.pending_contacts.insert(token, peer_ed25519);
     let req_packet = rt.client.create_kx_request(token);
@@ -1000,10 +1005,7 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
     let mut guard = state.runtime.lock().await;
     let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
 
-    let token_bytes = hex::decode(token_hex.trim()).map_err(|_| "Bad token hex".to_string())?;
-    let token: [u8; 16] = token_bytes
-        .try_into()
-        .map_err(|_| "Routing token must be 16 bytes".to_string())?;
+    let token = parse_token(&token_hex)?;
 
     rt.client.forget_contact(token);
     Ok(())
@@ -1027,10 +1029,7 @@ pub async fn send_message(
     let mut guard = state.runtime.lock().await;
     let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
 
-    let token_bytes = hex::decode(token_hex.trim()).map_err(|_| "Bad token hex".to_string())?;
-    let token: [u8; 16] = token_bytes
-        .try_into()
-        .map_err(|_| "Routing token must be 16 bytes".to_string())?;
+    let token = parse_token(&token_hex)?;
 
     let (msg_packet, pq_inject_packet) = rt
         .client
@@ -1088,13 +1087,10 @@ pub async fn chat_history(
     token_hex: String,
     limit: i64,
 ) -> Result<Vec<StoredMessageDto>, String> {
-    let mut guard = state.runtime.lock().await;
-    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    let guard = state.runtime.lock().await;
+    let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
 
-    let token_bytes = hex::decode(token_hex.trim()).map_err(|_| "Bad token hex".to_string())?;
-    let token: [u8; 16] = token_bytes
-        .try_into()
-        .map_err(|_| "Routing token must be 16 bytes".to_string())?;
+    let token = parse_token(&token_hex)?;
 
     Ok(rt
         .client

@@ -7,3 +7,6 @@
 # — kept ignored in case a stray copy from that earlier behavior reappears.
 /code/frontend/identities/
 /code/frontend/src-tauri/identities/
+
+# Stray npm installs (nothing in this repo uses npm)
+node_modules/

@@ -12,12 +12,13 @@
 // split keeps one implementation of the protocol logic instead of forking
 // it between two front ends.
 use anyhow::{Result, anyhow};
-use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-use ed25519_dalek::VerifyingKey;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{io::AsyncBufReadExt, net::UdpSocket, sync::Mutex};
 
-use client::{Client, ClientStateDto, TYPE_DATA, perform_handshake, state_file_path};
+use client::{
+    Client, ClientStateDto, parse_routing_token, parse_verifying_key, perform_handshake,
+    state_file_path,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,19 +33,8 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let server_pub_hex = &args[1];
-    let server_pub_bytes =
-        hex::decode(server_pub_hex).map_err(|_| anyhow!("Invalid hex for server pubkey"))?;
-    if server_pub_bytes.len() != 32 {
-        return Err(anyhow!(
-            "Server Ed25519 pubkey must be 32 bytes (64 hex chars), got {} bytes",
-            server_pub_bytes.len()
-        ));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&server_pub_bytes);
     let server_pub =
-        VerifyingKey::from_bytes(&arr).map_err(|_| anyhow!("Invalid server verifying key"))?;
+        parse_verifying_key(&args[1]).map_err(|e| anyhow!("Invalid server pubkey: {e}"))?;
 
     // Defaults to 127.0.0.1:4430 to match the server's local-dev default.
     // Override with SERVER_ADDR (e.g. "server:443" when running in Docker
@@ -102,30 +92,11 @@ async fn main() -> Result<()> {
         let mut buf = [0u8; 4096];
         loop {
             if let Ok((len, _)) = socket_clone.recv_from(&mut buf).await {
-                if len < 1 + 4 + 24 + 16 || buf[0] != TYPE_DATA {
-                    continue;
-                }
-
-                let mut session_id = [0u8; 4];
-                session_id.copy_from_slice(&buf[1..5]);
-
                 let mut c = client_clone.lock().await;
-                if session_id != c.session_id {
-                    continue;
-                }
-
-                let mut nonce_bytes = [0u8; 24];
-                nonce_bytes.copy_from_slice(&buf[5..29]);
-                let link_nonce = XNonce::from_slice(&nonce_bytes);
-                let ciphertext = &buf[29..len];
-                let link_cipher = XChaCha20Poly1305::new(Key::from_slice(&c.link_master_key));
-                if let Ok(decrypted) = link_cipher.decrypt(link_nonce, ciphertext)
-                    && decrypted.len() >= 16
+                if let Some(e2e_payload) = c.open_link_packet(&buf[..len])
+                    && let Ok(Some(reply)) = c.handle_incoming_packet(&e2e_payload)
                 {
-                    let e2e_payload = &decrypted[16..];
-                    if let Ok(Some(reply)) = c.handle_incoming_packet(e2e_payload) {
-                        let _ = socket_clone.send_to(&reply, c.server_addr).await;
-                    }
+                    let _ = socket_clone.send_to(&reply, c.server_addr).await;
                 }
             }
         }
@@ -150,13 +121,14 @@ async fn main() -> Result<()> {
                     println!("Usage: connect <token> <ed25519>");
                     continue;
                 }
-                let token_bytes = hex::decode(parts[1]).unwrap();
-                let mut token = [0u8; 16];
-                token.copy_from_slice(&token_bytes);
-                let ed25519_bytes = hex::decode(parts[2]).unwrap();
-                let mut ed_arr = [0u8; 32];
-                ed_arr.copy_from_slice(&ed25519_bytes);
-                let bob_ed25519 = VerifyingKey::from_bytes(&ed_arr).unwrap();
+                let (token, bob_ed25519) =
+                    match (parse_routing_token(parts[1]), parse_verifying_key(parts[2])) {
+                        (Ok(token), Ok(key)) => (token, key),
+                        (Err(e), _) | (_, Err(e)) => {
+                            println!("Error: {e}");
+                            continue;
+                        }
+                    };
                 let mut c = client.lock().await;
                 // Trust is asserted here from the (assumed) QR-scanned key;
                 // the reply's signature is checked against this on receipt.
@@ -170,9 +142,13 @@ async fn main() -> Result<()> {
                     println!("Usage: msg <token> <text...>");
                     continue;
                 }
-                let token_bytes = hex::decode(parts[1]).unwrap();
-                let mut token = [0u8; 16];
-                token.copy_from_slice(&token_bytes);
+                let token = match parse_routing_token(parts[1]) {
+                    Ok(token) => token,
+                    Err(e) => {
+                        println!("Error: {e}");
+                        continue;
+                    }
+                };
                 let text = parts[2..].join(" ");
                 let mut c = client.lock().await;
                 match c.create_encrypted_packet(token, text.as_bytes()) {

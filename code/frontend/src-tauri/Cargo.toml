@@ -20,7 +20,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
@@ -32,8 +31,6 @@ tauri-plugin-log = "2"
 # transport.
 client = { path = "../../client" }
 tokio = { version = "1", features = ["net", "sync", "rt-multi-thread", "macros"] }
-ed25519-dalek = "3.0.0"
-chacha20poly1305 = "0.10.1"
 hex = "0.4.3"
 zeroize = "1"
 

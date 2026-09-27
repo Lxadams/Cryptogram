@@ -121,6 +121,30 @@ fn apply_theme(theme: Theme) {
     }
 }
 
+/// Bin icon for destructive icon buttons (delete identity, remove contact).
+#[component]
+fn TrashIcon() -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 4.5h10" />
+            <path d="M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5" />
+            <path d="M4.5 4.5l.6 8a1 1 0 0 0 1 .9h3.8a1 1 0 0 0 1-.9l.6-8" />
+        </svg>
+    }
+}
+
+/// Clears a polling interval when the component that started it unmounts.
+/// A `set_interval` otherwise outlives its screen: after logging in, the
+/// Login screen's poll kept firing against disposed signals (panicking), and
+/// after a logout/login cycle a stale Main screen's poll kept draining
+/// `poll_inbox`, so new messages went to the dead screen instead of the
+/// live one.
+fn stop_on_cleanup(handle: Result<IntervalHandle, wasm_bindgen::JsValue>) {
+    if let Ok(handle) = handle {
+        on_cleanup(move || handle.clear());
+    }
+}
+
 fn copy_to_clipboard(text: &str) {
     // Fire-and-forget: `write_text` returns a Promise that the browser/webview
     // runs regardless of whether we await it from Rust, and there's nothing
@@ -348,7 +372,12 @@ fn LoginScreen(
     let refresh_known = move || {
         leptos::task::spawn_local(async move {
             if let Ok(list) = api::list_pseudonyms().await {
-                let selected = selected_existing.get_untracked();
+                // `try_`: a fetch already in flight when this screen closes
+                // (e.g. on a successful login) resolves after its signals
+                // are disposed, and a plain `get_untracked` would panic.
+                let Some(selected) = selected_existing.try_get_untracked() else {
+                    return;
+                };
                 if !selected.is_empty() && !list.contains(&selected) {
                     if pseudonym_input.get_untracked() == selected {
                         pseudonym_input.set(String::new());
@@ -356,12 +385,17 @@ fn LoginScreen(
                     selected_existing.set(String::new());
                     delete_confirm.set(None);
                 }
-                known.set(list);
+                if known.with_untracked(|current| current != &list) {
+                    known.set(list);
+                }
             }
         });
     };
     refresh_known();
-    let _known_refresh = set_interval_with_handle(refresh_known, Duration::from_millis(1000));
+    stop_on_cleanup(set_interval_with_handle(
+        refresh_known,
+        Duration::from_millis(1000),
+    ));
 
     let go_to_create_identity = move || {
         let typed = pseudonym_input.get();
@@ -476,11 +510,7 @@ fn LoginScreen(
                                             title="Delete this identity"
                                             on:click=move |_| delete_confirm.set(Some(trash_name.clone()))
                                         >
-                                            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
-                                                <path d="M3 4.5h10" />
-                                                <path d="M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5" />
-                                                <path d="M4.5 4.5l.6 8a1 1 0 0 0 1 .9h3.8a1 1 0 0 0 1-.9l.6-8" />
-                                            </svg>
+                                            <TrashIcon />
                                         </button>
                                     }.into_any()
                                 }
@@ -699,8 +729,7 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                 // live in the list.
                 messages.update(|map| {
                     let existing = map.entry(token.clone()).or_default();
-                    let existing_ids: std::collections::HashSet<u64> =
-                        existing.iter().map(|m| m.id).collect();
+                    let existing_ids: HashSet<u64> = existing.iter().map(|m| m.id).collect();
                     let mut combined: Vec<ChatMessage> = history
                         .into_iter()
                         .map(|m| ChatMessage {
@@ -725,7 +754,13 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     // a push/event channel — see poll_inbox's doc comment in commands.rs.
     let refresh = move || {
         leptos::task::spawn_local(async move {
-            if let Ok(list) = api::list_contacts().await {
+            // Only notify when something actually changed: this runs every
+            // second, and every `set` re-runs everything that reads
+            // `contacts`. `try_`: the response can land after this screen
+            // has unmounted.
+            if let Ok(list) = api::list_contacts().await
+                && contacts.try_with_untracked(|current| current != &list) == Some(true)
+            {
                 contacts.set(list);
             }
             if let Ok(incoming) = api::poll_inbox().await
@@ -756,7 +791,10 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         });
     };
     refresh();
-    let _interval = set_interval_with_handle(refresh, Duration::from_millis(1000));
+    stop_on_cleanup(set_interval_with_handle(
+        refresh,
+        Duration::from_millis(1000),
+    ));
 
     view! {
         <section class="main-screen">
@@ -1020,11 +1058,7 @@ fn ContactPanel(
                                                     remove_confirm.set(Some(remove_click.clone()));
                                                 }
                                             >
-                                                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
-                                                    <path d="M3 4.5h10" />
-                                                    <path d="M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5" />
-                                                    <path d="M4.5 4.5l.6 8a1 1 0 0 0 1 .9h3.8a1 1 0 0 0 1-.9l.6-8" />
-                                                </svg>
+                                                <TrashIcon />
                                             </button>
                                         }.into_any()
                                     }

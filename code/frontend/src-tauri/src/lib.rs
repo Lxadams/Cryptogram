@@ -18,7 +18,6 @@ pub fn run() {
             commands::delete_identity,
             commands::list_pseudonyms,
             commands::bootstrap,
-            commands::get_identity,
             commands::list_contacts,
             commands::connect_to_peer,
             commands::remove_contact,

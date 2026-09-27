@@ -152,11 +152,6 @@ pub async fn bootstrap(server_pubkey_hex: &str) -> Result<IdentityDto, String> {
     call("bootstrap", &BootstrapArgs { server_pubkey_hex }).await
 }
 
-// Note: the backend also exposes a `get_identity` command (re-fetches
-// identity without redoing the handshake), but nothing in this UI calls it
-// yet — the identity returned by `bootstrap` above is all `App` currently
-// needs, so no wrapper is defined here until something actually needs it.
-
 pub async fn list_contacts() -> Result<Vec<ContactDto>, String> {
     call("list_contacts", &()).await
 }

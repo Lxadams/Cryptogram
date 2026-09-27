@@ -12,4 +12,3 @@ run_rust_checks() {
 }
 
 run_rust_checks "code/server"
-run_rust_checks "code/utils"

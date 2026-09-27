@@ -25,7 +25,6 @@ jobs:
         # Add all your subfolder paths containing a Cargo.toml here
         project-path:
           - "code/server"
-          - "code/utils"
           - "code/client"
           - "code/frontend"
           - "code/frontend/src-tauri"
