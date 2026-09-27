@@ -13,10 +13,31 @@ js-sys = "0.3.103"
 leptos = { version = "0.8.20", features = ["csr"] }
 # Client-side routing between UI screens (identity, contacts, chat, etc.).
 leptos_router = "0.8.15"
+# QR encode (contact code -> SVG, for "Present QR code") and decode (camera
+# frame -> text, for "Scan QR code"). Both pure Rust, so they compile to the
+# same WASM on every platform — no per-device scanner plugin. Default
+# features off: they only pull in the `image` crate, which we don't need.
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+rqrr = { version = "0.11.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde-wasm-bindgen = "0.6.5"
 # Low-level JS interop, needed once we bridge to Tauri's `invoke()` (Option
 # B integration — see documentations/tech-decision-leptos-client.md).
 wasm-bindgen = "0.2.126"
 wasm-bindgen-futures = "0.4.76"
-web-sys = { version = "0.3.103", features = ["Storage", "MediaQueryList", "Navigator", "Clipboard"] }
+web-sys = { version = "0.3.103", features = [
+    "Storage",
+    "MediaQueryList",
+    "Navigator",
+    "Clipboard",
+    # Camera access for the QR scanner (see src/qr.rs).
+    "MediaDevices",
+    "MediaStream",
+    "MediaStreamTrack",
+    "MediaStreamConstraints",
+    "HtmlVideoElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "ContextAttributes2d",
+    "ImageData",
+] }

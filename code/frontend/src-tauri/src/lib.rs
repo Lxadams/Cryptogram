@@ -2,6 +2,8 @@ mod commands;
 mod state;
 
 use state::AppState;
+#[cfg(target_os = "linux")]
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -32,8 +34,42 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            #[cfg(target_os = "linux")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.with_webview(enable_camera_for_qr_scanner)?;
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Lets the frontend's QR scanner (src/qr.rs) use the camera on Linux.
+/// WebKitGTK has `getUserMedia` switched off by default and denies any
+/// permission request nobody handles; the other platforms' webviews need
+/// no code here (Android/iOS/macOS just need a camera permission in their
+/// app manifests, Windows prompts the user itself). Only video-only
+/// requests are allowed, since the app never asks for the microphone.
+#[cfg(target_os = "linux")]
+fn enable_camera_for_qr_scanner(webview: tauri::webview::PlatformWebview) {
+    use webkit2gtk::glib::object::Cast;
+    use webkit2gtk::{
+        PermissionRequestExt, SettingsExt, UserMediaPermissionRequest,
+        UserMediaPermissionRequestExt, WebViewExt,
+    };
+
+    let view = webview.inner();
+    if let Some(settings) = WebViewExt::settings(&view) {
+        settings.set_enable_media_stream(true);
+    }
+    view.connect_permission_request(|_, request| {
+        match request.downcast_ref::<UserMediaPermissionRequest>() {
+            Some(media) if media.is_for_video_device() && !media.is_for_audio_device() => {
+                request.allow();
+                true
+            }
+            // `false` = not handled here, so WebKit falls back to denying.
+            _ => false,
+        }
+    });
 }

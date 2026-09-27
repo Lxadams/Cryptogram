@@ -14,7 +14,8 @@
 //! rather than a router or global store — deliberately simple for a
 //! prototype with three screens.
 
-use crate::api;
+use crate::qr::QrScanner;
+use crate::{api, contact_code, qr};
 use leptos::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -769,20 +770,28 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
 }
 
 /// Our own identity — what a peer needs (routing token + Ed25519 key) to
-/// add us as a contact. In a real build this would render as a QR code
-/// (see documentations/doable-cryptographic-flow.md, Micro-QR); this
-/// prototype just shows the hex so it can be copy-pasted between two
-/// running instances during local testing. `name` (chosen on the login
-/// screen) is shown here for your own reference only — it's sent
+/// add us as a contact, shown both as hex (to copy-paste) and, via
+/// "Present QR code", as a QR code of the same two values for a peer's
+/// "Scan QR code" (see contact_code.rs for the payload). `name` (chosen on
+/// the login screen) is shown here for your own reference only — it's sent
 /// automatically as part of the KeyExchange once you connect to someone,
 /// so peers see "alice" in their contact list without typing anything
 /// themselves (see `Client::local_name` / `contact_names` in
 /// code/client/src/lib.rs).
 #[component]
 fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
+    let show_qr = RwSignal::new(false);
+    let code = contact_code::encode(&identity.routing_token, &identity.ed25519_public);
+    let qr_svg = StoredValue::new(qr::svg_for(&code));
+
     view! {
         <div class="identity-card">
-            <h2>"Your Identity"</h2>
+            <div class="identity-card-header">
+                <h2>"Your Identity"</h2>
+                <button type="button" on:click=move |_| show_qr.set(true)>
+                    "Present QR code"
+                </button>
+            </div>
             {identity.name.clone().map(|name| view! {
                 <p>
                     <strong>"Name: "</strong>
@@ -800,14 +809,54 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
                 <code>{identity.ed25519_public.clone()}</code>
                 <CopyButton value=identity.ed25519_public />
             </p>
+            <Show when=move || show_qr.get()>
+                <Modal title="Your QR code" on_close=Callback::new(move |()| show_qr.set(false))>
+                    {match qr_svg.get_value() {
+                        Ok(svg) => view! { <div class="qr-code" inner_html=svg></div> }.into_any(),
+                        Err(e) => view! { <p class="error">"Couldn't draw QR code: " {e}</p> }.into_any(),
+                    }}
+                    <p class="hint">
+                        "Have your contact tap \"Scan QR code\" and point their camera here."
+                    </p>
+                </Modal>
+            </Show>
         </div>
     }
 }
 
-/// Contact list plus the "add a new contact" form. Adding a contact here
-/// is the manual-entry equivalent of scanning a peer's QR code: pasting in
-/// their routing token + Ed25519 key is exactly the trust anchor the QR
-/// scan would establish (see KeyExchangePayload::verify in packets.rs).
+/// Centered dialog over a dimmed backdrop. Closes on the X button, a click
+/// on the backdrop, or Escape.
+#[component]
+fn Modal(title: &'static str, on_close: Callback<()>, children: Children) -> impl IntoView {
+    let escape = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" {
+            on_close.run(());
+        }
+    });
+    on_cleanup(move || escape.remove());
+
+    view! {
+        <div class="modal-backdrop" on:click=move |_| on_close.run(())>
+            <div class="modal" role="dialog" on:click=|ev| ev.stop_propagation()>
+                <div class="modal-header">
+                    <h3>{title}</h3>
+                    <button type="button" class="icon-btn" title="Close" on:click=move |_| on_close.run(())>
+                        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                            <path d="M4 4l8 8M12 4l-8 8" />
+                        </svg>
+                    </button>
+                </div>
+                {children()}
+            </div>
+        </div>
+    }
+}
+
+/// Contact list plus the two ways to add a contact: "Scan QR code" (reads
+/// a peer's presented QR with the camera) or pasting their routing token +
+/// Ed25519 key by hand as a fallback. Both end in the same
+/// `connect_to_peer` call with the same two values, so both establish the
+/// same trust anchor (see KeyExchangePayload::verify in packets.rs).
 #[component]
 fn ContactPanel(
     contacts: RwSignal<Vec<api::ContactDto>>,
@@ -822,6 +871,22 @@ fn ContactPanel(
     // screen's identity delete. `None` means no confirm is open.
     let remove_confirm = RwSignal::new(None::<String>);
     let remove_busy = RwSignal::new(false);
+    let scanning = RwSignal::new(false);
+
+    // Runs for every QR code the scanner decodes. Anything that isn't a
+    // contact code goes back to the scanner as an error so it keeps
+    // looking; a valid one closes the scanner and sends the request.
+    let on_scan = Callback::new(move |raw: String| {
+        let code = contact_code::parse(&raw)?;
+        scanning.set(false);
+        error.set(None);
+        leptos::task::spawn_local(async move {
+            if let Err(e) = api::connect_to_peer(&code.token_hex, &code.ed25519_hex).await {
+                error.set(Some(e));
+            }
+        });
+        Ok(())
+    });
 
     let on_add = move |_| {
         let token = token_input.get();
@@ -971,6 +1036,10 @@ fn ContactPanel(
             </ul>
 
             <h3>"Add contact"</h3>
+            <button type="button" class="scan-btn" on:click=move |_| scanning.set(true)>
+                "Scan QR code"
+            </button>
+            <p class="hint">"Or enter their details manually:"</p>
             <input
                 type="text"
                 placeholder="their routing token (hex)"
@@ -985,6 +1054,11 @@ fn ContactPanel(
             />
             <button on:click=on_add>"Send Connection Request"</button>
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+            <Show when=move || scanning.get()>
+                <Modal title="Scan QR code" on_close=Callback::new(move |()| scanning.set(false))>
+                    <QrScanner on_scan=on_scan />
+                </Modal>
+            </Show>
         </div>
     }
 }
