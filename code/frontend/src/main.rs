@@ -6,6 +6,8 @@
 // JS runtime to actually be present to succeed.
 mod api;
 mod app;
+mod contact_code;
+mod qr;
 
 fn main() {
     // Turns WASM panics into readable browser-console stack traces instead
