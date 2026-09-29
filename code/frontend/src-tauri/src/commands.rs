@@ -1011,9 +1011,10 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
     Ok(())
 }
 
-/// Encrypt and send an E2E message to an already-established session. Also
-/// sends a PQ ratchet-injection packet alongside, transparently, whenever
-/// `create_encrypted_packet` produces one (every 5th message).
+/// Encrypt and send an E2E message to an already-established session — as
+/// several chunk packets if it's long — followed by a PQ ratchet-injection
+/// packet whenever `create_encrypted_packets` produces one (roughly every 5th
+/// packet). Messages over the client's length limit come back as an error.
 ///
 /// Returns the message's local chat-history row id (`None` if no history is
 /// attached), so the frontend can label its own optimistic display of this
@@ -1031,20 +1032,16 @@ pub async fn send_message(
 
     let token = parse_token(&token_hex)?;
 
-    let (msg_packet, pq_inject_packet) = rt
+    let (msg_packets, pq_inject_packet) = rt
         .client
-        .create_encrypted_packet(token, text.as_bytes())
+        .create_encrypted_packets(token, text.as_bytes())
         .map_err(|e| e.to_string())?;
     let history_id = rt.client.last_recorded_id;
 
-    rt.socket
-        .send_to(&msg_packet, rt.client.server_addr)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if let Some(pq_pkt) = pq_inject_packet {
+    // In this order: the PQ inject must follow the message's last chunk.
+    for packet in msg_packets.iter().chain(&pq_inject_packet) {
         rt.socket
-            .send_to(&pq_pkt, rt.client.server_addr)
+            .send_to(packet, rt.client.server_addr)
             .await
             .map_err(|e| e.to_string())?;
     }

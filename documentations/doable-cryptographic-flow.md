@@ -63,8 +63,9 @@ Once the session is bootstrapped, ongoing messaging uses a **Symmetric Hash Ratc
     *   `NextSendChainKey = HMAC-SHA256(SendChainKey, "chain-key")` (and similarly for `RecvChainKey` on decryption).
     *   The old Chain Key is destroyed, but unused Message Keys are temporarily stored in a **Skip Dictionary** (up to 100 keys ahead) to handle out-of-order delivery gracefully.
 2.  **Message Encryption**: The plaintext is encrypted with `XChaCha20-Poly1305` using the Message Key. A fresh 24-byte random nonce is generated per message. The sender's 8-byte sequence number (`seq_no`) is included in the E2E payload structure.
-3.  **Periodic KEM Injection (PQ Ratchet)**: To provide continuous Post-Quantum secrecy without full session resets, a new Kyber encapsulation is performed against the peer's stored Kyber public key every 5 messages. The new PQ shared secret is mixed independently into the respective Chain Key via HKDF. The Kyber ciphertext is sent as a `0x05 PQInjectPayload` (1192 bytes).
-4.  **Packet Structure**: `[0x01 | 16-byte SenderToken | 8-byte SeqNo | 24-byte Nonce | E2E Ciphertext]`, wrapped in link encryption. The 16-byte `SenderToken` enables O(1) direct session lookup, preventing speculative ratchet corruption.
+    *   **Chunking & padding**: before encryption, a message is split into chunks of up to 1011 bytes (`[kind | 8-byte message id | index | count | data]`, at most 16 chunks, so messages up to 16,176 bytes), and each chunk is padded to a fixed 1024-byte block (`[2-byte length | chunk | zeros]`). Each chunk is its own ratcheted message, so every chat packet is exactly 1150 bytes on the wire — under the 1232-byte UDP payload that avoids IP fragmentation on any path — and neither the relay nor a network observer can read a message's length beyond its chunk count. The receiver reassembles chunks (in any order) before anything reaches the inbox or chat history; incomplete messages are dropped after 5 minutes.
+3.  **Periodic KEM Injection (PQ Ratchet)**: To provide continuous Post-Quantum secrecy without full session resets, a new Kyber encapsulation is performed against the peer's stored Kyber public key every 5 messages (counted in ratchet steps, i.e. chunks; checked once per message, so the inject is always sent after a message's last chunk and never between two). The new PQ shared secret is mixed independently into the respective Chain Key via HKDF. The Kyber ciphertext is sent as a `0x05 PQInjectPayload` (1192 bytes).
+4.  **Packet Structure**: `[0x01 | 16-byte SenderToken | 8-byte SeqNo | 24-byte Nonce | E2E Ciphertext of one padded chunk]`, wrapped in link encryption. The 16-byte `SenderToken` enables O(1) direct session lookup, preventing speculative ratchet corruption.
 5.  **Decryption**: The receiver extracts the `SenderToken` to locate the correct session, then uses the `seq_no`. If it's a previously skipped message, it retrieves the key from the Skip Dictionary. If it's a future message, it fast-forwards the `recv_chain_key` (up to 100 steps) and stores the intermediate skipped keys.
 
 ---
@@ -124,6 +125,9 @@ Raw UDP Datagram
         ├── [1 byte] Inner Type (0x01=Msg, 0x02=KeyExchange, 0x04=SessionEstablish, 0x05=PQInject)
         └── Type-specific payload (E2E encrypted or signed)
             ├── Msg (0x01): [16 bytes SenderToken] + [8 bytes SeqNo] + [24 bytes Nonce] + [Ciphertext]
+            │   └── Ciphertext decrypts to a 1024-byte padded block:
+            │       [2 bytes Length] + [Chunk] + [Zeros]
+            │       Chunk = [1 byte Kind] + [8 bytes MessageId] + [1 byte Index] + [1 byte Count] + [≤1011 bytes Data]
 ```
 
 ---
@@ -196,6 +200,16 @@ Raw UDP Datagram
 | `test_pq_inject_no_trigger_without_kyber_key` | Asserts `PQInject` is not triggered if the peer's Kyber public key is missing from session state. |
 | `test_pq_inject_chain_sync` | Verifies that after a PQ injection, both sides' chain keys remain identical. |
 | `test_pq_inject_changes_chain_key` | Asserts that injecting PQ entropy actually changes the chain key from what a pure hash ratchet would produce. |
+
+#### Message Padding & Chunking
+| Test | Description |
+|---|---|
+| `test_chat_packets_are_fixed_size_and_unpadded_on_receive` | Sends messages from empty up to one full chunk. Every packet is 1150 bytes and Bob receives the original text. |
+| `test_long_message_split_and_reassembled_out_of_order` | Sends a 3-chunk message with an emoji straddling a chunk boundary, delivered in reverse. Nothing reaches the inbox until the last chunk; then the exact text does. |
+| `test_pq_inject_sent_once_after_last_chunk` | A 12-chunk message crossing three PQ intervals produces exactly one inject, after the last chunk; chain keys stay in sync and the next message decrypts. |
+| `test_oversized_message_rejected_without_advancing_ratchet` | A message one byte over the 16,176-byte limit is rejected with a "too long" error, leaving `send_count` and the chain key untouched. |
+| `test_unpadded_message_from_older_client_is_dropped` | An authentic but unpadded message (as a pre-padding client sends) is dropped; the ratchet stays in sync for the next message. |
+| `padding::tests::*`, `chunks::tests::*` | Pad/unpad round trips and rejection of malformed blocks; split sizes at chunk boundaries; reassembly in any order, duplicate chunks, malformed headers, inconsistent counts, expiry, and the per-sender cap on incomplete messages. |
 
 #### Full Integration & Attack Simulation
 | Test | Description |

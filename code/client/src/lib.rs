@@ -17,6 +17,7 @@ use zeroize::Zeroizing;
 
 pub mod packets;
 use packets::*;
+mod chunks;
 mod history;
 mod padding;
 mod storage;
@@ -27,8 +28,12 @@ pub use storage::{ClientStateDto, IdentityStateStore};
 type HmacSha256 = Hmac<Sha256>;
 pub type SessionId = [u8; 4];
 pub type RoutingToken = [u8; 16];
+/// What `Client::create_encrypted_packets` returns: a message's chunk
+/// packets, then an optional PQ inject packet to send after them.
+pub type OutgoingPackets = (Vec<Vec<u8>>, Option<Vec<u8>>);
 
-// PQ injection interval: inject fresh Kyber entropy every N messages
+// PQ injection interval: inject fresh Kyber entropy every N ratchet steps
+// (one per chunk; see `create_encrypted_packets`)
 const PQ_INJECT_INTERVAL: u64 = 5;
 
 // Maximum number of skipped message keys to retain
@@ -436,6 +441,9 @@ pub struct Client {
     /// message for two under two different synthetic ids. Not persisted;
     /// meaningful only in the instant after `record_message` runs.
     pub last_recorded_id: Option<i64>,
+    /// Chunks of long incoming messages still waiting on the rest (see
+    /// `chunks`). Live local state, not persisted, like `inbox`.
+    reassembler: chunks::Reassembler,
 }
 
 impl Client {
@@ -460,6 +468,7 @@ impl Client {
             history: None,
             identity_store: None,
             last_recorded_id: None,
+            reassembler: chunks::Reassembler::default(),
         }
     }
 
@@ -522,6 +531,7 @@ impl Client {
         self.peer_kyber_keys.remove(&token);
         self.contact_names.remove(&token);
         self.last_seen.remove(&token);
+        self.reassembler.forget(&token);
         self.save();
         if let Some(history) = &self.history
             && let Err(e) = history.delete_contact(token)
@@ -541,7 +551,7 @@ impl Client {
 
     /// Build a signed presence ping for `target_token` (see
     /// `PresencePayload`) and link-encrypt it for the relay, the same way
-    /// `create_encrypted_packet` does for a chat message. Deliberately
+    /// `create_encrypted_packets` does for a chat message. Deliberately
     /// outside the E2E double ratchet — see the doc comment on
     /// `PresencePayload` for why.
     pub fn generate_presence_packet(&self, target_token: RoutingToken) -> Vec<u8> {
@@ -706,45 +716,65 @@ impl Client {
         );
     }
 
-    /// Encrypt a message. Returns (message_packet, optional_pq_inject_packet).
-    /// Every PQ_INJECT_INTERVAL messages, a PQ inject packet is generated automatically.
+    /// Encrypt a message. Returns (message_packets, optional_pq_inject_packet);
+    /// send them in that order.
     ///
-    /// The plaintext is padded to a fixed size first (see `padding`), so every
-    /// chat packet is 1150 bytes on the wire. Messages over
-    /// `padding::MAX_MESSAGE_LEN` bytes are rejected before the ratchet moves.
-    pub fn create_encrypted_packet(
+    /// The message is split into chunks (see `chunks`), each padded to a
+    /// fixed size (see `padding`) and sent as its own ratcheted chat packet,
+    /// so every packet is 1150 bytes on the wire whatever the message
+    /// length. Messages over `chunks::MAX_MESSAGE_LEN` bytes are rejected
+    /// before the ratchet moves.
+    ///
+    /// Every PQ_INJECT_INTERVAL ratchet steps, a PQ inject packet is
+    /// generated automatically — checked once per message, not per chunk, so
+    /// it always follows the message's last chunk rather than landing between
+    /// two. The receiver mixes an inject into its chain the moment it arrives,
+    /// so one that overtook an earlier chunk would leave that chunk
+    /// undecryptable.
+    pub fn create_encrypted_packets(
         &mut self,
         target_token: RoutingToken,
         plaintext: &[u8],
-    ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
-        let padded = padding::pad(plaintext)?;
+    ) -> Result<OutgoingPackets> {
+        let padded_chunks = chunks::split(plaintext)?
+            .iter()
+            .map(|chunk| padding::pad(chunk))
+            .collect::<Result<Vec<_>>>()?;
 
-        // Phase 1: encrypt the message and check if PQ inject is needed (mutable borrow on session)
-        let (full_e2e_payload, pq_ct) = {
+        // Phase 1: encrypt each chunk and check if PQ inject is needed (mutable borrow on session)
+        let (e2e_payloads, pq_ct) = {
             let session = self
                 .e2e_sessions
                 .get_mut(&target_token)
                 .ok_or(anyhow!("No E2E session established!"))?;
+            let send_count_before = session.send_count;
 
-            let message_key = session.symmetric_ratchet();
-            let e2e_cipher = XChaCha20Poly1305::new(Key::from_slice(&message_key));
-            let mut e2e_nonce_bytes = [0u8; 24];
-            OsRng.fill_bytes(&mut e2e_nonce_bytes);
-            let e2e_nonce = XNonce::from_slice(&e2e_nonce_bytes);
+            let mut e2e_payloads = Vec::with_capacity(padded_chunks.len());
+            for padded in &padded_chunks {
+                let message_key = session.symmetric_ratchet();
+                let e2e_cipher = XChaCha20Poly1305::new(Key::from_slice(&message_key));
+                let mut e2e_nonce_bytes = [0u8; 24];
+                OsRng.fill_bytes(&mut e2e_nonce_bytes);
+                let e2e_nonce = XNonce::from_slice(&e2e_nonce_bytes);
 
-            let mut full_e2e_payload = vec![0x01];
-            full_e2e_payload.extend_from_slice(&self.identity.routing_token);
-            full_e2e_payload.extend_from_slice(&session.send_count.to_be_bytes());
-            full_e2e_payload.extend_from_slice(&e2e_nonce_bytes);
-            let e2e_ciphertext = e2e_cipher.encrypt(e2e_nonce, padded.as_slice()).unwrap();
-            full_e2e_payload.extend_from_slice(&e2e_ciphertext);
+                let mut full_e2e_payload = vec![0x01];
+                full_e2e_payload.extend_from_slice(&self.identity.routing_token);
+                full_e2e_payload.extend_from_slice(&session.send_count.to_be_bytes());
+                full_e2e_payload.extend_from_slice(&e2e_nonce_bytes);
+                let e2e_ciphertext = e2e_cipher.encrypt(e2e_nonce, padded.as_slice()).unwrap();
+                full_e2e_payload.extend_from_slice(&e2e_ciphertext);
 
-            session.send_count += 1;
+                session.send_count += 1;
+                e2e_payloads.push(full_e2e_payload);
+            }
             // The state is mutated, but save() needs immutable ref.
             // We'll call self.save() after the mutable borrow block.
 
-            // Check if PQ injection is needed
-            let pq_ct = if session.send_count % PQ_INJECT_INTERVAL == 0 {
+            // Check if PQ injection is needed: did this message's chunks
+            // take send_count past a multiple of PQ_INJECT_INTERVAL?
+            let crossed_interval =
+                send_count_before / PQ_INJECT_INTERVAL != session.send_count / PQ_INJECT_INTERVAL;
+            let pq_ct = if crossed_interval {
                 if let Some(ref peer_kyber) = session.peer_kyber_pub {
                     let (pq_secret, kyber_ct) = encapsulate(peer_kyber);
                     session.inject_pq_secret_send(pq_secret.as_bytes());
@@ -760,14 +790,17 @@ impl Client {
                 None
             };
 
-            (full_e2e_payload, pq_ct)
+            (e2e_payloads, pq_ct)
         };
         // mutable borrow on self.e2e_sessions released
         self.save();
         self.record_message(target_token, true, plaintext);
 
         // Phase 2: link-encrypt everything (immutable borrow on self)
-        let msg_packet = self.wrap_link_encryption(target_token, &full_e2e_payload);
+        let msg_packets = e2e_payloads
+            .iter()
+            .map(|payload| self.wrap_link_encryption(target_token, payload))
+            .collect();
 
         let pq_inject_packet = pq_ct.map(|kyber_ct| {
             let pqi_payload = PQInjectPayload::generate(&self.identity, target_token, kyber_ct);
@@ -776,7 +809,7 @@ impl Client {
             self.wrap_link_encryption(target_token, &inner)
         });
 
-        Ok((msg_packet, pq_inject_packet))
+        Ok((msg_packets, pq_inject_packet))
     }
 
     /// The checks every signed control payload (KeyExchange,
@@ -832,6 +865,7 @@ impl Client {
             0x01 => {
                 // Msg: [16-byte sender_token | 8-byte seq_no | 24-byte nonce |
                 //       ciphertext of a `padding::PADDED_LEN`-byte padded block]
+                // Each one carries one chunk of a message (see `chunks`).
                 if pkt_data.len() < 16 + 8 + 24 {
                     return Err(anyhow!("Msg payload too small"));
                 }
@@ -848,11 +882,27 @@ impl Client {
                         // The ratchet has advanced either way, so persist
                         // that before deciding whether to keep the message.
                         self.save();
-                        let pt = match padding::unpad(&padded) {
-                            Ok(message) => message.to_vec(),
+                        // Any authenticated chunk shows the peer is online,
+                        // even if its message isn't complete yet.
+                        self.last_seen.insert(sender_token, Instant::now());
+                        let chunk = match padding::unpad(&padded) {
+                            Ok(chunk) => chunk,
                             Err(e) => {
                                 println!(
                                     ">> Dropped message from {}: {} (sender on an older client?)",
+                                    hex::encode(&sender_token[0..4]),
+                                    e
+                                );
+                                return Ok(None);
+                            }
+                        };
+                        let pt = match self.reassembler.accept(sender_token, chunk) {
+                            Ok(Some(message)) => message,
+                            // Waiting on the rest of the message's chunks.
+                            Ok(None) => return Ok(None),
+                            Err(e) => {
+                                println!(
+                                    ">> Dropped message chunk from {}: {}",
                                     hex::encode(&sender_token[0..4]),
                                     e
                                 );
@@ -868,7 +918,6 @@ impl Client {
                         // see the `inbox` field doc comment above.
                         self.record_message(sender_token, false, &pt);
                         self.inbox.push((sender_token, pt, self.last_recorded_id));
-                        self.last_seen.insert(sender_token, Instant::now());
                     } else {
                         println!(
                             ">> Received packet from {} but decryption failed (out of sync?).",
@@ -1190,7 +1239,7 @@ mod tests {
     }
 
     /// A frontend that shows both a live-delivered message (via
-    /// `create_encrypted_packet`'s side channel, or `drain_inbox`'s third
+    /// `create_encrypted_packets`'s side channel, or `drain_inbox`'s third
     /// tuple element) and a later history-fetched one (via
     /// `history_for_contact`) needs both to report the *same* id for the
     /// same underlying row, or a naive merge of the two views will show one
@@ -1228,7 +1277,7 @@ mod tests {
         // Outgoing: the side-channel id must match what a history fetch
         // reports for that same row.
         alice
-            .create_encrypted_packet(bob.identity.routing_token, b"outgoing")
+            .create_encrypted_packets(bob.identity.routing_token, b"outgoing")
             .unwrap();
         let live_outgoing_id = alice.last_recorded_id.expect("history is attached");
         let fetched = alice.history_for_contact(bob.identity.routing_token, 10);
@@ -1236,9 +1285,9 @@ mod tests {
 
         // Incoming: `drain_inbox`'s third element must match too.
         let (msg_packet, _) = bob
-            .create_encrypted_packet(alice.identity.routing_token, b"incoming")
+            .create_encrypted_packets(alice.identity.routing_token, b"incoming")
             .unwrap();
-        let inner_msg = strip_link(&msg_packet, &bob.link_master_key);
+        let inner_msg = strip_link(&msg_packet[0], &bob.link_master_key);
         alice.handle_incoming_packet(&inner_msg).unwrap();
         let (_, _, live_incoming_id) = alice.drain_inbox().pop().unwrap();
         let fetched = alice.history_for_contact(bob.identity.routing_token, 10);
@@ -1513,9 +1562,9 @@ mod tests {
             },
         );
         let (packet, _pq) = alice
-            .create_encrypted_packet(bob.identity.routing_token, b"Hello Bob!")
+            .create_encrypted_packets(bob.identity.routing_token, b"Hello Bob!")
             .unwrap();
-        let inner = strip_link(&packet, &alice.link_master_key);
+        let inner = strip_link(&packet[0], &alice.link_master_key);
         bob.handle_incoming_packet(&inner).unwrap();
         let a_ck = alice
             .e2e_sessions
@@ -1557,7 +1606,7 @@ mod tests {
         // Messages 1-4: no PQ inject
         for i in 0..4 {
             let (_, pq) = alice
-                .create_encrypted_packet(bob_id.routing_token, b"test")
+                .create_encrypted_packets(bob_id.routing_token, b"test")
                 .unwrap();
             assert!(
                 pq.is_none(),
@@ -1568,14 +1617,14 @@ mod tests {
 
         // Message 5: PQ inject triggers!
         let (_, pq) = alice
-            .create_encrypted_packet(bob_id.routing_token, b"test")
+            .create_encrypted_packets(bob_id.routing_token, b"test")
             .unwrap();
         assert!(pq.is_some(), "PQ inject MUST trigger at message 5");
 
         // Messages 6-9: no PQ inject
         for i in 5..9 {
             let (_, pq) = alice
-                .create_encrypted_packet(bob_id.routing_token, b"test")
+                .create_encrypted_packets(bob_id.routing_token, b"test")
                 .unwrap();
             assert!(
                 pq.is_none(),
@@ -1586,7 +1635,7 @@ mod tests {
 
         // Message 10: PQ inject triggers again!
         let (_, pq) = alice
-            .create_encrypted_packet(bob_id.routing_token, b"test")
+            .create_encrypted_packets(bob_id.routing_token, b"test")
             .unwrap();
         assert!(pq.is_some(), "PQ inject MUST trigger at message 10");
     }
@@ -1612,7 +1661,7 @@ mod tests {
 
         // Even at message 5, no PQ inject because no peer Kyber key
         for _ in 0..10 {
-            let (_, pq) = alice.create_encrypted_packet(bob_token, b"test").unwrap();
+            let (_, pq) = alice.create_encrypted_packets(bob_token, b"test").unwrap();
             assert!(
                 pq.is_none(),
                 "PQ inject must NOT trigger without peer Kyber key"
@@ -1665,14 +1714,14 @@ mod tests {
         // Alice sends 5 messages (triggers PQ inject on 5th)
         for i in 0..5 {
             let (msg_pkt, pq_pkt) = alice
-                .create_encrypted_packet(
+                .create_encrypted_packets(
                     bob.identity.routing_token,
                     format!("msg {}", i + 1).as_bytes(),
                 )
                 .unwrap();
 
             // Bob receives the message
-            let inner = strip_link(&msg_pkt, &alice.link_master_key);
+            let inner = strip_link(&msg_pkt[0], &alice.link_master_key);
             bob.handle_incoming_packet(&inner).unwrap();
 
             // If PQ inject was generated, Bob processes it too
@@ -1722,7 +1771,7 @@ mod tests {
         // Record chain key after 4th message (before PQ inject)
         for _ in 0..4 {
             alice
-                .create_encrypted_packet(bob_id.routing_token, b"test")
+                .create_encrypted_packets(bob_id.routing_token, b"test")
                 .unwrap();
         }
         let chain_before_pq = alice
@@ -1733,7 +1782,7 @@ mod tests {
 
         // Send 5th message (triggers PQ inject)
         let (_, pq) = alice
-            .create_encrypted_packet(bob_id.routing_token, b"test")
+            .create_encrypted_packets(bob_id.routing_token, b"test")
             .unwrap();
         assert!(pq.is_some());
 
@@ -1877,9 +1926,9 @@ mod tests {
             .root_key;
 
         let (msg_to_bob, _) = alice1
-            .create_encrypted_packet(bob.identity.routing_token, b"hi bob, it's alice")
+            .create_encrypted_packets(bob.identity.routing_token, b"hi bob, it's alice")
             .unwrap();
-        let inner_msg = strip_link(&msg_to_bob, &alice1.link_master_key);
+        let inner_msg = strip_link(&msg_to_bob[0], &alice1.link_master_key);
         bob.handle_incoming_packet(&inner_msg).unwrap();
         assert_eq!(bob.inbox.last().unwrap().1, b"hi bob, it's alice");
 
@@ -1936,16 +1985,16 @@ mod tests {
 
         // --- The new session must work end-to-end, in both directions ---
         let (msg_to_bob2, _) = alice2
-            .create_encrypted_packet(bob.identity.routing_token, b"hi bob, it's the new alice")
+            .create_encrypted_packets(bob.identity.routing_token, b"hi bob, it's the new alice")
             .unwrap();
-        let inner_msg2 = strip_link(&msg_to_bob2, &alice2.link_master_key);
+        let inner_msg2 = strip_link(&msg_to_bob2[0], &alice2.link_master_key);
         bob.handle_incoming_packet(&inner_msg2).unwrap();
         assert_eq!(bob.inbox.last().unwrap().1, b"hi bob, it's the new alice");
 
         let (msg_to_alice2, _) = bob
-            .create_encrypted_packet(alice2.identity.routing_token, b"hi new alice, it's bob")
+            .create_encrypted_packets(alice2.identity.routing_token, b"hi new alice, it's bob")
             .unwrap();
-        let inner_msg3 = strip_link(&msg_to_alice2, &bob.link_master_key);
+        let inner_msg3 = strip_link(&msg_to_alice2[0], &bob.link_master_key);
         alice2.handle_incoming_packet(&inner_msg3).unwrap();
         assert_eq!(alice2.inbox.last().unwrap().1, b"hi new alice, it's bob");
 
@@ -2031,12 +2080,12 @@ mod tests {
         // Send 5 messages with PQ inject at #5
         for i in 0..5 {
             let (msg_pkt, pq_pkt) = alice
-                .create_encrypted_packet(
+                .create_encrypted_packets(
                     bob.identity.routing_token,
                     format!("Hello {}", i + 1).as_bytes(),
                 )
                 .unwrap();
-            let msg_inner = strip_link(&msg_pkt, &alice.link_master_key);
+            let msg_inner = strip_link(&msg_pkt[0], &alice.link_master_key);
             bob.handle_incoming_packet(&msg_inner).unwrap();
             if let Some(pq) = pq_pkt {
                 assert_eq!(i, 4, "PQ inject must only trigger at message 5");
@@ -2060,9 +2109,9 @@ mod tests {
 
         // Send message 6 to prove the session still works
         let (msg6, _) = alice
-            .create_encrypted_packet(bob.identity.routing_token, b"Post-PQ message")
+            .create_encrypted_packets(bob.identity.routing_token, b"Post-PQ message")
             .unwrap();
-        let msg6_inner = strip_link(&msg6, &alice.link_master_key);
+        let msg6_inner = strip_link(&msg6[0], &alice.link_master_key);
         bob.handle_incoming_packet(&msg6_inner).unwrap();
 
         let a_ck2 = alice
@@ -2694,7 +2743,8 @@ mod tests {
             let key = bob_sender.symmetric_ratchet();
             let c = XChaCha20Poly1305::new(Key::from_slice(&key));
             let nonce = XNonce::from_slice(&[0x77u8; 24]);
-            let padded = padding::pad(format!("bob{}", i).as_bytes()).unwrap();
+            let chunk = chunks::split(format!("bob{}", i).as_bytes()).unwrap();
+            let padded = padding::pad(&chunk[0]).unwrap();
             let ct = c.encrypt(nonce, padded.as_slice()).unwrap();
             let mut pkt = vec![0x01];
             pkt.extend_from_slice(&bob_token);
@@ -2709,7 +2759,8 @@ mod tests {
             let key = charlie_sender.symmetric_ratchet();
             let c = XChaCha20Poly1305::new(Key::from_slice(&key));
             let nonce = XNonce::from_slice(&[0x88u8; 24]);
-            let padded = padding::pad(format!("char{}", i).as_bytes()).unwrap();
+            let chunk = chunks::split(format!("char{}", i).as_bytes()).unwrap();
+            let padded = padding::pad(&chunk[0]).unwrap();
             let ct = c.encrypt(nonce, padded.as_slice()).unwrap();
             let mut pkt = vec![0x01];
             pkt.extend_from_slice(&charlie_token);
@@ -2811,37 +2862,112 @@ mod tests {
         let freshness = Duration::from_secs(60);
 
         let (msg_pkt, _) = alice
-            .create_encrypted_packet(bob.identity.routing_token, b"hi")
+            .create_encrypted_packets(bob.identity.routing_token, b"hi")
             .unwrap();
-        let inner = strip_link(&msg_pkt, &alice.link_master_key);
+        let inner = strip_link(&msg_pkt[0], &alice.link_master_key);
         bob.handle_incoming_packet(&inner).unwrap();
 
         assert!(bob.is_online(&alice.identity.routing_token, freshness));
     }
 
     // ==========================================
-    // Message Padding Tests
+    // Message Padding & Chunking Tests
     // ==========================================
 
     #[test]
     fn test_chat_packets_are_fixed_size_and_unpadded_on_receive() {
         let (mut alice, mut bob) = established_pair();
-        let longest = "x".repeat(padding::MAX_MESSAGE_LEN);
-        for text in ["", "hi", "héllo 👋", longest.as_str()] {
-            let (pkt, _) = alice
-                .create_encrypted_packet(bob.identity.routing_token, text.as_bytes())
+        let one_full_chunk = "x".repeat(chunks::CHUNK_DATA_LEN);
+        for text in ["", "hi", "héllo 👋", one_full_chunk.as_str()] {
+            let (pkts, _) = alice
+                .create_encrypted_packets(bob.identity.routing_token, text.as_bytes())
                 .unwrap();
+            assert_eq!(pkts.len(), 1);
             assert_eq!(
-                pkt.len(),
+                pkts[0].len(),
                 1150,
                 "chat packet size must not depend on message length"
             );
-            let inner = strip_link(&pkt, &alice.link_master_key);
+            let inner = strip_link(&pkts[0], &alice.link_master_key);
             bob.handle_incoming_packet(&inner).unwrap();
             let inbox = bob.drain_inbox();
             assert_eq!(inbox.len(), 1);
             assert_eq!(inbox[0].1, text.as_bytes());
         }
+    }
+
+    #[test]
+    fn test_long_message_split_and_reassembled_out_of_order() {
+        let (mut alice, mut bob) = established_pair();
+        // Three chunks, with an emoji straddling the second boundary.
+        let text = format!(
+            "{}👋{}",
+            "a".repeat(2 * chunks::CHUNK_DATA_LEN - 1),
+            "b".repeat(100)
+        );
+        let (pkts, _) = alice
+            .create_encrypted_packets(bob.identity.routing_token, text.as_bytes())
+            .unwrap();
+        assert_eq!(pkts.len(), 3);
+        assert!(pkts.iter().all(|p| p.len() == 1150));
+
+        for pkt in pkts.iter().rev().take(2) {
+            let inner = strip_link(pkt, &alice.link_master_key);
+            bob.handle_incoming_packet(&inner).unwrap();
+            assert!(
+                bob.drain_inbox().is_empty(),
+                "nothing reaches the inbox until every chunk is in"
+            );
+        }
+        assert!(bob.is_online(&alice.identity.routing_token, Duration::from_secs(60)));
+
+        let inner = strip_link(&pkts[0], &alice.link_master_key);
+        bob.handle_incoming_packet(&inner).unwrap();
+        let inbox = bob.drain_inbox();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].1, text.as_bytes());
+    }
+
+    #[test]
+    fn test_pq_inject_sent_once_after_last_chunk() {
+        let (mut alice, mut bob) = established_pair();
+        let bob_token = bob.identity.routing_token;
+        let alice_token = alice.identity.routing_token;
+
+        // 3 chunks: send_count 0 -> 3, no interval crossed.
+        let (pkts, pq) = alice
+            .create_encrypted_packets(bob_token, &vec![b'x'; 3 * chunks::CHUNK_DATA_LEN])
+            .unwrap();
+        assert_eq!(pkts.len(), 3);
+        assert!(pq.is_none());
+        for pkt in &pkts {
+            bob.handle_incoming_packet(&strip_link(pkt, &alice.link_master_key))
+                .unwrap();
+        }
+
+        // 12 chunks: send_count 3 -> 15 crosses three intervals, but gets
+        // exactly one inject, after the last chunk.
+        let long = vec![b'y'; 12 * chunks::CHUNK_DATA_LEN];
+        let (pkts, pq) = alice.create_encrypted_packets(bob_token, &long).unwrap();
+        assert_eq!(pkts.len(), 12);
+        let pq = pq.expect("crossing an interval must produce a PQ inject");
+        for pkt in pkts.iter().chain([&pq]) {
+            bob.handle_incoming_packet(&strip_link(pkt, &alice.link_master_key))
+                .unwrap();
+        }
+        let inbox = bob.drain_inbox();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox[1].1, long);
+
+        assert_eq!(
+            alice.e2e_sessions[&bob_token].send_chain_key,
+            bob.e2e_sessions[&alice_token].recv_chain_key,
+            "chain keys must stay in sync across a chunked message and its inject"
+        );
+        let (next, _) = alice.create_encrypted_packets(bob_token, b"after").unwrap();
+        bob.handle_incoming_packet(&strip_link(&next[0], &alice.link_master_key))
+            .unwrap();
+        assert_eq!(bob.drain_inbox()[0].1, b"after");
     }
 
     #[test]
@@ -2851,9 +2977,9 @@ mod tests {
         let count_before = alice.e2e_sessions[&bob_token].send_count;
         let key_before = alice.e2e_sessions[&bob_token].send_chain_key;
 
-        let too_long = vec![b'x'; padding::MAX_MESSAGE_LEN + 1];
+        let too_long = vec![b'x'; chunks::MAX_MESSAGE_LEN + 1];
         let err = alice
-            .create_encrypted_packet(bob_token, &too_long)
+            .create_encrypted_packets(bob_token, &too_long)
             .unwrap_err();
         assert!(err.to_string().contains("too long"), "{err}");
 
@@ -2891,8 +3017,8 @@ mod tests {
 
         // Bob's ratchet still advanced past it, so the next padded message
         // decrypts normally.
-        let (next, _) = alice.create_encrypted_packet(bob_token, b"hi").unwrap();
-        let inner = strip_link(&next, &alice.link_master_key);
+        let (next, _) = alice.create_encrypted_packets(bob_token, b"hi").unwrap();
+        let inner = strip_link(&next[0], &alice.link_master_key);
         bob.handle_incoming_packet(&inner).unwrap();
         let inbox = bob.drain_inbox();
         assert_eq!(inbox.len(), 1);
