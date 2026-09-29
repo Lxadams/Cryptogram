@@ -18,6 +18,7 @@ use zeroize::Zeroizing;
 pub mod packets;
 use packets::*;
 mod history;
+mod padding;
 mod storage;
 pub use history::{ChatHistory, StoredMessage};
 use std::collections::HashSet;
@@ -707,11 +708,17 @@ impl Client {
 
     /// Encrypt a message. Returns (message_packet, optional_pq_inject_packet).
     /// Every PQ_INJECT_INTERVAL messages, a PQ inject packet is generated automatically.
+    ///
+    /// The plaintext is padded to a fixed size first (see `padding`), so every
+    /// chat packet is 1150 bytes on the wire. Messages over
+    /// `padding::MAX_MESSAGE_LEN` bytes are rejected before the ratchet moves.
     pub fn create_encrypted_packet(
         &mut self,
         target_token: RoutingToken,
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+        let padded = padding::pad(plaintext)?;
+
         // Phase 1: encrypt the message and check if PQ inject is needed (mutable borrow on session)
         let (full_e2e_payload, pq_ct) = {
             let session = self
@@ -729,7 +736,7 @@ impl Client {
             full_e2e_payload.extend_from_slice(&self.identity.routing_token);
             full_e2e_payload.extend_from_slice(&session.send_count.to_be_bytes());
             full_e2e_payload.extend_from_slice(&e2e_nonce_bytes);
-            let e2e_ciphertext = e2e_cipher.encrypt(e2e_nonce, plaintext).unwrap();
+            let e2e_ciphertext = e2e_cipher.encrypt(e2e_nonce, padded.as_slice()).unwrap();
             full_e2e_payload.extend_from_slice(&e2e_ciphertext);
 
             session.send_count += 1;
@@ -823,7 +830,8 @@ impl Client {
 
         match pkt_type {
             0x01 => {
-                // Msg: [16-byte sender_token | 8-byte seq_no | 24-byte nonce | ciphertext]
+                // Msg: [16-byte sender_token | 8-byte seq_no | 24-byte nonce |
+                //       ciphertext of a `padding::PADDED_LEN`-byte padded block]
                 if pkt_data.len() < 16 + 8 + 24 {
                     return Err(anyhow!("Msg payload too small"));
                 }
@@ -836,8 +844,21 @@ impl Client {
                 let ciphertext = &pkt_data[48..];
 
                 if let Some(session) = self.e2e_sessions.get_mut(&sender_token) {
-                    if let Some(pt) = session.try_decrypt(seq_no, nonce, ciphertext) {
+                    if let Some(padded) = session.try_decrypt(seq_no, nonce, ciphertext) {
+                        // The ratchet has advanced either way, so persist
+                        // that before deciding whether to keep the message.
                         self.save();
+                        let pt = match padding::unpad(&padded) {
+                            Ok(message) => message.to_vec(),
+                            Err(e) => {
+                                println!(
+                                    ">> Dropped message from {}: {} (sender on an older client?)",
+                                    hex::encode(&sender_token[0..4]),
+                                    e
+                                );
+                                return Ok(None);
+                            }
+                        };
                         println!(
                             ">> [From {}]: {}",
                             hex::encode(&sender_token[0..4]),
@@ -2673,7 +2694,8 @@ mod tests {
             let key = bob_sender.symmetric_ratchet();
             let c = XChaCha20Poly1305::new(Key::from_slice(&key));
             let nonce = XNonce::from_slice(&[0x77u8; 24]);
-            let ct = c.encrypt(nonce, format!("bob{}", i).as_bytes()).unwrap();
+            let padded = padding::pad(format!("bob{}", i).as_bytes()).unwrap();
+            let ct = c.encrypt(nonce, padded.as_slice()).unwrap();
             let mut pkt = vec![0x01];
             pkt.extend_from_slice(&bob_token);
             pkt.extend_from_slice(&(i as u64).to_be_bytes());
@@ -2687,7 +2709,8 @@ mod tests {
             let key = charlie_sender.symmetric_ratchet();
             let c = XChaCha20Poly1305::new(Key::from_slice(&key));
             let nonce = XNonce::from_slice(&[0x88u8; 24]);
-            let ct = c.encrypt(nonce, format!("char{}", i).as_bytes()).unwrap();
+            let padded = padding::pad(format!("char{}", i).as_bytes()).unwrap();
+            let ct = c.encrypt(nonce, padded.as_slice()).unwrap();
             let mut pkt = vec![0x01];
             pkt.extend_from_slice(&charlie_token);
             pkt.extend_from_slice(&(i as u64).to_be_bytes());
@@ -2794,6 +2817,86 @@ mod tests {
         bob.handle_incoming_packet(&inner).unwrap();
 
         assert!(bob.is_online(&alice.identity.routing_token, freshness));
+    }
+
+    // ==========================================
+    // Message Padding Tests
+    // ==========================================
+
+    #[test]
+    fn test_chat_packets_are_fixed_size_and_unpadded_on_receive() {
+        let (mut alice, mut bob) = established_pair();
+        let longest = "x".repeat(padding::MAX_MESSAGE_LEN);
+        for text in ["", "hi", "héllo 👋", longest.as_str()] {
+            let (pkt, _) = alice
+                .create_encrypted_packet(bob.identity.routing_token, text.as_bytes())
+                .unwrap();
+            assert_eq!(
+                pkt.len(),
+                1150,
+                "chat packet size must not depend on message length"
+            );
+            let inner = strip_link(&pkt, &alice.link_master_key);
+            bob.handle_incoming_packet(&inner).unwrap();
+            let inbox = bob.drain_inbox();
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(inbox[0].1, text.as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_oversized_message_rejected_without_advancing_ratchet() {
+        let (mut alice, bob) = established_pair();
+        let bob_token = bob.identity.routing_token;
+        let count_before = alice.e2e_sessions[&bob_token].send_count;
+        let key_before = alice.e2e_sessions[&bob_token].send_chain_key;
+
+        let too_long = vec![b'x'; padding::MAX_MESSAGE_LEN + 1];
+        let err = alice
+            .create_encrypted_packet(bob_token, &too_long)
+            .unwrap_err();
+        assert!(err.to_string().contains("too long"), "{err}");
+
+        let session = &alice.e2e_sessions[&bob_token];
+        assert_eq!(session.send_count, count_before);
+        assert_eq!(session.send_chain_key, key_before);
+    }
+
+    #[test]
+    fn test_unpadded_message_from_older_client_is_dropped() {
+        let (mut alice, mut bob) = established_pair();
+        let bob_token = bob.identity.routing_token;
+
+        // Encrypt with Alice's real ratchet but skip the padding, as a
+        // client from before padding was added would.
+        let session = alice.e2e_sessions.get_mut(&bob_token).unwrap();
+        let key = session.symmetric_ratchet();
+        let seq = session.send_count;
+        session.send_count += 1;
+        let nonce = [0x55u8; 24];
+        let ct = XChaCha20Poly1305::new(Key::from_slice(&key))
+            .encrypt(XNonce::from_slice(&nonce), b"hello".as_ref())
+            .unwrap();
+        let mut pkt = vec![0x01];
+        pkt.extend_from_slice(&alice.identity.routing_token);
+        pkt.extend_from_slice(&seq.to_be_bytes());
+        pkt.extend_from_slice(&nonce);
+        pkt.extend_from_slice(&ct);
+
+        assert!(bob.handle_incoming_packet(&pkt).unwrap().is_none());
+        assert!(
+            bob.drain_inbox().is_empty(),
+            "an unpadded message must not reach the inbox"
+        );
+
+        // Bob's ratchet still advanced past it, so the next padded message
+        // decrypts normally.
+        let (next, _) = alice.create_encrypted_packet(bob_token, b"hi").unwrap();
+        let inner = strip_link(&next, &alice.link_master_key);
+        bob.handle_incoming_packet(&inner).unwrap();
+        let inbox = bob.drain_inbox();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].1, b"hi");
     }
 
     #[test]
