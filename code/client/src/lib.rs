@@ -1103,6 +1103,9 @@ impl Client {
                 }
                 Ok(None)
             }
+            // Relay cover traffic (a "dummy packet"), sized like a chat
+            // message so the two look alike on the wire. Nothing to do.
+            0x00 => Ok(None),
             _ => Ok(None),
         }
     }
@@ -3023,6 +3026,20 @@ mod tests {
         let inbox = bob.drain_inbox();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].1, b"hi");
+    }
+
+    #[test]
+    fn test_relay_dummy_packet_is_ignored() {
+        let (alice, mut bob) = established_pair();
+        // What `open_link_packet` hands back for one of the relay's dummy
+        // packets: a chat-message-sized inner payload of type 0x00.
+        let dummy_inner = [0u8; 1 + 16 + 8 + 24 + padding::PADDED_LEN + 16];
+        assert!(bob.handle_incoming_packet(&dummy_inner).unwrap().is_none());
+        assert!(bob.drain_inbox().is_empty());
+        assert!(
+            !bob.is_online(&alice.identity.routing_token, Duration::from_secs(60)),
+            "a dummy packet must not count as hearing from anyone"
+        );
     }
 
     #[test]
