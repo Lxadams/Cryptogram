@@ -1,11 +1,11 @@
-use crate::{Client, SymmetricSessionState, UserIdentity};
+use crate::{Client, RecvPqInjects, SymmetricSessionState, UserIdentity};
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use pqcrypto_kyber::kyber768::{PublicKey, SecretKey};
 use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -51,9 +51,14 @@ pub struct SymmetricSessionStateDto {
     pub recv_count: u64,
     pub peer_kyber_pub: Option<String>,
     pub skip_dict: HashMap<u64, String>,
-    // Older state files predate the PQ-inject replay cache.
+    // PQ refreshes waiting for the receive chain to reach their position,
+    // and the latest one applied (see `RecvPqInjects`). Older state files
+    // predate both, and may still carry the `pq_inject_replay_cache` these
+    // replaced, which is ignored.
     #[serde(default)]
-    pub pq_inject_replay_cache: HashSet<String>,
+    pub pending_pq_injects: HashMap<u64, String>,
+    #[serde(default)]
+    pub pq_applied_through: u64,
 }
 
 impl ClientStateDto {
@@ -87,9 +92,9 @@ impl ClientStateDto {
             for (k, v) in &state.skip_dict {
                 skip_dict.insert(*k, hex::encode(v));
             }
-            let mut pq_inject_replay_cache = HashSet::new();
-            for sig in &state.pq_inject_replay_cache {
-                pq_inject_replay_cache.insert(hex::encode(sig));
+            let mut pending_pq_injects = HashMap::new();
+            for (position, secret) in &state.recv_pq_injects.pending {
+                pending_pq_injects.insert(*position, hex::encode(secret));
             }
 
             e2e_sessions.insert(
@@ -105,7 +110,8 @@ impl ClientStateDto {
                         .as_ref()
                         .map(|k| hex::encode(k.as_bytes())),
                     skip_dict,
-                    pq_inject_replay_cache,
+                    pending_pq_injects,
+                    pq_applied_through: state.recv_pq_injects.applied_through,
                 },
             );
         }
@@ -216,11 +222,11 @@ impl ClientStateDto {
                 hex::decode_to_slice(&v, &mut mk)?;
                 skip_dict.insert(k, mk);
             }
-            let mut pq_inject_replay_cache = HashSet::new();
-            for hex_sig in dto_state.pq_inject_replay_cache {
-                let mut sig = [0u8; 64];
-                hex::decode_to_slice(&hex_sig, &mut sig)?;
-                pq_inject_replay_cache.insert(sig);
+            let mut pending_pq_injects = BTreeMap::new();
+            for (position, hex_secret) in dto_state.pending_pq_injects {
+                let mut secret = [0u8; 32];
+                hex::decode_to_slice(&hex_secret, &mut secret)?;
+                pending_pq_injects.insert(position, secret);
             }
 
             e2e_sessions.insert(
@@ -233,7 +239,10 @@ impl ClientStateDto {
                     recv_count: dto_state.recv_count,
                     peer_kyber_pub: pkp,
                     skip_dict,
-                    pq_inject_replay_cache,
+                    recv_pq_injects: RecvPqInjects {
+                        pending: pending_pq_injects,
+                        applied_through: dto_state.pq_applied_through,
+                    },
                 },
             );
         }

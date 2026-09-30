@@ -15,7 +15,8 @@ use x25519_dalek::PublicKey as X25519PublicKey;
 // defines `signed_bytes()` (the part before the signature); `to_bytes()`,
 // `verify()` and signing in `generate()` are all derived from that one
 // function, which is what keeps the signed and serialized layouts from ever
-// drifting apart.
+// drifting apart. (PQInjectPayload's signature also covers a session binding
+// that isn't sent — see its `signing_input`.)
 
 const TOKEN_LEN: usize = 16;
 /// Sender token + target token + timestamp.
@@ -256,15 +257,22 @@ impl SessionEstablishPayload {
 }
 
 // ============================================================
-// PQInjectPayload (0x05) — 1192 bytes
+// PQInjectPayload (0x05) — 1200 bytes
 // ============================================================
 
-const PQI_LEN: usize = HEADER_LEN + KYBER_CT_LEN + SIG_LEN;
+const PQI_LEN: usize = HEADER_LEN + 8 + KYBER_CT_LEN + SIG_LEN;
 
 pub struct PQInjectPayload {
     pub routing_token: RoutingToken,
     pub target_token: RoutingToken,
     pub timestamp: u64,
+    /// The sender's `send_count` when it mixed this refresh into its send
+    /// chain, i.e. the sequence number of the first message encrypted on
+    /// the refreshed chain. Lets the receiver mix it in at exactly the same
+    /// point, whatever order the refresh and the messages around it arrive
+    /// in, and recognise a resent copy (see
+    /// `SymmetricSessionState::accept_pq_inject`).
+    pub applies_at: u64,
     pub kyber_ct: Ciphertext,
     pub signature: Signature,
 }
@@ -278,8 +286,20 @@ impl PQInjectPayload {
             &self.target_token,
             self.timestamp,
         );
+        out.extend_from_slice(&self.applies_at.to_be_bytes());
         out.extend_from_slice(self.kyber_ct.as_bytes());
         out
+    }
+
+    /// What the signature covers: everything before it on the wire, plus
+    /// `session_binding` (see `SymmetricSessionState::pq_inject_binding`),
+    /// which isn't sent. That ties the refresh to the one session it was
+    /// made for, so it can't be replayed into a later session with the same
+    /// peer, where its `applies_at` position would come round again.
+    fn signing_input(&self, session_binding: &[u8; 32]) -> Vec<u8> {
+        let mut input = self.signed_bytes();
+        input.extend_from_slice(session_binding);
+        input
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -289,11 +309,14 @@ impl PQInjectPayload {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let (routing_token, target_token, timestamp, body, signature) =
             split_payload(bytes, PQI_LEN, "PQ inject")?;
-        let kyber_ct = Ciphertext::from_bytes(body).map_err(|_| anyhow!("Invalid Kyber CT"))?;
+        let applies_at = u64::from_be_bytes(body[..8].try_into().unwrap());
+        let kyber_ct =
+            Ciphertext::from_bytes(&body[8..]).map_err(|_| anyhow!("Invalid Kyber CT"))?;
         Ok(Self {
             routing_token,
             target_token,
             timestamp,
+            applies_at,
             kyber_ct,
             signature,
         })
@@ -302,21 +325,30 @@ impl PQInjectPayload {
     pub fn generate(
         identity: &UserIdentity,
         target_token: RoutingToken,
+        applies_at: u64,
         kyber_ct: Ciphertext,
+        session_binding: &[u8; 32],
     ) -> Self {
         let mut payload = Self {
             routing_token: identity.routing_token,
             target_token,
             timestamp: now_secs(),
+            applies_at,
             kyber_ct,
             signature: unsigned(),
         };
-        payload.signature = identity.ed25519_secret.sign(&payload.signed_bytes());
+        payload.signature = identity
+            .ed25519_secret
+            .sign(&payload.signing_input(session_binding));
         payload
     }
 
-    pub fn verify(&self, ed25519_pub: &VerifyingKey) -> Result<()> {
-        check_signature(&self.signed_bytes(), &self.signature, ed25519_pub)
+    pub fn verify(&self, ed25519_pub: &VerifyingKey, session_binding: &[u8; 32]) -> Result<()> {
+        check_signature(
+            &self.signing_input(session_binding),
+            &self.signature,
+            ed25519_pub,
+        )
     }
 }
 
@@ -394,7 +426,7 @@ mod tests {
     fn payload_sizes_match_the_wire_format() {
         assert_eq!(KX_LEN, 1384);
         assert_eq!(EST_LEN, 1224);
-        assert_eq!(PQI_LEN, 1192);
+        assert_eq!(PQI_LEN, 1200);
         assert_eq!(PRESENCE_LEN, 104);
     }
 

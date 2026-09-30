@@ -64,7 +64,7 @@ Once the session is bootstrapped, ongoing messaging uses a **Symmetric Hash Ratc
     *   The old Chain Key is destroyed, but unused Message Keys are temporarily stored in a **Skip Dictionary** (up to 100 keys ahead) to handle out-of-order delivery gracefully.
 2.  **Message Encryption**: The plaintext is encrypted with `XChaCha20-Poly1305` using the Message Key. A fresh 24-byte random nonce is generated per message. The sender's 8-byte sequence number (`seq_no`) is included in the E2E payload structure.
     *   **Chunking & padding**: before encryption, a message is split into chunks of up to 1011 bytes (`[kind | 8-byte message id | index | count | data]`, at most 16 chunks, so messages up to 16,176 bytes), and each chunk is padded to a fixed 1024-byte block (`[2-byte length | chunk | zeros]`). Each chunk is its own ratcheted message, so every chat packet is exactly 1150 bytes on the wire — under the 1232-byte UDP payload that avoids IP fragmentation on any path — and neither the relay nor a network observer can read a message's length beyond its chunk count. The receiver reassembles chunks (in any order) before anything reaches the inbox or chat history; incomplete messages are dropped after 5 minutes.
-3.  **Periodic KEM Injection (PQ Ratchet)**: To provide continuous Post-Quantum secrecy without full session resets, a new Kyber encapsulation is performed against the peer's stored Kyber public key every 5 messages (counted in ratchet steps, i.e. chunks; checked once per message, so the inject is always sent after a message's last chunk and never between two). The new PQ shared secret is mixed independently into the respective Chain Key via HKDF. The Kyber ciphertext is sent as a `0x05 PQInjectPayload` (1192 bytes).
+3.  **Periodic KEM Injection (PQ Ratchet)**: To provide continuous Post-Quantum secrecy without full session resets, a new Kyber encapsulation is performed against the peer's stored Kyber public key every 5 messages (counted in ratchet steps, i.e. chunks; checked once per message, so the inject is always sent after a message's last chunk and never between two). The new PQ shared secret is mixed independently into the respective Chain Key via HKDF. The Kyber ciphertext is sent as a `0x05 PQInjectPayload` (1200 bytes), which carries `applies_at`: the sender's `send_count` when it mixed the secret in. The receiver mixes it in at exactly that position — straight away if its receive chain is already there, otherwise held until the messages before it arrive — so the inject can arrive before or after the messages around it, and any number of times: a copy for a position already reached is ignored. That position check replaces both a signature replay cache and the 5-minute timestamp check (which would have dropped an inject queued at the relay while the recipient was offline for longer, breaking the session). To stop an inject being replayed into a *later* session with the same peer, where positions restart from 0, its signature also covers a session binding (`HMAC(root_key, "pq-inject-session-binding")`) that is never sent, so it only verifies on the session it was made for. Every packet of a message, inject included, is therefore safe to resend.
 4.  **Packet Structure**: `[0x01 | 16-byte SenderToken | 8-byte SeqNo | 24-byte Nonce | E2E Ciphertext of one padded chunk]`, wrapped in link encryption. The 16-byte `SenderToken` enables O(1) direct session lookup, preventing speculative ratchet corruption.
 5.  **Decryption**: The receiver extracts the `SenderToken` to locate the correct session, then uses the `seq_no`. If it's a previously skipped message, it retrieves the key from the Skip Dictionary. If it's a future message, it fast-forwards the `recv_chain_key` (up to 100 steps) and stores the intermediate skipped keys.
 
@@ -154,7 +154,7 @@ Raw UDP Datagram
 |---|---|
 | `test_key_exchange_serialization` | Generates a `KeyExchangePayload`, serializes to 1352 bytes, deserializes, and verifies the Ed25519 signature round-trips correctly. Asserts `target_token` and `routing_token` are preserved. |
 | `test_session_est_serialization` | Generates a `SessionEstablishPayload`, serializes to 1224 bytes, deserializes, and verifies the Ed25519 signature. Asserts `routing_token` and `target_token` are preserved. |
-| `test_pq_inject_serialization` | Generates a `PQInjectPayload`, serializes to 1192 bytes, and verifies the Ed25519 signature correctly round-trips. |
+| `test_pq_inject_serialization` | Generates a `PQInjectPayload`, serializes to 1200 bytes, and verifies the Ed25519 signature and `applies_at` correctly round-trip. |
 
 #### Edge Case: Malformed Packets
 | Test | Description |
@@ -211,6 +211,16 @@ Raw UDP Datagram
 | `test_unpadded_message_from_older_client_is_dropped` | An authentic but unpadded message (as a pre-padding client sends) is dropped; the ratchet stays in sync for the next message. |
 | `padding::tests::*`, `chunks::tests::*` | Pad/unpad round trips and rejection of malformed blocks; split sizes at chunk boundaries; reassembly in any order, duplicate chunks, malformed headers, inconsistent counts, expiry, and the per-sender cap on incomplete messages. |
 
+#### PQ Refresh Ordering & Resends
+| Test | Description |
+|---|---|
+| `test_pq_inject_arriving_early_is_held_until_its_position` | The inject overtakes the last message before it. It's held, applied once that message arrives, and every message decrypts. |
+| `test_pq_inject_arriving_late_recovers_when_message_is_resent` | A message overtakes the inject it depends on and can't decrypt yet, without disturbing state; its resent copy decrypts once the inject arrives. |
+| `test_resent_pq_inject_and_message_copies_are_ignored` | Repeated copies of the inject and of already-received messages change nothing: each message is delivered once and the chains stay in sync. |
+| `test_several_pq_injects_ahead_of_out_of_order_messages` | Two injects arrive before any message, newest first, then messages out of order across both injects. All decrypt. |
+| `test_pq_inject_accepted_long_after_it_was_sent` | An inject whose timestamp is 10 minutes old (e.g. queued at the relay while offline) is still applied. |
+| `test_pq_inject_replayed_into_a_new_session_is_rejected` | An inject from an earlier session with the same peer fails verification against the new session's binding and is not held. |
+
 #### Full Integration & Attack Simulation
 | Test | Description |
 |---|---|
@@ -229,7 +239,6 @@ Raw UDP Datagram
 | `test_edge_case_pending_contacts_exhaustion` | Floods 55 KeyExchanges to a single client. Verifies pending_contacts is bounded to 51 (50 + 1 already accepted before the check). |
 | `test_edge_case_seen_session_keys_exhaustion` | Floods 1050 SessionEstablish packets. Verifies seen_session_keys cache is bounded to ≤1000 entries. |
 | `test_edge_case_session_establish_replay_detection` | Full handshake, then replays the same SessionEstablish. Verifies seen_session_keys blocks the replay from creating a new session. |
-| `test_edge_case_pq_inject_stale_timestamp` | Creates a PQ inject with timestamp 600s in the past, re-signs it. Verifies the handler drops it and chain key is unchanged. |
 | `test_storage_save_load_roundtrip` | Creates a Client with sessions, pending contacts, and seen keys. Saves to JSON, loads back, and verifies all keys survive round-trip. |
 | `test_concurrent_multi_peer_out_of_order` | Simulates receiving highly interleaved and out-of-order packets from multiple peers simultaneously. Asserts $O(1)$ SenderToken lookup routes to the correct session and skip dictionaries handle the disorder cleanly without advancing the wrong ratchets. |
 
