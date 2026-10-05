@@ -10,7 +10,8 @@ Branch `claude/raptorq-e2e-integration-2c36af`, 5 October 2026. Companion docume
 - **Burst sending.** Every chat message now travels as a burst of RaptorQ (RFC 6330) forward-error-correction symbols. The receiver rebuilds the message from *any* sufficient subset of them.
 - **End-to-end sealing.** Each symbol is sealed with a key only the two clients hold, so the relay forwards opaque packets and can't reassemble anything.
 - **PQ injections bundled with their message.** The ratchet's post-quantum injection (every 5th message) now travels inside the same burst as its message. Previously one lost or reordered injection packet desynchronised a session permanently; now the pair arrive together or not at all.
-- **PQ injections name their chain position.** Each injection carries the (signed) sequence number it applies at, so the receiver mixes it in at exactly that point however early or late it arrives, and rejects any copy for a position already passed.
+- **PQ injections name their chain position** (`applies_at`, from the message-padding PR #35). The receiver mixes each one in at exactly that point however early or late it arrives, and ignores copies. Its signature also covers a session binding, so it can't be replayed into a later session.
+- **Fixed-size packets** (also PR #35). Every chat chunk is padded to a 1,024-byte block, so every FEC symbol is full size and every datagram is 1,154 bytes whatever the message length. Long messages (up to 16,176 bytes) are split into chunks, all carried in one burst.
 - **Pacing.** Bursts are paced 10 ms per packet, one burst at a time in send order, so a short jamming spike can't take a whole message. The relay forwards a packet the moment it arrives and paces each recipient's backlog at 5 ms per packet, so it never re-bunches bursts.
 
 **Verified:**
@@ -22,7 +23,7 @@ Branch `claude/raptorq-e2e-integration-2c36af`, 5 October 2026. Companion docume
 | Real relay over real UDP, receiver jammed at 70% | **40/40** (69.8% dropped) |
 | Real relay, one side jammed at **80%** (beyond the target) | **30/30** each way |
 | Real relay, **both** sides jammed at 70% (≈91% end to end, well beyond the target) | 28/30 and 26/30. Degrades gracefully and the session survives. |
-| Test suites, all crates | **134 tests, all passing** (90 before this work), `fmt` and `clippy -D warnings` clean |
+| Test suites, all crates | **163 tests, all passing** (client 114, relay 10, fec 25, Tauri 14), `fmt` and `clippy -D warnings` clean |
 
 ## 2. Decisions
 
@@ -35,15 +36,16 @@ Branch `claude/raptorq-e2e-integration-2c36af`, 5 October 2026. Companion docume
 | Delivery target | 99.99% per message. 99.9999% for messages carrying a PQ injection, since losing one of those used to desync the session. | Agreed trade-off between reliability and airtime |
 | In scope | Chat messages (0x01) and PQ injections (0x05) | Contacts are added face to face via QR codes, and that handshake isn't digital in the lossy setting |
 | Out of scope | Relay handshake, sync/keepalive, KeyExchange (0x02), SessionEstablish (0x04), presence (0x06) | Assumed done on a clean link, as agreed |
-| Packet format | One new inner payload type, `0x07`. `0x05` gains an 8-byte chain position (1,200 bytes). Everything else untouched. | "Don't change the packet structure too much" |
+| Packet format | One new inner payload type, `0x07`. (`0x01` padding and `0x05`'s `applies_at` came with PR #35.) | "Don't change the packet structure too much" |
 
 ## 3. How a message travels now
 
 ```
 SEND (Client A)
   plaintext
-    -> symmetric-ratchet encrypt              (0x01 payload, unchanged)
-    -> every 5th message: + PQ injection      (0x05 payload, + its chain position)
+    -> split into chunks, pad each to 1,024 B (PR #35)
+    -> symmetric-ratchet encrypt each chunk   (one 0x01 payload per chunk)
+    -> every 5th step: + PQ injection         (0x05 payload, with `applies_at`)
     -> bundle: [2-byte len | payload]...      (one FEC "object")
     -> RaptorQ encode into N symbols          (N from fec::packets_for)
     -> seal each symbol end to end            (XChaCha20-Poly1305, per-contact key)
@@ -100,7 +102,7 @@ object id       = the message's sequence number (unique within a session;
 FEC object (bundle):
 
 ```
-[2 len | 0x01 message payload] ( [2 len | 0x05 PQ injection payload] )?
+( [2 len | 0x01 chunk payload] )+ ( [2 len | 0x05 PQ injection payload] )?
 ```
 
 ### 4.2 Sizes
@@ -108,11 +110,9 @@ FEC object (bundle):
 | | Bytes |
 |---|---|
 | Overhead per packet: link 61 + seal envelope 57 + FEC header 12 | **130** |
-| Largest datagram (T = 1024) | **1,154**: inside a 1,200-byte safe MTU and the relay's 2,048-byte buffer |
-| Datagram for a 1-byte message | 202 |
-| Datagram for a 100-character message | ~300 |
+| Every datagram (T = 1024) | **1,154**: inside a 1,200-byte safe MTU and the relay's 2,048-byte buffer |
 
-Short messages are *not* padded to full-size packets, which matters on metered SATCOM links. The trade-off is that the packet size reveals message length to within 8 bytes (see §11).
+Since chunks are padded (PR #35), the smallest bundle is 1,091 bytes, so the symbol size is always the 1,024-byte cap. Packet size no longer reveals message length; the number of packets reveals the chunk count (1,011 bytes per chunk). Short messages cost more airtime than before padding (34 packets instead of 27).
 
 ### 4.3 What the relay can see, before and after
 
@@ -137,14 +137,14 @@ The seal's AAD binds the sender *and* recipient tokens. The relay therefore can'
 
 Packets per message at 70% loss:
 
-| Object | K | 99.9% | **99.99%** (messages) | **99.9999%** (PQ-carrying) |
+| Message (padded chunks) | K | **99.99%** (messages) | K with PQ | **99.9999%** (PQ-carrying) |
 |---|---|---|---|---|
-| Typical chat message (< 1 KB) | 1 | 20 | **27** | 40 |
-| Message + PQ injection (~1.3 KB) | 2 | 27 | 34 | **48** |
-| ~4 KB message | 4 | 39 | **47** | 62 |
-| ~8 KB message | 8 | 59 | **69** | 86 |
+| 1 chunk (≤ 1,011 B, most chat) | 2 | **34** | 3 | **55** |
+| 4 chunks (≤ 4 KB) | 5 | **53** | 6 | 74 |
+| 8 chunks (≤ 8 KB) | 9 | **74** | 10 | 97 |
+| 16 chunks (max, 16,176 B) | 18 | **117** | 19 | 143 |
 
-In practice the 1,000-message test averaged **31.2 packets per message**: 800 × 27 plus 200 × 48, exactly as the model predicts. A typical short message costs roughly 6–8 KB on the wire.
+A typical short message costs about 39 KB on the wire (34 × 1,154 B). Before padding it was 27 packets of ~250 B, about 7 KB. That's the price of hiding message length.
 
 **A bug that measurement caught:** the first version of the model held failure flat at 1e-6 once K + 2 symbols arrived. That made a 1e-6 target reachable only through float rounding, so PQ-carrying bursts were **~155 packets instead of 48**. The 1,000-message pass-rate test exposed it: 52,600 packets where ~31,000 were expected. It was fixed, with a regression test (`stricter_targets_cost_a_few_more_packets_not_many`).
 
@@ -159,7 +159,7 @@ Every 5th message, the sender mixes fresh Kyber entropy into its sending chain. 
 FEC alone doesn't fix this. Two objects sent back to back can finish decoding in either order, so FEC makes case 3 more likely. The fixes:
 
 - **Bundling** fixes 1 and 2. The injection travels inside the same FEC object as its message, sized to 99.9999%. They arrive together, in order, or not at all. ([transport.rs](../code/client/src/transport.rs) `encode_message`)
-- **Chain positions** make the order of injections irrelevant. Each 0x05 names the sequence number it applies at. One for a position the receive chain hasn't reached is held (`pending_pq`, persisted) and mixed in when the chain gets there; one for a position already passed is a replay and is dropped. No timestamp check applies to 0x05, so one queued at the relay for longer than 5 minutes still lands. ([lib.rs](../code/client/src/lib.rs): `accept_pq_inject`, `try_decrypt`)
+- **Chain positions** (`applies_at`, PR #35) make the order of injections irrelevant. One for a position the receive chain hasn't reached is held (`recv_pq_injects`, persisted) and mixed in when the chain gets there. A copy of one already taken in is ignored. No timestamp check applies to 0x05, so one queued at the relay for longer than 5 minutes still lands. ([lib.rs](../code/client/src/lib.rs): `accept_pq_inject`, `try_decrypt`)
 - **Holding and retrying** fixes 3. A 0x01 message that arrived *sealed* (so its sender is proven), fails to decrypt, and has a sequence number at or ahead of the receive chain is held in `FecReceiver`. Once an injection lands or an earlier message decrypts, everything held for that peer is retried in sequence order. Held messages are capped at 32 per peer (the furthest-ahead dropped first) and expire 60 s after they were *first* held. Bare 0x01 datagrams, which anyone can forge, are never held. ([lib.rs](../code/client/src/lib.rs): `receive_message`, `retry_deferred`)
 
 Residual risk: if an *entire* PQ-carrying burst is lost (≤ 1 in 10⁶ per injection at the design loss), the session still desyncs, and there's no automatic recovery yet. See §11 and the review.
@@ -199,7 +199,7 @@ The relay learned nothing about FEC or crypto. It still forwards opaque inner pa
 - **CLI** ([main.rs](../code/client/src/main.rs)): `msg` queues its burst on a `BurstSender` and reports if it couldn't be sent.
 - **Desktop app** ([commands.rs](../code/frontend/src-tauri/src/commands.rs)): `send_message` builds the burst under the lock, releases it, and queues it on the runtime's `BurstSender`. It returns the chat-history id as before, or an error if the burst couldn't leave the machine.
 
-**Compatibility:** both peers need this build. Old builds ignore 0x07, and the 0x05 layout changed. The receive side still accepts bare 0x01/0x05 datagrams, and a test mixes both paths in one conversation.
+**Compatibility:** both peers need this build. Old builds ignore 0x07. The receive side still accepts bare 0x01/0x05 datagrams (PR #35's format), and a test mixes both paths in one conversation.
 
 ## 10. Build, CI and Docker
 
@@ -250,7 +250,7 @@ All pre-existing tests were run first, unchanged. One server test had pinned the
 - Symbols are opaque to the relay and bound to their sender.
 - The seal is bound to key, sender and recipient, and rejects reflection, relabelling, redirection, truncation and tampering.
 - PQ-carrying bursts get extra redundancy, but not a multiple.
-- Every datagram is ≤ 1,200 bytes, with no padding for short messages.
+- Every datagram is the same size (≤ 1,200 bytes) whatever the message length.
 - Held-message queue bounds and expiry.
 - Bundles may only carry the sealing peer's own 0x01/0x05. A smuggled KeyExchange can't re-key the session.
 - Malformed FEC payloads are dropped and the session carries on.
@@ -291,7 +291,7 @@ With `jammed=alice`, Alice→Bob exercises a jammed **sender** and Bob→Alice a
 | `FEC_DESIGN_LOSS` | `client/src/transport.rs` | 0.7 |
 | `MESSAGE_MAX_FAILURE` / `PQ_MESSAGE_MAX_FAILURE` | same | 1e-4 / 1e-6 |
 | `FEC_PACKET_SPACING` | same | 10 ms |
-| `MAX_FEC_MESSAGE_LEN` | same | 63,488 bytes |
+| `MAX_MESSAGE_LEN` (chunk limit, PR #35) | `client/src/chunks.rs` | 16,176 bytes |
 | `DEFER_TTL` / `MAX_DEFERRED_PER_PEER` | same | 60 s / 32 |
 | `MAX_SYMBOL_SIZE`, `MAX_OBJECT_LEN` | `fec/src/lib.rs` | 1,024 B / 64 KiB |
 | `fec::Limits` (pending/completed bounds and TTLs) | same | 128 / 32 per source / 120 s; 4,096 / 600 s |
@@ -305,7 +305,7 @@ To cover both sides being jammed at 70% (91% end to end), set `FEC_DESIGN_LOSS =
 1. **Residual PQ desync.** If a whole PQ-carrying burst is lost (≤ 10⁻⁶ per injection), the session breaks with no recovery. A resync/"session reset" message (roadmap Task 4.1b) would close this.
 2. ~~**PQ injections older than 5 minutes are rejected.**~~ Fixed: 0x05 is exempt from the freshness window, and its signed chain position rules out replays instead (review finding **C-4**).
 3. **Fixed redundancy.** Every message pays for 70% loss even on a clean link (27× packets for a short message). Loss feedback from the receiver could adapt it.
-4. **Traffic analysis.** Bursts reveal send times, message length (to 8 bytes) and every 5th message (larger burst). Padding to a few size buckets and/or the constant-rate tunnel mode would address this.
+4. **Traffic analysis.** Bursts reveal send times, the chunk count (burst length), and which messages carry a PQ injection (larger burst). Padding is per chunk now, so packet size reveals nothing. The constant-rate tunnel mode would hide the rest.
 5. **Not FEC-protected (by agreement):** relay handshake, sync/keepalive, KeyExchange, SessionEstablish, presence. The jammed client's presence dot will flicker, and a jammed client can't (re)connect to the relay.
 6. **Seal key is static per session.** It's derived from the root key, so a root-key compromise exposes the envelopes. The messages inside remain protected by the ratchet.
 7. **No automated multi-process test in CI.** `lossy_link` is manual because it needs a running relay.

@@ -1015,9 +1015,11 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
 
 /// Encrypt and send an E2E message to an already-established session, as a
 /// burst of FEC packets sized to survive heavy loss (see `client`'s
-/// `create_fec_packets`/`BurstSender`). Every 5th message's PQ
-/// ratchet-injection rides inside the same burst, transparently. Errors if
-/// the burst couldn't leave this machine at all (e.g. the network is down).
+/// `create_fec_packets`/`BurstSender`). A long message's chunks, and the PQ
+/// ratchet-injection whenever one is due (roughly every 5th chunk), ride
+/// inside the same burst, transparently. Errors if the message is over the
+/// client's length limit, or if the burst couldn't leave this machine at all
+/// (e.g. the network is down).
 ///
 /// Returns the message's local chat-history row id (`None` if no history is
 /// attached), so the frontend can label its own optimistic display of this

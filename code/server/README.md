@@ -31,6 +31,9 @@ send_due_packets():
         Prepend a 16-byte dummy routing token prefix so client can strip uniformly.
         Send UDP packet to recipient's IP + port.
     Return when the next slot falls due (if anything is still queued for an online token).
+    (Cover traffic: dummy_packet() builds a packet the same size and framing as a
+    forwarded FEC chat packet (1154 bytes), inner type 0x00, which clients ignore.
+    Currently disabled: nothing sends them.)
 
 sweep_expired_messages():
     For all entries in the message queue that have expired:

@@ -1146,7 +1146,17 @@ fn ChatPanel(
                         });
                     });
                 }
-                Err(e) => error.set(Some(e)),
+                Err(e) => {
+                    // Put the text back so a rejected message (e.g. over
+                    // the length limit) can be edited and resent rather
+                    // than lost — unless the user has already started
+                    // typing a new one. `try_`: same disposed-signal
+                    // reasoning as `refresh_known` above.
+                    if draft.try_get_untracked().is_some_and(|d| d.is_empty()) {
+                        draft.set(text);
+                    }
+                    error.set(Some(e));
+                }
             }
         });
     };

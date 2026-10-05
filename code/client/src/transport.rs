@@ -1,11 +1,11 @@
 //! FEC transport: carries E2E messages as bursts of RaptorQ symbols (see the
 //! `fec` crate) so they survive heavy packet loss with no ACKs or resends.
 //!
-//! Send side (`Client::create_fec_packets`): the ratchet-encrypted message
-//! (0x01) — plus, every `PQ_INJECT_INTERVAL` messages, the PQ inject (0x05)
-//! that follows it — is bundled into one FEC object, encoded into enough
-//! symbols to survive `FEC_DESIGN_LOSS`, and every symbol is sealed end to
-//! end before the usual link encryption:
+//! Send side (`Client::create_fec_packets`): the message's ratchet-encrypted
+//! chunks (0x01, each padded to a fixed size) — plus, when due, the PQ inject
+//! (0x05) that follows them — are bundled into one FEC object, encoded into
+//! enough symbols to survive `FEC_DESIGN_LOSS`, and every symbol is sealed
+//! end to end before the usual link encryption:
 //!
 //!   [0x07 | 16-byte sender token | 24-byte nonce | XChaCha20-Poly1305(symbol)]
 //!
@@ -51,9 +51,6 @@ const MESSAGE_MAX_FAILURE: f64 = 1e-4;
 const PQ_MESSAGE_MAX_FAILURE: f64 = 1e-6;
 /// Gap between consecutive packets of a burst (see `send_burst`).
 const FEC_PACKET_SPACING: Duration = Duration::from_millis(10);
-/// Longest plaintext `create_fec_packets` accepts — what fits in one FEC
-/// object alongside the message header and a PQ inject, with room to spare.
-pub const MAX_FEC_MESSAGE_LEN: usize = fec::MAX_OBJECT_LEN - 2048;
 
 /// How long, and how many, messages are parked per peer waiting for a PQ
 /// inject they were encrypted after.
@@ -101,22 +98,25 @@ pub(crate) fn unbundle(mut object: &[u8]) -> Option<Vec<&[u8]>> {
     Some(parts)
 }
 
-/// Bundle a ratchet-encrypted message (and the PQ inject that follows it,
-/// if any) into FEC object `object_id`, encode it for `FEC_DESIGN_LOSS`,
-/// and seal every symbol for `target`. Returns 0x07 inner payloads, not yet
-/// link-encrypted.
+/// Bundle a message's ratchet-encrypted chunks (and the PQ inject that
+/// follows them, if any) into FEC object `object_id`, encode it for
+/// `FEC_DESIGN_LOSS`, and seal every symbol for `target`. Returns 0x07 inner
+/// payloads, not yet link-encrypted.
 pub(crate) fn encode_message(
     root_key: &[u8; 32],
     sender: &RoutingToken,
     target: &RoutingToken,
     object_id: u32,
-    message: &[u8],
+    chunks: &[Vec<u8>],
     pq_inject: Option<&[u8]>,
 ) -> Result<Vec<Vec<u8>>> {
-    let (object, max_failure) = match pq_inject {
-        Some(pq) => (bundle(&[message, pq]), PQ_MESSAGE_MAX_FAILURE),
-        None => (bundle(&[message]), MESSAGE_MAX_FAILURE),
+    let mut parts: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+    parts.extend(pq_inject);
+    let max_failure = match pq_inject {
+        Some(_) => PQ_MESSAGE_MAX_FAILURE,
+        None => MESSAGE_MAX_FAILURE,
     };
+    let object = bundle(&parts);
     let packets = fec::packets_for(object.len(), FEC_DESIGN_LOSS, max_failure);
     let symbols = fec::encode(object_id, &object, packets)?;
     Ok(seal_symbols(root_key, sender, target, &symbols))
@@ -392,10 +392,10 @@ impl BurstSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Client;
     use crate::test_support::{
         Rng, cleanup, connect, connected_pair, inbox_texts, new_client, relay, session,
     };
+    use crate::{Client, MAX_MESSAGE_LEN};
 
     /// Each message's burst, as the relay hands it to the recipient.
     fn bursts(from: &mut Client, to: &Client, count: usize) -> Vec<Vec<Vec<u8>>> {
@@ -518,7 +518,12 @@ mod tests {
         }
         assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2", "m3"]);
         assert_eq!(bob.fec_rx.deferred_count(&alice.identity.routing_token), 5);
-        assert!(session(&bob, &alice).pending_pq.contains_key(&10));
+        assert!(
+            session(&bob, &alice)
+                .recv_pq_injects
+                .pending
+                .contains_key(&10)
+        );
 
         deliver(&mut bob, &bursts[4]);
         assert_eq!(inbox_texts(&mut bob), ["m4", "m5", "m6", "m7", "m8", "m9"]);
@@ -564,12 +569,19 @@ mod tests {
     fn stale_messages_are_not_parked() {
         let (mut alice, mut bob) = connected_pair();
         let (alice_token, bob_token) = (alice.identity.routing_token, bob.identity.routing_token);
-        let (msg, _) = alice.create_encrypted_packet(bob_token, b"once").unwrap();
-        let inner = relay(&msg, &alice);
+        let (msgs, _) = alice.create_encrypted_packets(bob_token, b"once").unwrap();
+        let inner = relay(&msgs[0], &alice);
         bob.handle_incoming_packet(&inner).unwrap();
         let root = session(&bob, &alice).root_key;
         for object_id in [100, 101] {
-            let burst = encode_message(&root, &alice_token, &bob_token, object_id, &inner, None);
+            let burst = encode_message(
+                &root,
+                &alice_token,
+                &bob_token,
+                object_id,
+                std::slice::from_ref(&inner),
+                None,
+            );
             deliver(&mut bob, &burst.unwrap());
         }
         assert_eq!(inbox_texts(&mut bob), ["once"]);
@@ -659,7 +671,7 @@ mod tests {
     fn oversized_messages_are_refused_before_touching_the_ratchet() {
         let (mut alice, bob) = connected_pair();
         let before = session(&alice, &bob).send_count;
-        let huge = vec![b'x'; MAX_FEC_MESSAGE_LEN + 1];
+        let huge = vec![b'x'; MAX_MESSAGE_LEN + 1];
         assert!(
             alice
                 .create_fec_packets(bob.identity.routing_token, &huge)
@@ -709,7 +721,8 @@ mod tests {
     fn sealed_symbols_are_bound_to_key_sender_and_recipient() {
         let root = [1u8; 32];
         let (a, b, c) = ([0xA; 16], [0xB; 16], [0xC; 16]);
-        let inner = encode_message(&root, &a, &b, 0, b"\x01not really a message", None).unwrap();
+        let message = b"\x01not really a message".to_vec();
+        let inner = encode_message(&root, &a, &b, 0, &[message], None).unwrap();
         assert_eq!(&inner[0][..17], [&[0x07][..], &a].concat());
         let sealed = &inner[0][17..];
 
@@ -733,8 +746,9 @@ mod tests {
         let (root, a, b) = ([3u8; 32], [0xA; 16], [0xB; 16]);
         let message = vec![0x01; 200];
         let pq = vec![0x05; 1193];
-        let plain = encode_message(&root, &a, &b, 0, &message, None).unwrap();
-        let with_pq = encode_message(&root, &a, &b, 1, &message, Some(&pq)).unwrap();
+        let chunks = std::slice::from_ref(&message);
+        let plain = encode_message(&root, &a, &b, 0, chunks, None).unwrap();
+        let with_pq = encode_message(&root, &a, &b, 1, chunks, Some(&pq)).unwrap();
         assert_eq!(
             plain.len() as u32,
             fec::packets_for(2 + message.len(), FEC_DESIGN_LOSS, MESSAGE_MAX_FAILURE)
@@ -778,29 +792,22 @@ mod tests {
         cleanup(&[&alice, &bob]);
     }
 
-    /// Every datagram stays inside ~1200 bytes (crosses real networks
-    /// unfragmented, and well inside the relay's 2048-byte receive buffer),
-    /// and short messages aren't padded out to full-size packets.
+    /// Every datagram is the same size whatever the message length (chunks
+    /// are padded, so every symbol is full-size), and stays inside ~1200
+    /// bytes: it crosses real networks unfragmented, well inside the relay's
+    /// 2048-byte receive buffer.
     #[test]
-    fn every_packet_fits_in_one_datagram() {
+    fn every_packet_is_one_fixed_size_datagram() {
         let (mut alice, bob) = connected_pair();
-        let mut smallest = usize::MAX;
-        for len in [1, 100, 1000, 3000, 20_000, MAX_FEC_MESSAGE_LEN] {
+        let mut sizes = Vec::new();
+        for len in [1, 100, 1000, 3000, 10_000, MAX_MESSAGE_LEN] {
             let burst = alice
                 .create_fec_packets(bob.identity.routing_token, &vec![b'x'; len])
                 .unwrap();
-            let size = burst[0].len();
-            assert!(
-                burst.iter().all(|p| p.len() == size),
-                "uniform within a burst"
-            );
-            assert!(size <= 1200, "{len}-byte message -> {size}-byte datagrams");
-            smallest = smallest.min(size);
+            sizes.extend(burst.iter().map(Vec::len));
         }
-        assert!(
-            smallest < 300,
-            "a 1-byte message used {smallest}-byte datagrams"
-        );
+        assert!(sizes.iter().all(|&size| size == sizes[0]), "{sizes:?}");
+        assert!(sizes[0] <= 1200, "{}-byte datagrams", sizes[0]);
         cleanup(&[&alice, &bob]);
     }
 
@@ -884,12 +891,12 @@ mod tests {
         let (alice_token, bob_token) = (alice.identity.routing_token, bob.identity.routing_token);
         let root_before = session(&bob, &alice).root_key;
 
-        let (carols_msg, _) = carol
-            .create_encrypted_packet(bob_token, b"from carol")
+        let (carols_msgs, _) = carol
+            .create_encrypted_packets(bob_token, b"from carol")
             .unwrap();
-        let carols_msg = relay(&carols_msg, &carol);
+        let carols_msg = relay(&carols_msgs[0], &carol);
         let alices_kx = relay(&alice.create_kx_request(bob_token), &alice);
-        let nested = encode_message(&root_before, &alice_token, &bob_token, 0, b"\x01x", None)
+        let nested = encode_message(&root_before, &alice_token, &bob_token, 0, &[vec![1]], None)
             .unwrap()
             .remove(0);
         let object = bundle(&[&carols_msg, &alices_kx, &nested]);
@@ -962,12 +969,11 @@ mod tests {
         for i in 0..12 {
             let text = format!("m{i}");
             if i % 2 == 0 {
-                let (msg, pq) = alice
-                    .create_encrypted_packet(bob_token, text.as_bytes())
+                let (msgs, pq) = alice
+                    .create_encrypted_packets(bob_token, text.as_bytes())
                     .unwrap();
-                bob.handle_incoming_packet(&relay(&msg, &alice)).unwrap();
-                if let Some(pq) = pq {
-                    bob.handle_incoming_packet(&relay(&pq, &alice)).unwrap();
+                for packet in msgs.iter().chain(&pq) {
+                    bob.handle_incoming_packet(&relay(packet, &alice)).unwrap();
                 }
             } else {
                 for p in alice

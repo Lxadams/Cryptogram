@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use x25519_dalek::PublicKey as X25519PublicKey;
 mod stores;
 
-use crate::stores::Tables;
+use crate::stores::{SessionId, Tables};
 
 const METADATA_TTL: Duration = Duration::from_secs(1000);
 const MESSAGE_TTL: Duration = Duration::from_secs(1000);
@@ -34,6 +34,19 @@ const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
 const TYPE_HANDSHAKE_INIT: u8 = 0;
 const TYPE_DATA: u8 = 1;
 const TYPE_HANDSHAKE_RESP: u8 = 2;
+
+// Relay cover traffic ("dummy packets") is shaped like a forwarded chat
+// packet so the two are the same size on the wire. Clients send chat as FEC
+// symbols (see code/client/src/transport.rs), and since every chunk inside
+// is padded to a fixed block (code/client/src/padding.rs), every symbol is
+// the maximum 1024 bytes. So a forwarded packet's inner payload is always
+//   1 type + 16 sender token + 24 nonce + 12 FEC header + 1024 symbol + 16 tag
+// = 1093 bytes, i.e. a 1154-byte UDP packet once wrapped for the recipient.
+// Keep this in step with the client if that layout changes.
+const CHAT_INNER_PAYLOAD_LEN: usize = 1 + 16 + 24 + 12 + 1024 + 16;
+// Inner type byte of a dummy packet, which the client ignores (the `0x00`
+// arm in `Client::handle_incoming_packet`).
+const INNER_TYPE_DUMMY: u8 = 0x00;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ServerIdentityDto {
@@ -271,12 +284,51 @@ fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
     });
 }
 
+/// Link-encrypt `inner_payload` for the recipient behind `session_id`,
+/// behind the 16-byte zero routing prefix clients strip off. Real forwarded
+/// messages and dummy packets both go through this, so they're framed
+/// identically on the wire.
+fn wrap_for_recipient(
+    link_key: &[u8; 32],
+    session_id: &SessionId,
+    inner_payload: &[u8],
+) -> Vec<u8> {
+    use rand_core::{OsRng, RngCore};
+
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(link_key));
+    let mut nonce_bytes = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = XNonce::from_slice(&nonce_bytes);
+
+    let mut full_inner = vec![0u8; 16]; // Dummy routing token prefix
+    full_inner.extend_from_slice(inner_payload);
+
+    let ciphertext = cipher
+        .encrypt(nonce, full_inner.as_slice())
+        .expect("XChaCha20-Poly1305 encryption is infallible for in-memory buffers");
+
+    let mut packet = vec![TYPE_DATA];
+    packet.extend_from_slice(session_id);
+    packet.extend_from_slice(&nonce_bytes);
+    packet.extend_from_slice(&ciphertext);
+    packet
+}
+
+/// A dummy packet for the recipient behind `session_id`: the same size and
+/// framing as a forwarded chat packet, with an inner type the client drops.
+/// Cover traffic is switched off for now (nothing sends these), but this
+/// keeps them ready to match real traffic when it's turned back on.
+#[allow(dead_code)]
+fn dummy_packet(link_key: &[u8; 32], session_id: &SessionId) -> Vec<u8> {
+    let mut inner = vec![0u8; CHAT_INNER_PAYLOAD_LEN];
+    inner[0] = INNER_TYPE_DUMMY;
+    wrap_for_recipient(link_key, session_id, &inner)
+}
+
 /// Forward every packet whose recipient's pacing slot is due (see
 /// `Tables::take_due`), re-encrypted under the recipient's link key.
 /// Returns when the next slot falls due, if anything is still waiting.
 async fn send_due_packets(tables: &Mutex<Tables>, socket: &UdpSocket) -> Option<Instant> {
-    use rand_core::{OsRng, RngCore};
-
     let (due, next_due) = {
         let mut tables = tables.lock().unwrap();
         let (due, next_due) = tables.take_due(Instant::now(), RELAY_PACKET_SPACING);
@@ -287,23 +339,7 @@ async fn send_due_packets(tables: &Mutex<Tables>, socket: &UdpSocket) -> Option<
         (due, next_due)
     };
     for (link_key, due) in due {
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
-        let mut nonce_bytes = [0u8; 24];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
-
-        let mut full_inner = vec![0u8; 16]; // Dummy routing token prefix
-        full_inner.extend_from_slice(&due.payload);
-
-        let ciphertext = cipher
-            .encrypt(nonce, full_inner.as_slice())
-            .expect("XChaCha20-Poly1305 encryption is infallible for in-memory buffers");
-
-        let mut packet = vec![TYPE_DATA];
-        packet.extend_from_slice(&due.session_id);
-        packet.extend_from_slice(&nonce_bytes);
-        packet.extend_from_slice(&ciphertext);
-
+        let packet = wrap_for_recipient(&link_key, &due.session_id, &due.payload);
         // Already taken off the queue: on failure, skip just this one.
         match socket.send_to(&packet, due.addr).await {
             Ok(_) => debug!("Sent {} bytes (re-encrypted) to {}", packet.len(), due.addr),
@@ -421,6 +457,27 @@ mod tests {
     // ==========================================
     // Missing Edge Case: Server Relay & Handshake Tests
     // ==========================================
+
+    #[test]
+    fn test_dummy_packet_matches_forwarded_chat_packet() {
+        let mut link_key = [0u8; 32];
+        OsRng.fill_bytes(&mut link_key);
+        let session_id = [7u8; 4];
+
+        let dummy = dummy_packet(&link_key, &session_id);
+        let chat = wrap_for_recipient(&link_key, &session_id, &[0x07; CHAT_INNER_PAYLOAD_LEN]);
+        assert_eq!(dummy.len(), 1154, "same size as a client's FEC chat packet");
+        assert_eq!(dummy.len(), chat.len());
+        assert_eq!(dummy[..5], chat[..5], "same packet type and session id");
+
+        // Framed as the client expects: the zero routing prefix it strips,
+        // then an inner payload starting with the type byte it ignores.
+        let plaintext = XChaCha20Poly1305::new(Key::from_slice(&link_key))
+            .decrypt(XNonce::from_slice(&dummy[5..29]), &dummy[29..])
+            .unwrap();
+        assert_eq!(plaintext[..16], [0u8; 16]);
+        assert_eq!(plaintext[16], INNER_TYPE_DUMMY);
+    }
 
     #[test]
     fn test_edge_case_invalid_handshake() {
