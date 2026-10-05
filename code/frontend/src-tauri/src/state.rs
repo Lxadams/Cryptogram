@@ -36,7 +36,7 @@ pub struct PendingIdentity {
     /// `client` crate) and carried forward only as this key — the passcode
     /// itself is zeroized and dropped inside the `login` command, never
     /// stored in `AppState`. `bootstrap` uses this to open the identity's
-    /// SQLCipher chat-history database. `Zeroizing` wipes it from memory
+    /// SQLCipher identity-state and chat-history databases. `Zeroizing` wipes it from memory
     /// once `bootstrap` takes it (or on logout, whichever comes first).
     pub vault_key: Zeroizing<[u8; 32]>,
 }

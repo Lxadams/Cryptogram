@@ -321,10 +321,10 @@ pub fn App() -> impl IntoView {
 }
 
 /// Screen 1 (default): log in with a username + passcode that already has a
-/// saved identity. This is a UI-layer gate only — see `hash_passcode`'s doc
-/// comment in `code/client/src/lib.rs` — it decides which pseudonym's
-/// identity file the Connect screen's `bootstrap` call will load next,
-/// nothing here touches the network. No saved identity for that username?
+/// saved identity. The passcode derives the vault key that decrypts that
+/// identity's SQLCipher stores (see `derive_vault_key` in
+/// `code/client/src/lib.rs`); this screen decides which identity the Connect
+/// screen's `bootstrap` call will load next, nothing here touches the network. No saved identity for that username?
 /// The "Create identity" button hands off to `CreateIdentityScreen` instead
 /// of trying to create one inline.
 #[component]
@@ -563,8 +563,8 @@ fn LoginScreen(
 /// Screen 1b: mint a brand-new identity behind a chosen username + passcode.
 /// On success, hands back to `LoginScreen` rather than proceeding straight
 /// to Connect — the user logs in with what they just chose, same as any
-/// other identity. This is a UI-layer gate only, same caveat as
-/// `LoginScreen` — see `hash_passcode`'s doc comment in
+/// other identity. The passcode chosen here is what encrypts the identity's
+/// local stores — see `hash_passcode`'s doc comment in
 /// `code/client/src/lib.rs`.
 #[component]
 fn CreateIdentityScreen(
@@ -640,7 +640,7 @@ fn CreateIdentityScreen(
     }
 }
 
-/// Screen 1: paste the relay's printed Ed25519 pubkey and perform the link
+/// Screen 2: paste the relay's printed Ed25519 pubkey and perform the link
 /// handshake. Mirrors the CLI's required command-line argument — same
 /// trust model, just entered through a text field instead of argv.
 #[component]
@@ -691,7 +691,7 @@ fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView 
     }
 }
 
-/// Screen 2: everything after a successful handshake — our identity (to
+/// Screen 3: everything after a successful handshake — our identity (to
 /// share with peers), the contact list, and a chat panel for whichever
 /// contact is selected.
 #[component]

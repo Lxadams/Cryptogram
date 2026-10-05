@@ -328,7 +328,7 @@ const PRESENCE_LEN: usize = HEADER_LEN + SIG_LEN;
 
 /// A lightweight "I'm still here" signal sent periodically to each
 /// established contact so their client can show an online/offline marker.
-/// Deliberately outside the E2E double ratchet (unlike 0x01 Msg) — it
+/// Deliberately outside the E2E hash ratchet (unlike 0x01 Msg) — it
 /// doesn't need confidentiality (liveness isn't secret, and the relay
 /// already sees routing-token traffic patterns), only authenticity and
 /// freshness, so it's just signed like KeyExchange/PQInject rather than

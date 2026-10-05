@@ -42,11 +42,11 @@ const MAX_TIMESTAMP_DRIFT: u64 = 300;
 // How long `perform_handshake` waits for the relay's reply
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Where `Client::save`/callers' `ClientStateDto::load` persist identity +
-/// session state. Overridable via `E2E_STATE_FILE` so multiple peer
-/// processes (e.g. `code/frontend`'s Tauri backend, one per `runpeer.sh`
-/// invocation) can each keep their own identity without relying on process
-/// cwd tricks.
+/// Where the CLI's plaintext `ClientStateDto` save/load goes (the desktop
+/// app instead uses an `IdentityStateStore` per identity, under its app-data
+/// directory). Overridable via `E2E_STATE_FILE` so multiple CLI peers (e.g.
+/// one per Docker volume) can each keep their own identity without relying
+/// on process cwd tricks.
 pub fn state_file_path() -> String {
     std::env::var("E2E_STATE_FILE").unwrap_or_else(|_| "client_state.json".to_string())
 }
@@ -151,7 +151,7 @@ fn parse_passcode_hash(stored: &str) -> Option<ParsedPasscodeHash> {
 /// Hash a login passcode for storage as `identities/<pseudonym>/passcode.hash`.
 /// Real Argon2id KDF — besides gating login, this stored hash's salt/params
 /// are also what `derive_vault_key` recomputes from to unlock the identity's
-/// SQLCipher chat-history database.
+/// SQLCipher identity-state and chat-history databases.
 /// Format: `"argon2id$<m_cost>$<t_cost>$<p_cost>$<salt_hex>$<verifier_hex>"`.
 pub fn hash_passcode(passcode: &str) -> String {
     let mut salt = [0u8; ARGON2_SALT_LEN];
@@ -177,7 +177,8 @@ pub fn verify_passcode(passcode: &str, stored: &str) -> bool {
 
 /// Recompute the Argon2id master secret `hash_passcode` derived at creation
 /// time and, only if it matches the stored login verifier, return the vault
-/// key used to unlock this identity's SQLCipher chat-history database.
+/// key used to unlock this identity's SQLCipher identity-state and
+/// chat-history databases.
 ///
 /// The verifier and the vault key are independent HKDF-SHA256 expansions
 /// (different labels) of one Argon2id output that itself is never stored or
@@ -541,7 +542,7 @@ impl Client {
     /// Build a signed presence ping for `target_token` (see
     /// `PresencePayload`) and link-encrypt it for the relay, the same way
     /// `create_encrypted_packet` does for a chat message. Deliberately
-    /// outside the E2E double ratchet — see the doc comment on
+    /// outside the E2E hash ratchet — see the doc comment on
     /// `PresencePayload` for why.
     pub fn generate_presence_packet(&self, target_token: RoutingToken) -> Vec<u8> {
         let payload = PresencePayload::generate(&self.identity, target_token);
@@ -1948,7 +1949,7 @@ mod tests {
 
     #[test]
     fn test_key_exchange_propagates_display_name() {
-        // A self-chosen name (e.g. set via `./runpeer.sh alice`) should
+        // A self-chosen name (the desktop app's login username) should
         // reach the peer automatically as part of the KeyExchange — no
         // manual entry by the other side, in either direction.
         let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
