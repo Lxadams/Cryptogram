@@ -393,16 +393,16 @@ impl<S: Copy + Eq + Hash> Reassembler<S> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// SplitMix64 — a tiny seeded PRNG so every loss pattern below is
+/// Test helpers, also used by the `client` crate's tests (via the
+/// `test-util` feature).
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util {
+    /// SplitMix64 — a tiny seeded PRNG so every loss pattern is
     /// reproducible without pulling in a `rand` dependency.
-    struct Rng(u64);
+    pub struct Rng(pub u64);
 
     impl Rng {
-        fn next_u64(&mut self) -> u64 {
+        pub fn next_u64(&mut self) -> u64 {
             self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = self.0;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -411,24 +411,30 @@ mod tests {
         }
 
         /// Uniform in [0, 1).
-        fn unit(&mut self) -> f64 {
+        pub fn unit(&mut self) -> f64 {
             (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
         }
 
-        fn below(&mut self, n: usize) -> usize {
+        pub fn below(&mut self, n: usize) -> usize {
             (self.next_u64() % n as u64) as usize
         }
 
-        fn shuffle<T>(&mut self, items: &mut [T]) {
+        pub fn shuffle<T>(&mut self, items: &mut [T]) {
             for i in (1..items.len()).rev() {
                 items.swap(i, self.below(i + 1));
             }
         }
 
-        fn bytes(&mut self, len: usize) -> Vec<u8> {
+        pub fn bytes(&mut self, len: usize) -> Vec<u8> {
             (0..len).map(|_| self.next_u64() as u8).collect()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::Rng;
+    use super::*;
 
     fn now() -> Instant {
         Instant::now()

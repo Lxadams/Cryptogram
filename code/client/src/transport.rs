@@ -16,7 +16,11 @@
 //! Bundling the PQ inject with its message is what keeps the ratchet in step
 //! under loss: the two arrive together or not at all, and in order. A later
 //! message that overtakes the bundle (its own object finished decoding
-//! first) is parked in `FecReceiver` and retried once the inject lands.
+//! first) is parked in `FecReceiver` and retried once the inject lands; the
+//! inject itself names the chain position it applies at, so it's mixed in
+//! at exactly that point however early or late it arrives. Only sealed
+//! messages are parked: the seal proves the sender, so strangers can't fill
+//! the queue.
 
 use crate::{HKDF_SALT, RoutingToken};
 use anyhow::Result;
@@ -27,14 +31,18 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
+use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Interval, MissedTickBehavior};
 
 /// Packet loss each burst is sized to survive: the jammed side's link (the
 /// sender's uplink or the receiver's downlink) dropping 70% of packets.
-pub const FEC_DESIGN_LOSS: f64 = 0.7;
+const FEC_DESIGN_LOSS: f64 = 0.7;
 /// Chance a chat message may fail to arrive at `FEC_DESIGN_LOSS`: 1 in
 /// 10,000 (27 packets for a short message).
 const MESSAGE_MAX_FAILURE: f64 = 1e-4;
@@ -42,7 +50,7 @@ const MESSAGE_MAX_FAILURE: f64 = 1e-4;
 /// desyncs the ratchet for good, not just one message.
 const PQ_MESSAGE_MAX_FAILURE: f64 = 1e-6;
 /// Gap between consecutive packets of a burst (see `send_burst`).
-pub const FEC_PACKET_SPACING: Duration = Duration::from_millis(10);
+const FEC_PACKET_SPACING: Duration = Duration::from_millis(10);
 /// Longest plaintext `create_fec_packets` accepts — what fits in one FEC
 /// object alongside the message header and a PQ inject, with room to spare.
 pub const MAX_FEC_MESSAGE_LEN: usize = fec::MAX_OBJECT_LEN - 2048;
@@ -94,13 +102,14 @@ pub(crate) fn unbundle(mut object: &[u8]) -> Option<Vec<&[u8]>> {
 }
 
 /// Bundle a ratchet-encrypted message (and the PQ inject that follows it,
-/// if any) into one FEC object, encode it for `FEC_DESIGN_LOSS`, and seal
-/// every symbol for `target`. Returns 0x07 inner payloads, not yet
+/// if any) into FEC object `object_id`, encode it for `FEC_DESIGN_LOSS`,
+/// and seal every symbol for `target`. Returns 0x07 inner payloads, not yet
 /// link-encrypted.
 pub(crate) fn encode_message(
     root_key: &[u8; 32],
     sender: &RoutingToken,
     target: &RoutingToken,
+    object_id: u32,
     message: &[u8],
     pq_inject: Option<&[u8]>,
 ) -> Result<Vec<Vec<u8>>> {
@@ -109,7 +118,7 @@ pub(crate) fn encode_message(
         None => (bundle(&[message]), MESSAGE_MAX_FAILURE),
     };
     let packets = fec::packets_for(object.len(), FEC_DESIGN_LOSS, max_failure);
-    let symbols = fec::encode(OsRng.next_u32(), &object, packets)?;
+    let symbols = fec::encode(object_id, &object, packets)?;
     Ok(seal_symbols(root_key, sender, target, &symbols))
 }
 
@@ -148,9 +157,9 @@ fn seal_symbols(
 
 /// Open a sealed symbol (`sealed` = nonce || ciphertext, i.e. the 0x07
 /// payload after its sender token). `None` unless it was sealed by
-/// `sender` for `target` under this session's root key.
-pub(crate) fn open_symbol(
-    root_key: &[u8; 32],
+/// `sender` for `target` with this session's seal cipher.
+fn open_symbol(
+    cipher: &XChaCha20Poly1305,
     sender: &RoutingToken,
     target: &RoutingToken,
     sealed: &[u8],
@@ -159,7 +168,7 @@ pub(crate) fn open_symbol(
         return None;
     }
     let (nonce, ciphertext) = sealed.split_at(NONCE_LEN);
-    seal_cipher(root_key)
+    cipher
         .decrypt(
             XNonce::from_slice(nonce),
             Payload {
@@ -170,159 +179,240 @@ pub(crate) fn open_symbol(
         .ok()
 }
 
-/// Receive-side FEC state: half-rebuilt objects, plus chat messages parked
-/// because they arrived ahead of the PQ inject they were encrypted after.
-/// Transient — never persisted (a restart just drops anything in flight).
+/// Receive-side FEC state: per-session seal ciphers, half-rebuilt objects,
+/// and chat messages parked because they arrived ahead of the PQ inject
+/// they were encrypted after. Transient — never persisted (a restart just
+/// drops anything in flight).
 #[derive(Default)]
 pub struct FecReceiver {
-    pub(crate) reassembler: fec::Reassembler<RoutingToken>,
-    deferred: HashMap<RoutingToken, VecDeque<(Instant, Vec<u8>)>>,
+    /// Keyed by (sender, session epoch): object ids are per-session seq
+    /// numbers, so a re-established session's ids mustn't hit the previous
+    /// session's, still remembered as completed.
+    reassembler: fec::Reassembler<(RoutingToken, u64)>,
+    peers: HashMap<RoutingToken, PeerSeal>,
+    next_epoch: u64,
+    /// Parked 0x01 payloads per sender, keyed by seq number.
+    deferred: HashMap<RoutingToken, BTreeMap<u64, (Instant, Vec<u8>)>>,
+}
+
+/// A peer's symbol-opening cipher, derived once per session rather than
+/// once per symbol, and the epoch that session's objects reassemble under.
+struct PeerSeal {
+    root_key: [u8; 32],
+    cipher: XChaCha20Poly1305,
+    epoch: u64,
 }
 
 impl FecReceiver {
-    /// Park an undecryptable 0x01 payload from `sender` for a later retry.
-    pub(crate) fn defer(&mut self, sender: RoutingToken, payload: Vec<u8>, now: Instant) {
-        let queue = self.deferred.entry(sender).or_default();
-        queue.retain(|(parked, _)| now.saturating_duration_since(*parked) < DEFER_TTL);
-        if queue.len() >= MAX_DEFERRED_PER_PEER {
-            queue.pop_front();
+    /// Open a sealed symbol from `sender` (see `open_symbol`) under the
+    /// session `root_key` belongs to. A session not seen before gets a fresh
+    /// cipher and reassembly epoch, and anything still parked from the
+    /// sender's previous session is dropped (it can't decrypt any more).
+    pub(crate) fn open(
+        &mut self,
+        root_key: &[u8; 32],
+        sender: &RoutingToken,
+        target: &RoutingToken,
+        sealed: &[u8],
+    ) -> Option<Vec<u8>> {
+        if self
+            .peers
+            .get(sender)
+            .is_none_or(|peer| peer.root_key != *root_key)
+        {
+            self.next_epoch += 1;
+            self.peers.insert(
+                *sender,
+                PeerSeal {
+                    root_key: *root_key,
+                    cipher: seal_cipher(root_key),
+                    epoch: self.next_epoch,
+                },
+            );
+            self.deferred.remove(sender);
         }
-        queue.push_back((now, payload));
+        open_symbol(&self.peers[sender].cipher, sender, target, sealed)
     }
 
-    /// Everything still fresh that's parked for `sender`, oldest first.
-    pub(crate) fn take_deferred(&mut self, sender: &RoutingToken, now: Instant) -> Vec<Vec<u8>> {
+    /// Feed a symbol `open` returned to the reassembler: the rebuilt object
+    /// the first time enough of its symbols have arrived.
+    pub(crate) fn reassemble(
+        &mut self,
+        sender: RoutingToken,
+        symbol: &[u8],
+        now: Instant,
+    ) -> Result<Option<Vec<u8>>, fec::FecError> {
+        let epoch = self.peers.get(&sender).map_or(0, |peer| peer.epoch);
+        self.reassembler.ingest((sender, epoch), symbol, now)
+    }
+
+    /// Park the undecryptable 0x01 message `seq` from `sender` for a later
+    /// retry. `parked_at` is when it was first parked: re-parking after a
+    /// failed retry keeps it, so a message can't outlive `DEFER_TTL`.
+    pub(crate) fn defer(
+        &mut self,
+        sender: RoutingToken,
+        seq: u64,
+        payload: Vec<u8>,
+        parked_at: Instant,
+        now: Instant,
+    ) {
+        let fresh = |parked: &Instant| now.saturating_duration_since(*parked) < DEFER_TTL;
+        if !fresh(&parked_at) {
+            return;
+        }
+        let queue = self.deferred.entry(sender).or_default();
+        queue.retain(|_, (parked, _)| fresh(parked));
+        queue.entry(seq).or_insert((parked_at, payload));
+        // Over the cap, drop the furthest-ahead message: lower seq numbers
+        // are the ones the next PQ inject unblocks first.
+        if queue.len() > MAX_DEFERRED_PER_PEER {
+            queue.pop_last();
+        }
+    }
+
+    /// Everything still fresh that's parked for `sender`, in seq order, as
+    /// (parked_at, payload).
+    pub(crate) fn take_deferred(
+        &mut self,
+        sender: &RoutingToken,
+        now: Instant,
+    ) -> Vec<(Instant, Vec<u8>)> {
         self.deferred
             .remove(sender)
             .into_iter()
             .flatten()
+            .map(|(_, entry)| entry)
             .filter(|(parked, _)| now.saturating_duration_since(*parked) < DEFER_TTL)
-            .map(|(_, payload)| payload)
             .collect()
     }
 
     #[cfg(test)]
     pub(crate) fn deferred_count(&self, sender: &RoutingToken) -> usize {
-        self.deferred.get(sender).map_or(0, VecDeque::len)
+        self.deferred.get(sender).map_or(0, BTreeMap::len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_objects(&self) -> usize {
+        self.reassembler.pending_objects()
+    }
+}
+
+/// Ticks every `FEC_PACKET_SPACING`. After a stall (a busy runtime, a slow
+/// disk write) it carries on at the normal spacing instead of firing the
+/// missed ticks back to back, which would send a run of packets unpaced.
+fn pacer() -> Interval {
+    let mut ticker = tokio::time::interval(FEC_PACKET_SPACING);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker
+}
+
+/// Send each packet on its own `ticker` tick. A failed send is skipped
+/// rather than aborting the rest: a lost packet is exactly what the
+/// redundancy is for.
+async fn send_paced(
+    ticker: &mut Interval,
+    socket: &UdpSocket,
+    addr: SocketAddr,
+    packets: &[Vec<u8>],
+) {
+    for packet in packets {
+        ticker.tick().await; // the first tick after idling is immediate
+        let _ = socket.send_to(packet, addr).await;
     }
 }
 
 /// Transmit one message's FEC packets at a steady `FEC_PACKET_SPACING`, so
 /// a short jamming spike can only take a few of them — the code tolerates
-/// losing most of a burst, just not all of it at once. A failed send is
-/// skipped rather than aborting the rest: a lost packet is exactly what the
-/// redundancy is for. Run it on its own task (it takes a few hundred ms),
-/// not while holding the client lock.
-pub async fn send_burst(socket: &UdpSocket, addr: SocketAddr, packets: &[Vec<u8>]) {
-    let mut ticker = tokio::time::interval(FEC_PACKET_SPACING);
-    for packet in packets {
-        ticker.tick().await; // first tick is immediate
-        let _ = socket.send_to(packet, addr).await;
+/// losing most of a burst, just not all of it at once. Fails, abandoning
+/// the burst, only if its first packet can't be sent: then nothing is
+/// getting out. Front ends use `BurstSender`, which also keeps bursts in
+/// order.
+pub async fn send_burst(
+    socket: &UdpSocket,
+    addr: SocketAddr,
+    packets: &[Vec<u8>],
+) -> io::Result<()> {
+    let Some((first, rest)) = packets.split_first() else {
+        return Ok(());
+    };
+    let mut ticker = pacer();
+    ticker.tick().await;
+    socket.send_to(first, addr).await?;
+    send_paced(&mut ticker, socket, addr, rest).await;
+    Ok(())
+}
+
+type BurstJob = (Vec<Vec<u8>>, oneshot::Sender<io::Result<()>>);
+
+/// Sends bursts (see `send_burst`) one at a time, in the order they were
+/// queued, on a task of its own: one message's burst never interleaves with
+/// the next one's, so the receiver finishes rebuilding them in send order,
+/// and the spacing holds across back-to-back bursts too. Cheap to clone;
+/// the task ends once every clone is dropped and the queue has drained.
+#[derive(Clone)]
+pub struct BurstSender(mpsc::UnboundedSender<BurstJob>);
+
+impl BurstSender {
+    /// Start the sending task for `socket` → `addr`. Must be called from
+    /// within a Tokio runtime.
+    pub fn spawn(socket: Arc<UdpSocket>, addr: SocketAddr) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<BurstJob>();
+        tokio::spawn(async move {
+            let mut ticker = pacer();
+            while let Some((packets, first_sent)) = rx.recv().await {
+                let Some((first, rest)) = packets.split_first() else {
+                    let _ = first_sent.send(Ok(()));
+                    continue;
+                };
+                ticker.tick().await;
+                let result = socket.send_to(first, addr).await.map(drop);
+                let failed = result.is_err();
+                let _ = first_sent.send(result);
+                if !failed {
+                    send_paced(&mut ticker, &socket, addr, rest).await;
+                }
+            }
+        });
+        Self(tx)
+    }
+
+    /// Queue one message's burst behind any still going out. Resolves once
+    /// its first packet has been sent — `Err` if it couldn't be, in which
+    /// case none of it leaves this machine — while the rest is paced out in
+    /// the background.
+    pub async fn send(&self, packets: Vec<Vec<u8>>) -> io::Result<()> {
+        let stopped = || io::Error::other("burst sender task has stopped");
+        let (tx, rx) = oneshot::channel();
+        self.0.send((packets, tx)).map_err(|_| stopped())?;
+        rx.await.map_err(|_| stopped())?
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Client, SymmetricSessionState};
-    use std::net::SocketAddr;
+    use crate::Client;
+    use crate::test_support::{
+        Rng, cleanup, connect, connected_pair, inbox_texts, new_client, relay, session,
+    };
 
-    /// SplitMix64: reproducible loss/reorder patterns without a `rand` dep.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-
-        fn unit(&mut self) -> f64 {
-            (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-        }
-
-        fn shuffle<T>(&mut self, items: &mut [T]) {
-            for i in (1..items.len()).rev() {
-                items.swap(i, (self.next_u64() % (i as u64 + 1)) as usize);
-            }
-        }
-    }
-
-    /// What the relay does to a client's packet before forwarding it: strip
-    /// the sender's link layer and the routing token, leaving the inner
-    /// payload (the recipient's own link layer is re-added and removed
-    /// symmetrically, so tests skip it, like the rest of the suite does).
-    fn relay(packet: &[u8], sender: &Client) -> Vec<u8> {
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&sender.link_master_key));
-        let inner = cipher
-            .decrypt(XNonce::from_slice(&packet[5..29]), &packet[29..])
-            .unwrap();
-        inner[16..].to_vec()
-    }
-
-    /// A fresh client whose persistence points at a scratch path.
-    fn new_client() -> Client {
-        let addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
-        let mut client = Client::new(addr);
-        client.state_path = std::env::temp_dir()
-            .join(format!(
-                "e2e-fec-test-{}.json",
-                hex::encode(client.identity.routing_token)
-            ))
-            .to_string_lossy()
-            .into_owned();
-        client
-    }
-
-    /// Establish an E2E session (KeyExchange → reply → SessionEstablish,
-    /// exactly as over the wire) on a clean link.
-    fn connect(initiator: &mut Client, responder: &mut Client) {
-        initiator.pending_contacts.insert(
-            responder.identity.routing_token,
-            responder.identity.ed25519_public,
-        );
-        let kx = initiator.create_kx_request(responder.identity.routing_token);
-        let reply = responder
-            .handle_incoming_packet(&relay(&kx, initiator))
-            .unwrap()
-            .unwrap();
-        let est = initiator
-            .handle_incoming_packet(&relay(&reply, responder))
-            .unwrap()
-            .unwrap();
-        responder
-            .handle_incoming_packet(&relay(&est, initiator))
-            .unwrap();
-        assert!(
-            responder
-                .e2e_sessions
-                .contains_key(&initiator.identity.routing_token)
-        );
-    }
-
-    fn connected_pair() -> (Client, Client) {
-        let (mut alice, mut bob) = (new_client(), new_client());
-        connect(&mut alice, &mut bob);
-        (alice, bob)
-    }
-
-    fn session<'a>(of: &'a Client, with: &Client) -> &'a SymmetricSessionState {
-        &of.e2e_sessions[&with.identity.routing_token]
-    }
-
-    fn inbox_texts(client: &mut Client) -> Vec<String> {
-        client
-            .drain_inbox()
-            .into_iter()
-            .map(|(_, pt, _)| String::from_utf8(pt).unwrap())
+    /// Each message's burst, as the relay hands it to the recipient.
+    fn bursts(from: &mut Client, to: &Client, count: usize) -> Vec<Vec<Vec<u8>>> {
+        (0..count)
+            .map(|i| {
+                from.create_fec_packets(to.identity.routing_token, format!("m{i}").as_bytes())
+                    .unwrap()
+                    .iter()
+                    .map(|p| relay(p, from))
+                    .collect()
+            })
             .collect()
     }
 
-    fn cleanup(clients: &[&Client]) {
-        for c in clients {
-            let _ = std::fs::remove_file(&c.state_path);
+    fn deliver(to: &mut Client, burst: &[Vec<u8>]) {
+        for inner in burst {
+            to.handle_incoming_packet(inner).unwrap();
         }
     }
 
@@ -394,31 +484,17 @@ mod tests {
     #[test]
     fn message_overtaking_its_pq_inject_is_recovered() {
         let (mut alice, mut bob) = connected_pair();
-        let bob_token = bob.identity.routing_token;
-        let bursts: Vec<Vec<Vec<u8>>> = (0..6)
-            .map(|i| {
-                alice
-                    .create_fec_packets(bob_token, format!("m{i}").as_bytes())
-                    .unwrap()
-                    .iter()
-                    .map(|p| relay(p, &alice))
-                    .collect()
-            })
-            .collect();
+        let bursts = bursts(&mut alice, &bob, 6);
 
         for i in [0, 1, 2, 3, 5] {
-            for inner in &bursts[i] {
-                bob.handle_incoming_packet(inner).unwrap();
-            }
+            deliver(&mut bob, &bursts[i]);
         }
         assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2", "m3"]);
         assert_eq!(bob.fec_rx.deferred_count(&alice.identity.routing_token), 1);
 
         // Message 4 + its PQ inject arrive last: 4 decrypts, the inject
         // lands, and the parked message 5 goes through right after.
-        for inner in &bursts[4] {
-            bob.handle_incoming_packet(inner).unwrap();
-        }
+        deliver(&mut bob, &bursts[4]);
         assert_eq!(inbox_texts(&mut bob), ["m4", "m5"]);
         assert_eq!(bob.fec_rx.deferred_count(&alice.identity.routing_token), 0);
         assert_eq!(
@@ -428,19 +504,98 @@ mod tests {
         cleanup(&[&alice, &bob]);
     }
 
-    /// Re-delivering an already-read message (a replay, or a straggler) can
-    /// never succeed later, so it must not sit in the deferred queue.
+    /// The race the review found: a later PQ inject (message 9's) finishes
+    /// decoding before an earlier one (message 4's). Each must land at its
+    /// own chain position, not wherever the chain happens to be, or the
+    /// session is corrupted for good.
+    #[test]
+    fn pq_injects_arriving_out_of_order_land_at_their_own_positions() {
+        let (mut alice, mut bob) = connected_pair();
+        let bursts = bursts(&mut alice, &bob, 11);
+
+        for i in [0, 1, 2, 3, 5, 6, 7, 8, 9] {
+            deliver(&mut bob, &bursts[i]);
+        }
+        assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2", "m3"]);
+        assert_eq!(bob.fec_rx.deferred_count(&alice.identity.routing_token), 5);
+        assert!(session(&bob, &alice).pending_pq.contains_key(&10));
+
+        deliver(&mut bob, &bursts[4]);
+        assert_eq!(inbox_texts(&mut bob), ["m4", "m5", "m6", "m7", "m8", "m9"]);
+        deliver(&mut bob, &bursts[10]);
+        assert_eq!(inbox_texts(&mut bob), ["m10"]);
+        assert_eq!(
+            session(&alice, &bob).send_chain_key,
+            session(&bob, &alice).recv_chain_key
+        );
+        cleanup(&[&alice, &bob]);
+    }
+
+    /// A bare 0x01 is unauthenticated until it decrypts, so one that can't
+    /// is never held: forged ones can't push genuine parked messages out.
+    #[test]
+    fn forged_bare_messages_are_never_parked() {
+        let (mut alice, mut bob) = connected_pair();
+        let alice_token = alice.identity.routing_token;
+        let bursts = bursts(&mut alice, &bob, 6);
+        for i in [0, 1, 2, 3, 5] {
+            deliver(&mut bob, &bursts[i]);
+        }
+        assert_eq!(bob.fec_rx.deferred_count(&alice_token), 1);
+
+        for seq in 0..2 * MAX_DEFERRED_PER_PEER as u64 {
+            let mut forged = vec![0x01];
+            forged.extend_from_slice(&alice_token);
+            forged.extend_from_slice(&(5 + seq).to_be_bytes());
+            forged.extend_from_slice(&[0u8; 24 + 32]);
+            bob.handle_incoming_packet(&forged).unwrap();
+        }
+        assert_eq!(bob.fec_rx.deferred_count(&alice_token), 1);
+
+        deliver(&mut bob, &bursts[4]);
+        assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2", "m3", "m4", "m5"]);
+        cleanup(&[&alice, &bob]);
+    }
+
+    /// A sealed re-delivery of an already-read message (a straggler, or
+    /// the relay replaying it under a new object) can never succeed later,
+    /// so it must not sit in the deferred queue.
     #[test]
     fn stale_messages_are_not_parked() {
         let (mut alice, mut bob) = connected_pair();
-        let (msg, _) = alice
-            .create_encrypted_packet(bob.identity.routing_token, b"once")
-            .unwrap();
+        let (alice_token, bob_token) = (alice.identity.routing_token, bob.identity.routing_token);
+        let (msg, _) = alice.create_encrypted_packet(bob_token, b"once").unwrap();
         let inner = relay(&msg, &alice);
         bob.handle_incoming_packet(&inner).unwrap();
-        bob.handle_incoming_packet(&inner).unwrap();
+        let root = session(&bob, &alice).root_key;
+        for object_id in [100, 101] {
+            let burst = encode_message(&root, &alice_token, &bob_token, object_id, &inner, None);
+            deliver(&mut bob, &burst.unwrap());
+        }
         assert_eq!(inbox_texts(&mut bob), ["once"]);
-        assert_eq!(bob.fec_rx.deferred_count(&alice.identity.routing_token), 0);
+        assert_eq!(bob.fec_rx.deferred_count(&alice_token), 0);
+        cleanup(&[&alice, &bob]);
+    }
+
+    /// Object ids are per-session seq numbers, so a re-established session
+    /// reuses ids the previous one already completed — which must not be
+    /// mistaken for stragglers.
+    #[test]
+    fn reestablished_session_reuses_object_ids_cleanly() {
+        let (mut alice, mut bob) = connected_pair();
+        for burst in bursts(&mut alice, &bob, 3) {
+            deliver(&mut bob, &burst);
+        }
+        assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2"]);
+
+        alice.forget_contact(bob.identity.routing_token);
+        bob.forget_contact(alice.identity.routing_token);
+        connect(&mut alice, &mut bob);
+        assert_eq!(session(&alice, &bob).send_count, 0);
+        for burst in bursts(&mut alice, &bob, 3) {
+            deliver(&mut bob, &burst);
+        }
+        assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2"]);
         cleanup(&[&alice, &bob]);
     }
 
@@ -490,7 +645,7 @@ mod tests {
             bob.handle_incoming_packet(&foreign).unwrap();
         }
         assert!(bob.drain_inbox().is_empty());
-        assert_eq!(bob.fec_rx.reassembler.pending_objects(), 0);
+        assert_eq!(bob.fec_rx.pending_objects(), 0);
 
         // The genuine burst still works afterwards.
         for inner in &burst {
@@ -519,7 +674,9 @@ mod tests {
         let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let packets: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 100]).collect();
-        send_burst(&tx, rx.local_addr().unwrap(), &packets).await;
+        send_burst(&tx, rx.local_addr().unwrap(), &packets)
+            .await
+            .unwrap();
         let mut buf = [0u8; 256];
         for expected in &packets {
             let (len, _) = rx.recv_from(&mut buf).await.unwrap();
@@ -535,7 +692,9 @@ mod tests {
         let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let packets: Vec<Vec<u8>> = (0..11u8).map(|i| vec![i; 64]).collect();
         let started = Instant::now();
-        send_burst(&tx, rx.local_addr().unwrap(), &packets).await;
+        send_burst(&tx, rx.local_addr().unwrap(), &packets)
+            .await
+            .unwrap();
         let spread = started.elapsed();
         assert!(
             spread >= FEC_PACKET_SPACING * 9,
@@ -550,26 +709,23 @@ mod tests {
     fn sealed_symbols_are_bound_to_key_sender_and_recipient() {
         let root = [1u8; 32];
         let (a, b, c) = ([0xA; 16], [0xB; 16], [0xC; 16]);
-        let inner = encode_message(&root, &a, &b, b"\x01not really a message", None).unwrap();
+        let inner = encode_message(&root, &a, &b, 0, b"\x01not really a message", None).unwrap();
         assert_eq!(&inner[0][..17], [&[0x07][..], &a].concat());
         let sealed = &inner[0][17..];
 
-        let symbol = open_symbol(&root, &a, &b, sealed).expect("intended recipient opens it");
+        let open = |key: &[u8; 32], sender, target, sealed: &[u8]| {
+            open_symbol(&seal_cipher(key), sender, target, sealed)
+        };
+        let symbol = open(&root, &a, &b, sealed).expect("intended recipient opens it");
         assert_eq!(symbol.len(), fec::HEADER_LEN + fec::symbol_size_for(2 + 21));
-        assert!(
-            open_symbol(&[2u8; 32], &a, &b, sealed).is_none(),
-            "other key"
-        );
-        assert!(open_symbol(&root, &b, &a, sealed).is_none(), "reflected");
-        assert!(open_symbol(&root, &c, &b, sealed).is_none(), "relabelled");
-        assert!(open_symbol(&root, &a, &c, sealed).is_none(), "redirected");
-        assert!(
-            open_symbol(&root, &a, &b, &sealed[..23]).is_none(),
-            "truncated"
-        );
+        assert!(open(&[2u8; 32], &a, &b, sealed).is_none(), "other key");
+        assert!(open(&root, &b, &a, sealed).is_none(), "reflected");
+        assert!(open(&root, &c, &b, sealed).is_none(), "relabelled");
+        assert!(open(&root, &a, &c, sealed).is_none(), "redirected");
+        assert!(open(&root, &a, &b, &sealed[..23]).is_none(), "truncated");
         let mut bad_nonce = sealed.to_vec();
         bad_nonce[0] ^= 1;
-        assert!(open_symbol(&root, &a, &b, &bad_nonce).is_none(), "tampered");
+        assert!(open(&root, &a, &b, &bad_nonce).is_none(), "tampered");
     }
 
     #[test]
@@ -577,8 +733,8 @@ mod tests {
         let (root, a, b) = ([3u8; 32], [0xA; 16], [0xB; 16]);
         let message = vec![0x01; 200];
         let pq = vec![0x05; 1193];
-        let plain = encode_message(&root, &a, &b, &message, None).unwrap();
-        let with_pq = encode_message(&root, &a, &b, &message, Some(&pq)).unwrap();
+        let plain = encode_message(&root, &a, &b, 0, &message, None).unwrap();
+        let with_pq = encode_message(&root, &a, &b, 1, &message, Some(&pq)).unwrap();
         assert_eq!(
             plain.len() as u32,
             fec::packets_for(2 + message.len(), FEC_DESIGN_LOSS, MESSAGE_MAX_FAILURE)
@@ -649,24 +805,71 @@ mod tests {
     }
 
     #[test]
-    fn deferred_queue_is_bounded_per_peer_and_expires() {
+    fn deferred_queue_is_bounded_per_peer_ordered_and_expires() {
         let mut rx = FecReceiver::default();
         let t = Instant::now();
         let (peer, other) = ([7u8; 16], [8u8; 16]);
-        for i in 0..40u8 {
-            rx.defer(peer, vec![i], t);
+        for seq in (0..40u64).rev() {
+            rx.defer(peer, seq, vec![seq as u8], t, t);
         }
         assert_eq!(rx.deferred_count(&peer), MAX_DEFERRED_PER_PEER);
-        let taken = rx.take_deferred(&peer, t);
-        // The oldest were dropped to make room; order is preserved.
-        assert_eq!(taken.first(), Some(&vec![40 - MAX_DEFERRED_PER_PEER as u8]));
-        assert_eq!(taken.last(), Some(&vec![39]));
+        let taken: Vec<Vec<u8>> = rx
+            .take_deferred(&peer, t)
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        // The furthest-ahead were dropped to make room; seq order on the way out.
+        let expected: Vec<Vec<u8>> = (0..MAX_DEFERRED_PER_PEER as u8).map(|i| vec![i]).collect();
+        assert_eq!(taken, expected);
         assert_eq!(rx.deferred_count(&peer), 0);
 
-        rx.defer(peer, vec![1], t);
-        rx.defer(other, vec![2], t);
+        rx.defer(peer, 1, vec![1], t, t);
+        rx.defer(other, 2, vec![2], t, t);
         assert!(rx.take_deferred(&peer, t + DEFER_TTL).is_empty(), "expired");
-        assert_eq!(rx.take_deferred(&other, t), [vec![2]], "peers independent");
+        assert_eq!(
+            rx.take_deferred(&other, t),
+            [(t, vec![2])],
+            "peers independent"
+        );
+
+        // Re-parking after a failed retry keeps the original park time, so
+        // retries can't keep a message alive past DEFER_TTL.
+        let later = t + DEFER_TTL / 2;
+        rx.defer(peer, 3, vec![3], t, later);
+        let (parked_at, payload) = rx.take_deferred(&peer, later).remove(0);
+        rx.defer(peer, 3, payload, parked_at, t + DEFER_TTL);
+        assert_eq!(rx.deferred_count(&peer), 0);
+    }
+
+    /// Bursts queued back to back go out whole and in order, never
+    /// interleaved, with the spacing kept across the boundary.
+    #[tokio::test]
+    async fn burst_sender_keeps_bursts_in_order() {
+        let tx = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = BurstSender::spawn(tx, rx.local_addr().unwrap());
+        let first: Vec<Vec<u8>> = (0..5u8).map(|i| vec![1, i]).collect();
+        let second: Vec<Vec<u8>> = (0..5u8).map(|i| vec![2, i]).collect();
+        let started = Instant::now();
+        let (a, b) = tokio::join!(sender.send(first.clone()), sender.send(second.clone()));
+        a.unwrap();
+        b.unwrap();
+        let mut buf = [0u8; 16];
+        for expected in first.iter().chain(&second) {
+            let (len, _) = rx.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], &expected[..]);
+        }
+        assert!(started.elapsed() >= FEC_PACKET_SPACING * 9);
+    }
+
+    /// If the first packet can't leave this machine, the caller is told.
+    #[tokio::test]
+    async fn burst_sender_reports_a_burst_that_cannot_be_sent() {
+        let tx = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // An IPv6 destination from an IPv4 socket: every send fails.
+        let sender = BurstSender::spawn(tx, "[::1]:9".parse().unwrap());
+        assert!(sender.send(vec![vec![0u8; 8]; 3]).await.is_err());
+        assert!(sender.send(Vec::new()).await.is_ok(), "task still running");
     }
 
     /// A sealed object may only carry what `create_fec_packets` bundles — a
@@ -686,7 +889,7 @@ mod tests {
             .unwrap();
         let carols_msg = relay(&carols_msg, &carol);
         let alices_kx = relay(&alice.create_kx_request(bob_token), &alice);
-        let nested = encode_message(&root_before, &alice_token, &bob_token, b"\x01x", None)
+        let nested = encode_message(&root_before, &alice_token, &bob_token, 0, b"\x01x", None)
             .unwrap()
             .remove(0);
         let object = bundle(&[&carols_msg, &alices_kx, &nested]);

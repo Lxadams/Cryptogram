@@ -182,7 +182,7 @@ async fn one_way(from: &Peer, to: &Peer, count: usize, label: &str) -> Result<us
             c.create_fec_packets(to.token, text.as_bytes())?
         };
         let server_addr = from.proxy.addr;
-        send_burst(&from.socket, server_addr, &packets).await;
+        send_burst(&from.socket, server_addr, &packets).await?;
         sent.push(text);
     }
     tokio::time::sleep(Duration::from_secs(2)).await;

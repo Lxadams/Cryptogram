@@ -10,7 +10,8 @@ Branch `claude/raptorq-e2e-integration-2c36af`, 5 October 2026. Companion docume
 - **Burst sending.** Every chat message now travels as a burst of RaptorQ (RFC 6330) forward-error-correction symbols. The receiver rebuilds the message from *any* sufficient subset of them.
 - **End-to-end sealing.** Each symbol is sealed with a key only the two clients hold, so the relay forwards opaque packets and can't reassemble anything.
 - **PQ injections bundled with their message.** The ratchet's post-quantum injection (every 5th message) now travels inside the same burst as its message. Previously one lost or reordered injection packet desynchronised a session permanently; now the pair arrive together or not at all.
-- **Pacing.** Bursts are paced 10 ms per packet so a short jamming spike can't take a whole message. The relay now forwards every 10 ms instead of every second, so it no longer re-bunches bursts.
+- **PQ injections name their chain position.** Each injection carries the (signed) sequence number it applies at, so the receiver mixes it in at exactly that point however early or late it arrives, and rejects any copy for a position already passed.
+- **Pacing.** Bursts are paced 10 ms per packet, one burst at a time in send order, so a short jamming spike can't take a whole message. The relay forwards a packet the moment it arrives and paces each recipient's backlog at 5 ms per packet, so it never re-bunches bursts.
 
 **Verified:**
 
@@ -34,7 +35,7 @@ Branch `claude/raptorq-e2e-integration-2c36af`, 5 October 2026. Companion docume
 | Delivery target | 99.99% per message. 99.9999% for messages carrying a PQ injection, since losing one of those used to desync the session. | Agreed trade-off between reliability and airtime |
 | In scope | Chat messages (0x01) and PQ injections (0x05) | Contacts are added face to face via QR codes, and that handshake isn't digital in the lossy setting |
 | Out of scope | Relay handshake, sync/keepalive, KeyExchange (0x02), SessionEstablish (0x04), presence (0x06) | Assumed done on a clean link, as agreed |
-| Packet format | Existing formats untouched. One new inner payload type, `0x07`. | "Don't change the packet structure too much" |
+| Packet format | One new inner payload type, `0x07`. `0x05` gains an 8-byte chain position (1,200 bytes). Everything else untouched. | "Don't change the packet structure too much" |
 
 ## 3. How a message travels now
 
@@ -42,16 +43,16 @@ Branch `claude/raptorq-e2e-integration-2c36af`, 5 October 2026. Companion docume
 SEND (Client A)
   plaintext
     -> symmetric-ratchet encrypt              (0x01 payload, unchanged)
-    -> every 5th message: + PQ injection      (0x05 payload, unchanged)
+    -> every 5th message: + PQ injection      (0x05 payload, + its chain position)
     -> bundle: [2-byte len | payload]...      (one FEC "object")
     -> RaptorQ encode into N symbols          (N from fec::packets_for)
     -> seal each symbol end to end            (XChaCha20-Poly1305, per-contact key)
     -> link-encrypt each, as before           (unchanged)
-    -> send_burst: one packet every 10 ms
+    -> BurstSender: one packet every 10 ms, one burst at a time
 
 RELAY (unchanged logic)
   link-decrypt -> read recipient token -> queue -> re-encrypt for recipient
-  (now flushed every 10 ms, queue cap 1024 packets per recipient)
+  (forwarded on arrival, backlogs paced 5 ms/packet, queue cap 2 MiB per recipient)
 
 RECEIVE (Client B)
   link-decrypt (unchanged) -> inner type 0x07
@@ -92,7 +93,8 @@ FEC packet (`code/fec`), all fields big-endian:
 T (symbol size) = object length rounded up to a multiple of 8, capped at 1024.
                   Derived from the length on both sides, never sent.
 symbol id       = 0..K-1 for source symbols, K.. for repair symbols (RFC 6330 ESI, 24-bit).
-object id       = random per message.
+object id       = the message's sequence number (unique within a session;
+                  the receiver keeps each session's ids apart).
 ```
 
 FEC object (bundle):
@@ -157,25 +159,27 @@ Every 5th message, the sender mixes fresh Kyber entropy into its sending chain. 
 FEC alone doesn't fix this. Two objects sent back to back can finish decoding in either order, so FEC makes case 3 more likely. The fixes:
 
 - **Bundling** fixes 1 and 2. The injection travels inside the same FEC object as its message, sized to 99.9999%. They arrive together, in order, or not at all. ([transport.rs](../code/client/src/transport.rs) `encode_message`)
-- **Holding and retrying** fixes 3. A 0x01 message that fails to decrypt *and* has a sequence number at or ahead of the receive chain is held in `FecReceiver`. Once the next PQ injection lands, everything held for that peer is retried. Held messages are capped at 32 per peer and expire after 60 s. Stale or duplicate sequence numbers are never held. ([lib.rs](../code/client/src/lib.rs): `0x01` branch, `0x05` branch, `retry_deferred`)
+- **Chain positions** make the order of injections irrelevant. Each 0x05 names the sequence number it applies at. One for a position the receive chain hasn't reached is held (`pending_pq`, persisted) and mixed in when the chain gets there; one for a position already passed is a replay and is dropped. No timestamp check applies to 0x05, so one queued at the relay for longer than 5 minutes still lands. ([lib.rs](../code/client/src/lib.rs): `accept_pq_inject`, `try_decrypt`)
+- **Holding and retrying** fixes 3. A 0x01 message that arrived *sealed* (so its sender is proven), fails to decrypt, and has a sequence number at or ahead of the receive chain is held in `FecReceiver`. Once an injection lands or an earlier message decrypts, everything held for that peer is retried in sequence order. Held messages are capped at 32 per peer (the furthest-ahead dropped first) and expire 60 s after they were *first* held. Bare 0x01 datagrams, which anyone can forge, are never held. ([lib.rs](../code/client/src/lib.rs): `receive_message`, `retry_deferred`)
 
 Residual risk: if an *entire* PQ-carrying burst is lost (≤ 1 in 10⁶ per injection at the design loss), the session still desyncs, and there's no automatic recovery yet. See §11 and the review.
 
 ## 7. Pacing
 
-`send_burst` sends one packet every `FEC_PACKET_SPACING` (10 ms), using a tokio interval that keeps a steady average rate. A 27-packet message takes ~0.27 s. Spreading packets in time keeps losses close to independent under bursty jamming: one 50 ms spike costs about 5 packets, not the whole message. It also avoids overflowing the receiver's socket buffer.
+Packets go out every `FEC_PACKET_SPACING` (10 ms). After a stall the interval carries on at that spacing rather than catching up, so it never sends a run of packets unpaced. A 27-packet message takes ~0.27 s. Spreading packets in time keeps losses close to independent under bursty jamming: one 50 ms spike costs about 5 packets, not the whole message. It also avoids overflowing the receiver's socket buffer.
 
-The relay previously flushed its queues once per second. That would have collapsed any pacing into one line-rate blast, so it now flushes every 10 ms.
+Front ends send through `BurstSender`, a task per socket that sends bursts one at a time in the order queued. One message's burst never interleaves with the next, so the receiver finishes them in send order. `send` resolves once a burst's first packet is out and fails if it couldn't be sent at all (for example, the network is down), so the UI can report it. The client lock isn't held while a burst drains, because the receive loop needs that lock.
 
-Callers run `send_burst` on its own task so the client lock isn't held while a burst drains, because the receive loop needs that lock.
+The relay previously flushed its queues once per second, which collapsed any pacing into one line-rate blast. Now its outbound task wakes the moment a packet is queued or a recipient syncs, and sends each recipient at most one packet every 5 ms. A live burst passes straight through with its spacing intact, and a backlog is spread out instead of overflowing the recipient's socket buffer.
 
 ## 8. Relay changes (`code/server`)
 
 | Change | Before | After | Why |
 |---|---|---|---|
-| `OUTBOUND_TASK_INTERVAL` | 1 s | **10 ms** | Preserve burst pacing; cut up to 1 s of latency |
-| Per-recipient queue cap (`MAX_QUEUED_PER_TOKEN`) | 50 | **1,024** packets | A single burst (27–86 packets) could exceed 50, and the cap applied to online recipients too, silently dropping symbols |
+| Outbound scheduling | Poll every 1 s, drain everything | **Woken on arrival** (`Notify`); at most one packet per recipient every `RELAY_PACKET_SPACING` (5 ms) | Preserve burst pacing, pace backlogs, no idle polling, no added latency |
+| Per-recipient queue cap | 50 packets, oldest evicted | **2 MiB** (`MAX_QUEUED_BYTES_PER_TOKEN`), new packets refused once full | Evicting the oldest cut the front off queued bursts, and losing an older PQ-carrying message makes every later one undecryptable |
 | Send error during a flush | Aborted the rest of the already-drained batch (lost) | Logged, skipped, continues | Each forwarded symbol counts |
+| Per-packet logging | `info!` × 3 per packet | `debug!` | A message is tens to hundreds of packets; blocking stdout slowed the receive loop |
 
 The relay learned nothing about FEC or crypto. It still forwards opaque inner payloads by recipient token.
 
@@ -185,17 +189,17 @@ The relay learned nothing about FEC or crypto. It still forwards opaque inner pa
   - `encode`, `packets_for`, `symbol_size_for`, `source_symbols_for`.
   - `Reassembler<S>`: any order, duplicates OK, each object returned exactly once. Memory is bounded per source and overall, partial objects expire after 120 s, and finished ids are remembered for 600 s so stragglers are ignored.
   - Every header field is validated before it reaches `raptorq`, so malformed input returns an error instead of panicking.
-- **New: `transport` module** ([code/client/src/transport.rs](../code/client/src/transport.rs)): bundling, seal and open, burst encoding, `FecReceiver` (reassembler plus held messages), `send_burst`, and the tuning constants.
+- **New: `transport` module** ([code/client/src/transport.rs](../code/client/src/transport.rs)): bundling, seal and open, burst encoding, `FecReceiver` (per-session seal ciphers, reassembler, held messages), `send_burst`, `BurstSender`, and the tuning constants.
 - **`Client`** ([lib.rs](../code/client/src/lib.rs)):
   - New `create_fec_packets(target, plaintext)`. It checks the size *before* touching the ratchet.
-  - `create_encrypted_packet` keeps its exact signature and behaviour. Both now share the private `encrypt_message_payloads`.
+  - `create_encrypted_packet` (single datagrams, injection sent separately) is now test-only. Both share the private `encrypt_message_payloads`.
   - New `0x07` receive branch. Bundled parts are accepted only as 0x01/0x05, and only on the sealing peer's own behalf, so a bundle can't carry a KeyExchange that would re-key the session.
   - Messages are held and retried around PQ injections (§6).
   - New transient field `fec_rx`, never persisted.
-- **CLI** ([main.rs](../code/client/src/main.rs)): `msg` now sends a paced burst on its own task.
-- **Desktop app** ([commands.rs](../code/frontend/src-tauri/src/commands.rs)): `send_message` builds the burst under the lock, releases it, and sends on a background task. Its return value (the chat-history id) is unchanged.
+- **CLI** ([main.rs](../code/client/src/main.rs)): `msg` queues its burst on a `BurstSender` and reports if it couldn't be sent.
+- **Desktop app** ([commands.rs](../code/frontend/src-tauri/src/commands.rs)): `send_message` builds the burst under the lock, releases it, and queues it on the runtime's `BurstSender`. It returns the chat-history id as before, or an error if the burst couldn't leave the machine.
 
-**Compatibility:** both peers need this build. Old builds ignore 0x07. The single-datagram path still works, and a test mixes both paths in one conversation.
+**Compatibility:** both peers need this build. Old builds ignore 0x07, and the 0x05 layout changed. The receive side still accepts bare 0x01/0x05 datagrams, and a test mixes both paths in one conversation.
 
 ## 10. Build, CI and Docker
 
@@ -291,15 +295,15 @@ With `jammed=alice`, Alice→Bob exercises a jammed **sender** and Bob→Alice a
 | `DEFER_TTL` / `MAX_DEFERRED_PER_PEER` | same | 60 s / 32 |
 | `MAX_SYMBOL_SIZE`, `MAX_OBJECT_LEN` | `fec/src/lib.rs` | 1,024 B / 64 KiB |
 | `fec::Limits` (pending/completed bounds and TTLs) | same | 128 / 32 per source / 120 s; 4,096 / 600 s |
-| `OUTBOUND_TASK_INTERVAL` | `server/src/main.rs` | 10 ms |
-| `MAX_QUEUED_PER_TOKEN` | `server/src/stores.rs` | 1,024 |
+| `RELAY_PACKET_SPACING` | `server/src/main.rs` | 5 ms |
+| `MAX_QUEUED_BYTES_PER_TOKEN` | `server/src/stores.rs` | 2 MiB |
 
 To cover both sides being jammed at 70% (91% end to end), set `FEC_DESIGN_LOSS = 0.91`. A short message then costs ~99 packets.
 
 ## 13. Known limitations and follow-ups
 
 1. **Residual PQ desync.** If a whole PQ-carrying burst is lost (≤ 10⁻⁶ per injection), the session breaks with no recovery. A resync/"session reset" message (roadmap Task 4.1b) would close this.
-2. **PQ injections older than 5 minutes are rejected.** This predates this work and is serious for the loss goal: an offline or jammed recipient who gets a queued PQ-carrying message more than 300 s late drops the injection, and the session desyncs. See review finding **C-4**.
+2. ~~**PQ injections older than 5 minutes are rejected.**~~ Fixed: 0x05 is exempt from the freshness window, and its signed chain position rules out replays instead (review finding **C-4**).
 3. **Fixed redundancy.** Every message pays for 70% loss even on a clean link (27× packets for a short message). Loss feedback from the receiver could adapt it.
 4. **Traffic analysis.** Bursts reveal send times, message length (to 8 bytes) and every 5th message (larger burst). Padding to a few size buckets and/or the constant-rate tunnel mode would address this.
 5. **Not FEC-protected (by agreement):** relay handshake, sync/keepalive, KeyExchange, SessionEstablish, presence. The jammed client's presence dot will flicker, and a jammed client can't (re)connect to the relay.

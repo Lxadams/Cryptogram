@@ -9,7 +9,10 @@ use pqcrypto_traits::kem::SharedSecret as _;
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+};
 use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
@@ -23,7 +26,9 @@ mod transport;
 pub use history::{ChatHistory, StoredMessage};
 use std::collections::HashSet;
 pub use storage::{ClientStateDto, IdentityStateStore};
-pub use transport::{FEC_DESIGN_LOSS, FEC_PACKET_SPACING, MAX_FEC_MESSAGE_LEN, send_burst};
+pub use transport::{BurstSender, MAX_FEC_MESSAGE_LEN, send_burst};
+#[cfg(test)]
+mod test_support;
 
 type HmacSha256 = Hmac<Sha256>;
 pub type SessionId = [u8; 4];
@@ -34,6 +39,10 @@ const PQ_INJECT_INTERVAL: u64 = 5;
 
 // Maximum number of skipped message keys to retain
 const MAX_SKIP_DICT_SIZE: usize = 500;
+
+/// Furthest ahead of the receive chain a message (or a PQ inject's
+/// position) may be before it's dropped as bogus.
+const MAX_SKIP: u64 = 100;
 
 // Domain-separation salt for HKDF derivations
 const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
@@ -249,6 +258,10 @@ pub struct SymmetricSessionState {
     pub peer_kyber_pub: Option<PublicKey>,
     pub skip_dict: HashMap<u64, [u8; 32]>,
     pub pq_inject_replay_cache: HashSet<[u8; 64]>,
+    /// PQ secrets received ahead of their chain position (`PQInjectPayload::seq`),
+    /// keyed by it. Always `> recv_count`: one at `recv_count` is mixed in
+    /// as soon as the chain gets there — see `accept_pq_inject`.
+    pub pending_pq: BTreeMap<u64, Vec<u8>>,
 }
 
 /// One step of the symmetric hash ratchet: `(message key, next chain key)`.
@@ -296,6 +309,7 @@ impl SymmetricSessionState {
             peer_kyber_pub,
             skip_dict: HashMap::new(),
             pq_inject_replay_cache: HashSet::new(),
+            pending_pq: BTreeMap::new(),
         }
     }
 
@@ -323,7 +337,7 @@ impl SymmetricSessionState {
             return None;
         }
 
-        if seq_no - self.recv_count > 100 {
+        if seq_no - self.recv_count > MAX_SKIP {
             return None;
         }
 
@@ -342,7 +356,12 @@ impl SymmetricSessionState {
         let mut skipped_keys = Vec::new();
 
         let mut msg_key = [0u8; 32];
-        for _ in self.recv_count..=seq_no {
+        for s in self.recv_count..=seq_no {
+            // Any PQ inject already received for a position on the way gets
+            // mixed in exactly where the sender mixed it.
+            if let Some(secret) = self.pending_pq.get(&s) {
+                mix_pq_secret(&mut test_chain, secret);
+            }
             (msg_key, test_chain) = chain_step(&test_chain);
             skipped_keys.push(msg_key);
         }
@@ -357,20 +376,42 @@ impl SymmetricSessionState {
                 }
             }
             self.recv_count = seq_no + 1;
+            self.pending_pq.retain(|&s, _| s > seq_no);
+            self.apply_due_pq_inject();
             Some(pt)
         } else {
             None
         }
     }
 
+    /// Take in a verified PQ inject's secret for chain position `seq`: mixed
+    /// into the receive chain now if that's where the chain is, or held until
+    /// it gets there. `false` for a position already passed or already held
+    /// (a replay), or further ahead than any message could be (which also
+    /// bounds how many are held).
+    pub fn accept_pq_inject(&mut self, seq: u64, pq_secret_bytes: &[u8]) -> bool {
+        if seq < self.recv_count
+            || seq - self.recv_count > MAX_SKIP + 1
+            || self.pending_pq.contains_key(&seq)
+        {
+            return false;
+        }
+        self.pending_pq.insert(seq, pq_secret_bytes.to_vec());
+        self.apply_due_pq_inject();
+        true
+    }
+
+    /// Mix in the held PQ inject for `recv_count`, if any, so `recv_chain_key`
+    /// always matches the sender's chain key at that position.
+    fn apply_due_pq_inject(&mut self) {
+        if let Some(secret) = self.pending_pq.remove(&self.recv_count) {
+            mix_pq_secret(&mut self.recv_chain_key, &secret);
+        }
+    }
+
     /// Mix fresh PQ shared secret into the send chain key via HKDF (called by sender)
     pub fn inject_pq_secret_send(&mut self, pq_secret_bytes: &[u8]) {
         mix_pq_secret(&mut self.send_chain_key, pq_secret_bytes);
-    }
-
-    /// Mix fresh PQ shared secret into the recv chain key via HKDF (called by receiver)
-    pub fn inject_pq_secret_recv(&mut self, pq_secret_bytes: &[u8]) {
-        mix_pq_secret(&mut self.recv_chain_key, pq_secret_bytes);
     }
 }
 
@@ -712,11 +753,12 @@ impl Client {
         );
     }
 
-    /// Encrypt a message. Returns (message_packet, optional_pq_inject_packet),
-    /// each a single link-encrypted datagram. Every PQ_INJECT_INTERVAL
-    /// messages, a PQ inject packet is generated automatically. Front ends
-    /// talking over a lossy link use `create_fec_packets` instead.
-    pub fn create_encrypted_packet(
+    /// Encrypt a message as single link-encrypted datagrams: (message_packet,
+    /// optional_pq_inject_packet), the latter every PQ_INJECT_INTERVAL
+    /// messages. Test-only — real front ends send with `create_fec_packets`,
+    /// which never lets the inject travel apart from its message.
+    #[cfg(test)]
+    pub(crate) fn create_encrypted_packet(
         &mut self,
         target_token: RoutingToken,
         plaintext: &[u8],
@@ -746,11 +788,16 @@ impl Client {
             ));
         }
         let (msg_payload, pq_payload) = self.encrypt_message_payloads(target_token, plaintext)?;
-        let root_key = self.e2e_sessions[&target_token].root_key;
+        let session = &self.e2e_sessions[&target_token];
+        // The message's seq number doubles as its FEC object id: unique
+        // within the session, unlike a random id. (`FecReceiver` keeps each
+        // session's ids apart.)
+        let object_id = (session.send_count - 1) as u32;
         let symbols = transport::encode_message(
-            &root_key,
+            &session.root_key,
             &self.identity.routing_token,
             &target_token,
+            object_id,
             &msg_payload,
             pq_payload.as_deref(),
         )?;
@@ -793,7 +840,9 @@ impl Client {
             // The state is mutated, but save() needs immutable ref.
             // We'll call self.save() after the mutable borrow block.
 
-            // Check if PQ injection is needed
+            // Check if PQ injection is needed. It's mixed in at chain
+            // position `send_count` (the next message's), which the inject
+            // payload names so the peer can apply it at exactly that point.
             let pq_ct = if session.send_count % PQ_INJECT_INTERVAL == 0 {
                 if let Some(ref peer_kyber) = session.peer_kyber_pub {
                     let (pq_secret, kyber_ct) = encapsulate(peer_kyber);
@@ -802,7 +851,7 @@ impl Client {
                         ">> [PQ] Injected post-quantum entropy after {} messages",
                         session.send_count
                     );
-                    Some(kyber_ct)
+                    Some((session.send_count, kyber_ct))
                 } else {
                     None
                 }
@@ -817,8 +866,9 @@ impl Client {
         self.record_message(target_token, true, plaintext);
 
         // Phase 2: build the signed PQ inject payload (immutable borrow on self)
-        let pq_payload = pq_ct.map(|kyber_ct| {
-            let pqi_payload = PQInjectPayload::generate(&self.identity, target_token, kyber_ct);
+        let pq_payload = pq_ct.map(|(seq, kyber_ct)| {
+            let pqi_payload =
+                PQInjectPayload::generate(&self.identity, target_token, seq, kyber_ct);
             let mut inner = vec![0x05];
             inner.extend_from_slice(&pqi_payload.to_bytes());
             inner
@@ -832,8 +882,7 @@ impl Client {
     /// it's addressed to us, and its timestamp is within
     /// `MAX_TIMESTAMP_DRIFT` of our clock. Logs and returns `false` if not.
     fn accepts_payload(&self, what: &str, target_token: &RoutingToken, timestamp: u64) -> bool {
-        if target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
-            println!(">> [SECURITY ALERT] Dropped {what}! It was bound to a different target.");
+        if !self.addressed_to_me(what, target_token) {
             return false;
         }
         let now = SystemTime::now()
@@ -842,6 +891,15 @@ impl Client {
             .as_secs();
         if now.abs_diff(timestamp) > MAX_TIMESTAMP_DRIFT {
             println!(">> [SECURITY ALERT] Dropped {what}! Timestamp is stale or from the future.");
+            return false;
+        }
+        true
+    }
+
+    /// The target-binding half of `accepts_payload`, on its own.
+    fn addressed_to_me(&self, what: &str, target_token: &RoutingToken) -> bool {
+        if target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
+            println!(">> [SECURITY ALERT] Dropped {what}! It was bound to a different target.");
             return false;
         }
         true
@@ -878,54 +936,8 @@ impl Client {
 
         match pkt_type {
             0x01 => {
-                // Msg: [16-byte sender_token | 8-byte seq_no | 24-byte nonce | ciphertext]
-                if pkt_data.len() < 16 + 8 + 24 {
-                    return Err(anyhow!("Msg payload too small"));
-                }
-                let mut sender_token = [0u8; 16];
-                sender_token.copy_from_slice(&pkt_data[0..16]);
-                let seq_no = u64::from_be_bytes(pkt_data[16..24].try_into().unwrap());
-                let mut nonce_bytes = [0u8; 24];
-                nonce_bytes.copy_from_slice(&pkt_data[24..48]);
-                let nonce = XNonce::from_slice(&nonce_bytes);
-                let ciphertext = &pkt_data[48..];
-
-                if let Some(session) = self.e2e_sessions.get_mut(&sender_token) {
-                    if let Some(pt) = session.try_decrypt(seq_no, nonce, ciphertext) {
-                        self.save();
-                        println!(
-                            ">> [From {}]: {}",
-                            hex::encode(&sender_token[0..4]),
-                            String::from_utf8_lossy(&pt)
-                        );
-                        // Also hand it to any polling consumer (e.g. a GUI) —
-                        // see the `inbox` field doc comment above.
-                        self.record_message(sender_token, false, &pt);
-                        self.inbox.push((sender_token, pt, self.last_recorded_id));
-                        self.last_seen.insert(sender_token, Instant::now());
-                    } else if seq_no >= session.recv_count {
-                        // Possibly encrypted after a PQ inject that hasn't
-                        // landed yet (its FEC burst can finish decoding after
-                        // this one's): park it, and `retry_deferred` replays
-                        // it once the inject arrives. Older seq numbers can
-                        // never succeed later, so those aren't kept.
-                        println!(
-                            ">> Holding message {seq_no} from {}: not decryptable yet (PQ ratchet update in flight?).",
-                            hex::encode(&sender_token[0..4])
-                        );
-                        self.fec_rx
-                            .defer(sender_token, payload.to_vec(), Instant::now());
-                    } else {
-                        println!(
-                            ">> Received packet from {} but decryption failed (out of sync?).",
-                            hex::encode(&sender_token[0..4])
-                        );
-                    }
-                } else {
-                    println!(
-                        ">> Received packet from unknown sender {}. No E2E session found.",
-                        hex::encode(&sender_token[0..4])
-                    );
+                if let Some(sender) = self.receive_message(payload, None)? {
+                    self.retry_deferred(sender)?;
                 }
                 Ok(None)
             }
@@ -1035,9 +1047,12 @@ impl Client {
                 Ok(None)
             }
             0x05 => {
-                // PQ Inject
+                // PQ Inject. No timestamp freshness check: its signed chain
+                // position (`seq`) is what rules out replays, and one queued
+                // at the relay can legitimately be older than
+                // MAX_TIMESTAMP_DRIFT.
                 if let Ok(pqi) = PQInjectPayload::from_bytes(pkt_data) {
-                    if !self.accepts_payload("PQInject", &pqi.target_token, pqi.timestamp) {
+                    if !self.addressed_to_me("PQInject", &pqi.target_token) {
                         return Ok(None);
                     }
                     if let Some(sender_pub) = self.pending_contacts.get(&pqi.routing_token) {
@@ -1053,12 +1068,18 @@ impl Client {
                                     );
                                     return Ok(None);
                                 }
+                                if !session.accept_pq_inject(pqi.seq, pq_secret.as_bytes()) {
+                                    println!(
+                                        ">> [SECURITY ALERT] Dropped PQInject for chain position {} (stale, duplicate or out of range).",
+                                        pqi.seq
+                                    );
+                                    return Ok(None);
+                                }
                                 if session.pq_inject_replay_cache.len() > 1000 {
                                     session.pq_inject_replay_cache.clear();
                                 }
                                 session.pq_inject_replay_cache.insert(sig_bytes);
-
-                                session.inject_pq_secret_recv(pq_secret.as_bytes());
+                                self.save();
 
                                 println!(
                                     ">> [PQ] Received and injected post-quantum entropy from {}!",
@@ -1112,8 +1133,9 @@ impl Client {
                 let Some(session) = self.e2e_sessions.get(&sender_token) else {
                     return Ok(None);
                 };
-                let Some(symbol) = transport::open_symbol(
-                    &session.root_key,
+                let root_key = session.root_key;
+                let Some(symbol) = self.fec_rx.open(
+                    &root_key,
                     &sender_token,
                     &self.identity.routing_token,
                     &pkt_data[16..],
@@ -1121,35 +1143,50 @@ impl Client {
                     println!(">> [SECURITY ALERT] Dropped FEC symbol that failed authentication.");
                     return Ok(None);
                 };
-                let object =
-                    match self
-                        .fec_rx
-                        .reassembler
-                        .ingest(sender_token, &symbol, Instant::now())
-                    {
-                        Ok(Some(object)) => object,
-                        Ok(None) => return Ok(None),
-                        Err(e) => {
-                            println!(
-                                ">> Dropped FEC symbol from {}: {e}",
-                                hex::encode(&sender_token[0..4])
-                            );
-                            return Ok(None);
-                        }
-                    };
+                let object = match self
+                    .fec_rx
+                    .reassemble(sender_token, &symbol, Instant::now())
+                {
+                    Ok(Some(object)) => object,
+                    Ok(None) => return Ok(None),
+                    Err(e) => {
+                        println!(
+                            ">> Dropped FEC symbol from {}: {e}",
+                            hex::encode(&sender_token[0..4])
+                        );
+                        return Ok(None);
+                    }
+                };
                 let Some(parts) = transport::unbundle(&object) else {
                     println!(">> Dropped malformed FEC object.");
                     return Ok(None);
                 };
+                let mut delivered = false;
                 for part in parts {
                     // Only what `create_fec_packets` bundles (a message and
                     // its PQ inject), and only on the sealing peer's own
                     // behalf: both carry the sender's token right after the
                     // type byte.
-                    let own = part.get(1..17) == Some(&sender_token[..]);
-                    if own && matches!(part[0], 0x01 | 0x05) {
-                        self.handle_incoming_packet(part)?;
+                    if part.get(1..17) != Some(&sender_token[..]) {
+                        continue;
                     }
+                    match part[0] {
+                        // The seal already proved who sent it, so a message
+                        // that can't be decrypted yet may be held back.
+                        0x01 => {
+                            delivered |=
+                                self.receive_message(part, Some(Instant::now()))?.is_some();
+                        }
+                        0x05 => {
+                            self.handle_incoming_packet(part)?;
+                        }
+                        _ => {}
+                    }
+                }
+                // Once the whole bundle is in: its inject (if any) has
+                // already triggered a retry of its own.
+                if delivered {
+                    self.retry_deferred(sender_token)?;
                 }
                 Ok(None)
             }
@@ -1157,11 +1194,79 @@ impl Client {
         }
     }
 
-    /// Replay messages from `sender` that the 0x01 branch parked as not yet
-    /// decryptable, now that a PQ inject has moved their receive chain on.
+    /// Decrypt a 0x01 chat message: [16-byte sender_token | 8-byte seq_no |
+    /// 24-byte nonce | ciphertext]. Returns the sender if it was delivered.
+    ///
+    /// `park` is `Some(parked_at)` only for a message whose sender is
+    /// already authenticated (it arrived sealed in an FEC bundle): if it
+    /// can't be decrypted yet — it was encrypted after a PQ inject still in
+    /// flight — it's held for `retry_deferred`, keeping its original
+    /// `parked_at` so retries never extend its lifetime. Anyone can forge a
+    /// bare 0x01, so those are never held.
+    fn receive_message(
+        &mut self,
+        payload: &[u8],
+        park: Option<Instant>,
+    ) -> Result<Option<RoutingToken>> {
+        let pkt_data = &payload[1..];
+        if pkt_data.len() < 16 + 8 + 24 {
+            return Err(anyhow!("Msg payload too small"));
+        }
+        let sender_token: RoutingToken = pkt_data[0..16].try_into().unwrap();
+        let seq_no = u64::from_be_bytes(pkt_data[16..24].try_into().unwrap());
+        let nonce = XNonce::from_slice(&pkt_data[24..48]);
+        let ciphertext = &pkt_data[48..];
+
+        let Some(session) = self.e2e_sessions.get_mut(&sender_token) else {
+            println!(
+                ">> Received packet from unknown sender {}. No E2E session found.",
+                hex::encode(&sender_token[0..4])
+            );
+            return Ok(None);
+        };
+        if let Some(pt) = session.try_decrypt(seq_no, nonce, ciphertext) {
+            self.save();
+            println!(
+                ">> [From {}]: {}",
+                hex::encode(&sender_token[0..4]),
+                String::from_utf8_lossy(&pt)
+            );
+            // Also hand it to any polling consumer (e.g. a GUI) — see the
+            // `inbox` field doc comment above.
+            self.record_message(sender_token, false, &pt);
+            self.inbox.push((sender_token, pt, self.last_recorded_id));
+            self.last_seen.insert(sender_token, Instant::now());
+            return Ok(Some(sender_token));
+        }
+        match park {
+            // Older seq numbers can never succeed later, so those aren't kept.
+            Some(parked_at) if seq_no >= session.recv_count => {
+                println!(
+                    ">> Holding message {seq_no} from {}: not decryptable yet (PQ ratchet update in flight?).",
+                    hex::encode(&sender_token[0..4])
+                );
+                self.fec_rx.defer(
+                    sender_token,
+                    seq_no,
+                    payload.to_vec(),
+                    parked_at,
+                    Instant::now(),
+                );
+            }
+            _ => println!(
+                ">> Received packet from {} but decryption failed (out of sync?).",
+                hex::encode(&sender_token[0..4])
+            ),
+        }
+        Ok(None)
+    }
+
+    /// Replay, in seq order, messages from `sender` held back as not yet
+    /// decryptable, now that a PQ inject or an earlier message has moved
+    /// their receive chain on.
     fn retry_deferred(&mut self, sender: RoutingToken) -> Result<()> {
-        for payload in self.fec_rx.take_deferred(&sender, Instant::now()) {
-            self.handle_incoming_packet(&payload)?;
+        for (parked_at, payload) in self.fec_rx.take_deferred(&sender, Instant::now()) {
+            self.receive_message(&payload, Some(parked_at))?;
         }
         Ok(())
     }
@@ -1206,17 +1311,8 @@ pub async fn perform_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{connected_pair, strip_link};
     use pqcrypto_traits::kem::PublicKey as _;
-
-    /// Helper: strip link encryption from a packet (simulate server forwarding)
-    fn strip_link(packet: &[u8], link_key: &[u8; 32]) -> Vec<u8> {
-        let mut nonce_bytes = [0u8; 24];
-        nonce_bytes.copy_from_slice(&packet[5..29]);
-        let link_nonce = XNonce::from_slice(&nonce_bytes);
-        let link_cipher = XChaCha20Poly1305::new(Key::from_slice(link_key));
-        let decrypted = link_cipher.decrypt(link_nonce, &packet[29..]).unwrap();
-        decrypted[16..].to_vec() // strip routing token
-    }
 
     #[test]
     fn test_passcode_hash_roundtrip_and_rejection() {
@@ -1404,13 +1500,14 @@ mod tests {
         let alice_id = UserIdentity::generate();
         let bob_id = UserIdentity::generate();
         let (_pq_secret, kyber_ct) = encapsulate(&bob_id.kyber_public);
-        let pqi = PQInjectPayload::generate(&alice_id, bob_id.routing_token, kyber_ct);
+        let pqi = PQInjectPayload::generate(&alice_id, bob_id.routing_token, 5, kyber_ct);
         let bytes = pqi.to_bytes();
-        assert_eq!(bytes.len(), 1192);
+        assert_eq!(bytes.len(), 1200);
         let parsed = PQInjectPayload::from_bytes(&bytes).unwrap();
         assert!(parsed.verify(&alice_id.ed25519_public).is_ok());
         assert_eq!(parsed.routing_token, alice_id.routing_token);
         assert_eq!(parsed.target_token, bob_id.routing_token);
+        assert_eq!(parsed.seq, 5);
     }
 
     // ==========================================
@@ -1474,7 +1571,7 @@ mod tests {
         let alice_id = UserIdentity::generate();
         let bob_id = UserIdentity::generate();
         let (_, kyber_ct) = encapsulate(&bob_id.kyber_public);
-        let pqi = PQInjectPayload::generate(&alice_id, bob_id.routing_token, kyber_ct);
+        let pqi = PQInjectPayload::generate(&alice_id, bob_id.routing_token, 5, kyber_ct);
         let mut bytes = pqi.to_bytes();
         bytes[1150] ^= 0x01;
         let parsed = PQInjectPayload::from_bytes(&bytes).unwrap();
@@ -1500,7 +1597,7 @@ mod tests {
         let alice_id = UserIdentity::generate();
         let bob_id = UserIdentity::generate();
         let (_, kyber_ct) = encapsulate(&bob_id.kyber_public);
-        let pqi = PQInjectPayload::generate(&alice_id, bob_id.routing_token, kyber_ct);
+        let pqi = PQInjectPayload::generate(&alice_id, bob_id.routing_token, 5, kyber_ct);
         let bytes = pqi.to_bytes();
         let parsed = PQInjectPayload::from_bytes(&bytes).unwrap();
         // Verify with wrong key — simulates Mallory injection
@@ -1550,6 +1647,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: HashSet::new(),
+            pending_pq: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -1560,6 +1658,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: HashSet::new(),
+            pending_pq: Default::default(),
         };
         for i in 0..10 {
             let alice_mk = alice_state.symmetric_ratchet();
@@ -1580,6 +1679,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: HashSet::new(),
+            pending_pq: Default::default(),
         };
         let mut seen_keys = std::collections::HashSet::new();
         for _ in 0..100 {
@@ -1605,6 +1705,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 pq_inject_replay_cache: std::collections::HashSet::new(),
+                pending_pq: Default::default(),
             },
         );
         bob.e2e_sessions.insert(
@@ -1618,6 +1719,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 pq_inject_replay_cache: std::collections::HashSet::new(),
+                pending_pq: Default::default(),
             },
         );
         let (packet, _pq) = alice
@@ -1658,6 +1760,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 pq_inject_replay_cache: std::collections::HashSet::new(),
+                pending_pq: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -1714,6 +1817,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 pq_inject_replay_cache: std::collections::HashSet::new(),
+                pending_pq: Default::default(),
                 peer_kyber_pub: None, // No Kyber key!
             },
         );
@@ -1750,6 +1854,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 pq_inject_replay_cache: std::collections::HashSet::new(),
+                pending_pq: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -1763,6 +1868,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 pq_inject_replay_cache: std::collections::HashSet::new(),
+                pending_pq: Default::default(),
                 peer_kyber_pub: Some(alice_kyber_copy),
             },
         );
@@ -1823,6 +1929,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 pq_inject_replay_cache: std::collections::HashSet::new(),
+                pending_pq: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -1868,6 +1975,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: HashSet::new(),
+            pending_pq: Default::default(),
         };
         for _ in 0..5 {
             no_pq_state.symmetric_ratchet();
@@ -2257,6 +2365,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 pq_inject_replay_cache: std::collections::HashSet::new(),
+                pending_pq: Default::default(),
             },
         );
         let chain_before = bob
@@ -2267,7 +2376,8 @@ mod tests {
 
         // Mallory signs PQ inject with her own key but spoofs Alice's routing token
         let (_, kyber_ct) = encapsulate(&bob.identity.kyber_public);
-        let mut pqi = PQInjectPayload::generate(&mallory_id, bob.identity.routing_token, kyber_ct);
+        let mut pqi =
+            PQInjectPayload::generate(&mallory_id, bob.identity.routing_token, 0, kyber_ct);
         pqi.routing_token = alice_id.routing_token;
 
         let mut inner = vec![0x05];
@@ -2302,6 +2412,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: std::collections::HashSet::new(),
+            pending_pq: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -2312,6 +2423,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: std::collections::HashSet::new(),
+            pending_pq: Default::default(),
         };
 
         let mk1 = alice_state.symmetric_ratchet();
@@ -2356,6 +2468,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: std::collections::HashSet::new(),
+            pending_pq: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -2366,6 +2479,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: std::collections::HashSet::new(),
+            pending_pq: Default::default(),
         };
 
         // Receive packet with seq_no 150 (exceeds MAX_SKIP_DICT_ENTRIES of 100)
@@ -2455,6 +2569,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: std::collections::HashSet::new(),
+            pending_pq: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -2465,6 +2580,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             pq_inject_replay_cache: std::collections::HashSet::new(),
+            pending_pq: Default::default(),
         };
 
         let mk0 = alice_state.symmetric_ratchet();
@@ -2598,65 +2714,90 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_edge_case_pq_inject_stale_timestamp() {
-        // PQ inject with an expired timestamp must be rejected
-        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
-        let mut bob = Client::new(server_addr);
+    /// Bob with a session to Alice at `recv_count`, and an inject from her
+    /// for chain position `seq`, signed with `timestamp`.
+    fn pq_inject_fixture(recv_count: u64, seq: u64, timestamp: u64) -> (Client, Vec<u8>) {
+        let mut bob = Client::new("127.0.0.1:4430".parse().unwrap());
         let alice_id = UserIdentity::generate();
-
         bob.pending_contacts
             .insert(alice_id.routing_token, alice_id.ed25519_public);
-        bob.e2e_sessions.insert(
-            alice_id.routing_token,
-            SymmetricSessionState {
-                root_key: [0x42; 32],
-                send_chain_key: [0x42; 32],
-                recv_chain_key: [0x42; 32],
-                send_count: 0,
-                peer_kyber_pub: None,
-                recv_count: 0,
-                skip_dict: std::collections::HashMap::new(),
-                pq_inject_replay_cache: std::collections::HashSet::new(),
-            },
-        );
-        let chain_before = bob
-            .e2e_sessions
-            .get(&alice_id.routing_token)
-            .unwrap()
-            .send_chain_key;
+        let mut session = SymmetricSessionState::from_root_key([0x42; 32], None);
+        session.recv_count = recv_count;
+        bob.e2e_sessions.insert(alice_id.routing_token, session);
 
-        // Create PQ inject with stale timestamp
         let (_, kyber_ct) = encapsulate(&bob.identity.kyber_public);
-        let mut pqi = PQInjectPayload::generate(&alice_id, bob.identity.routing_token, kyber_ct);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        pqi.timestamp = now - 600; // 10 minutes in the past
-        // Re-sign with the stale timestamp
+        let mut pqi =
+            PQInjectPayload::generate(&alice_id, bob.identity.routing_token, seq, kyber_ct);
+        pqi.timestamp = timestamp;
+        // Re-sign over the changed timestamp
         use ed25519_dalek::Signer;
         use pqcrypto_traits::kem::Ciphertext as _;
         let mut msg = Vec::new();
         msg.extend_from_slice(&pqi.routing_token);
         msg.extend_from_slice(&pqi.target_token);
         msg.extend_from_slice(&pqi.timestamp.to_be_bytes());
+        msg.extend_from_slice(&pqi.seq.to_be_bytes());
         msg.extend_from_slice(pqi.kyber_ct.as_bytes());
         pqi.signature = alice_id.ed25519_secret.sign(&msg);
 
         let mut packet = vec![0x05];
         packet.extend_from_slice(&pqi.to_bytes());
-        bob.handle_incoming_packet(&packet).unwrap();
+        (bob, packet)
+    }
 
-        let chain_after = bob
-            .e2e_sessions
-            .get(&alice_id.routing_token)
+    fn only_recv_chain(client: &Client) -> [u8; 32] {
+        client.e2e_sessions.values().next().unwrap().recv_chain_key
+    }
+
+    #[test]
+    fn test_edge_case_pq_inject_older_than_timestamp_window_still_applies() {
+        // Queued at the relay past MAX_TIMESTAMP_DRIFT: its chain position,
+        // not its age, decides — dropping it would desync the session.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
-            .send_chain_key;
-        assert_eq!(
-            chain_before, chain_after,
-            "Stale PQ inject must NOT modify chain key"
-        );
+            .as_secs();
+        let (mut bob, packet) = pq_inject_fixture(5, 5, now - 600);
+        let before = only_recv_chain(&bob);
+        bob.handle_incoming_packet(&packet).unwrap();
+        assert_ne!(only_recv_chain(&bob), before, "late PQ inject must apply");
+
+        // A replay of it must not apply twice.
+        let applied = only_recv_chain(&bob);
+        bob.handle_incoming_packet(&packet).unwrap();
+        assert_eq!(only_recv_chain(&bob), applied);
+    }
+
+    #[test]
+    fn test_edge_case_pq_inject_for_passed_or_far_position_rejected() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (recv_count, seq) in [(6, 5), (0, MAX_SKIP + 2)] {
+            let (mut bob, packet) = pq_inject_fixture(recv_count, seq, now);
+            let before = only_recv_chain(&bob);
+            bob.handle_incoming_packet(&packet).unwrap();
+            assert_eq!(only_recv_chain(&bob), before);
+            let session = bob.e2e_sessions.values().next().unwrap();
+            assert!(session.pending_pq.is_empty(), "seq {seq} at {recv_count}");
+        }
+    }
+
+    #[test]
+    fn test_pq_inject_ahead_of_chain_is_held_until_its_position() {
+        // An inject for a position the chain hasn't reached is held, not
+        // mixed in early.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (mut bob, packet) = pq_inject_fixture(2, 5, now);
+        let before = only_recv_chain(&bob);
+        bob.handle_incoming_packet(&packet).unwrap();
+        assert_eq!(only_recv_chain(&bob), before);
+        let session = bob.e2e_sessions.values().next().unwrap();
+        assert!(session.pending_pq.contains_key(&5));
     }
 
     #[test]
@@ -2689,6 +2830,7 @@ mod tests {
                     m
                 },
                 pq_inject_replay_cache: std::collections::HashSet::new(),
+                pending_pq: BTreeMap::from([(10, vec![0xBC; 32])]),
             },
         );
         original.seen_session_keys.insert([0xDD; 32]);
@@ -2727,6 +2869,7 @@ mod tests {
         assert_eq!(orig_sess.recv_count, load_sess.recv_count);
         assert_eq!(orig_sess.skip_dict.len(), load_sess.skip_dict.len());
         assert_eq!(orig_sess.skip_dict[&1], load_sess.skip_dict[&1]);
+        assert_eq!(orig_sess.pending_pq, load_sess.pending_pq);
 
         // Verify pending contacts
         assert!(loaded.pending_contacts.contains_key(&peer_token));
@@ -2758,6 +2901,7 @@ mod tests {
                 peer_kyber_pub: None,
                 skip_dict: HashMap::new(),
                 pq_inject_replay_cache: HashSet::new(),
+                pending_pq: Default::default(),
             },
         );
 
@@ -2772,6 +2916,7 @@ mod tests {
                 peer_kyber_pub: None,
                 skip_dict: HashMap::new(),
                 pq_inject_replay_cache: HashSet::new(),
+                pending_pq: Default::default(),
             },
         );
 
@@ -2784,6 +2929,7 @@ mod tests {
             peer_kyber_pub: None,
             skip_dict: HashMap::new(),
             pq_inject_replay_cache: HashSet::new(),
+            pending_pq: Default::default(),
         };
 
         let mut charlie_sender = SymmetricSessionState {
@@ -2795,6 +2941,7 @@ mod tests {
             peer_kyber_pub: None,
             skip_dict: HashMap::new(),
             pq_inject_replay_cache: HashSet::new(),
+            pending_pq: Default::default(),
         };
 
         let mut bob_pkts = vec![];
@@ -2849,30 +2996,9 @@ mod tests {
     /// Runs the same 3-way handshake as `test_full_3way_handshake` and
     /// returns the two established clients, to avoid repeating the setup
     /// in every presence test below.
-    fn established_pair() -> (Client, Client) {
-        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
-        let mut alice = Client::new(server_addr);
-        let mut bob = Client::new(server_addr);
-
-        alice
-            .pending_contacts
-            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
-        let alice_kx =
-            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
-        let mut kx_inner = vec![0x02];
-        kx_inner.extend_from_slice(&alice_kx.to_bytes());
-        let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
-        let inner = strip_link(&bob_reply, &bob.link_master_key);
-        let alice_reply = alice.handle_incoming_packet(&inner).unwrap().unwrap();
-        let inner2 = strip_link(&alice_reply, &alice.link_master_key);
-        bob.handle_incoming_packet(&inner2).unwrap();
-
-        (alice, bob)
-    }
-
     #[test]
     fn test_presence_ping_marks_peer_online() {
-        let (alice, mut bob) = established_pair();
+        let (alice, mut bob) = connected_pair();
         let freshness = Duration::from_secs(60);
 
         assert!(
@@ -2896,7 +3022,7 @@ mod tests {
 
     #[test]
     fn test_presence_ping_expires_after_freshness_window() {
-        let (alice, mut bob) = established_pair();
+        let (alice, mut bob) = connected_pair();
         let tiny_freshness = Duration::from_millis(20);
 
         let ping = alice.generate_presence_packet(bob.identity.routing_token);
@@ -2913,7 +3039,7 @@ mod tests {
 
     #[test]
     fn test_chat_message_also_marks_peer_online() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let freshness = Duration::from_secs(60);
 
         let (msg_pkt, _) = alice
@@ -2927,7 +3053,7 @@ mod tests {
 
     #[test]
     fn test_presence_ping_rejects_wrong_target() {
-        let (alice, mut bob) = established_pair();
+        let (alice, mut bob) = connected_pair();
         let mallory = Client::new("127.0.0.1:4430".parse().unwrap());
 
         // A ping Alice generated for someone else must not mark her online

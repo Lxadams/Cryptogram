@@ -26,3 +26,6 @@ zeroize = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 # RaptorQ forward error correction for lossy links — see src/transport.rs.
 fec = { path = "../fec" }
+
+[dev-dependencies]
+fec = { path = "../fec", features = ["test-util"] }

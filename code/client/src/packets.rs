@@ -256,15 +256,20 @@ impl SessionEstablishPayload {
 }
 
 // ============================================================
-// PQInjectPayload (0x05) — 1192 bytes
+// PQInjectPayload (0x05) — 1200 bytes
 // ============================================================
 
-const PQI_LEN: usize = HEADER_LEN + KYBER_CT_LEN + SIG_LEN;
+const PQI_LEN: usize = HEADER_LEN + 8 + KYBER_CT_LEN + SIG_LEN;
 
 pub struct PQInjectPayload {
     pub routing_token: RoutingToken,
     pub target_token: RoutingToken,
     pub timestamp: u64,
+    /// The chain position the secret is mixed in at: just before the sender
+    /// derives the key for message `seq`. Lets the receiver apply it at that
+    /// exact position however late or early it arrives, and makes any copy
+    /// for a position already passed a detectable replay.
+    pub seq: u64,
     pub kyber_ct: Ciphertext,
     pub signature: Signature,
 }
@@ -278,6 +283,7 @@ impl PQInjectPayload {
             &self.target_token,
             self.timestamp,
         );
+        out.extend_from_slice(&self.seq.to_be_bytes());
         out.extend_from_slice(self.kyber_ct.as_bytes());
         out
     }
@@ -289,11 +295,14 @@ impl PQInjectPayload {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let (routing_token, target_token, timestamp, body, signature) =
             split_payload(bytes, PQI_LEN, "PQ inject")?;
-        let kyber_ct = Ciphertext::from_bytes(body).map_err(|_| anyhow!("Invalid Kyber CT"))?;
+        let seq = u64::from_be_bytes(body[..8].try_into().unwrap());
+        let kyber_ct =
+            Ciphertext::from_bytes(&body[8..]).map_err(|_| anyhow!("Invalid Kyber CT"))?;
         Ok(Self {
             routing_token,
             target_token,
             timestamp,
+            seq,
             kyber_ct,
             signature,
         })
@@ -302,12 +311,14 @@ impl PQInjectPayload {
     pub fn generate(
         identity: &UserIdentity,
         target_token: RoutingToken,
+        seq: u64,
         kyber_ct: Ciphertext,
     ) -> Self {
         let mut payload = Self {
             routing_token: identity.routing_token,
             target_token,
             timestamp: now_secs(),
+            seq,
             kyber_ct,
             signature: unsigned(),
         };
@@ -394,7 +405,7 @@ mod tests {
     fn payload_sizes_match_the_wire_format() {
         assert_eq!(KX_LEN, 1384);
         assert_eq!(EST_LEN, 1224);
-        assert_eq!(PQI_LEN, 1192);
+        assert_eq!(PQI_LEN, 1200);
         assert_eq!(PRESENCE_LEN, 104);
     }
 

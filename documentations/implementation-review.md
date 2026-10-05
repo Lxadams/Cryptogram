@@ -39,7 +39,7 @@ The weakest area is **the relay's link and routing layer**. Anyone with a link s
 | 1 | R-1 Any client can register any routing token (traffic hijack) | High |
 | 2 | R-2 Any client can overwrite any session's link key | High |
 | 3 | R-3 Links expire after 1 h with no re-handshake. Queued messages for that client are then dropped. | High |
-| 4 | C-4 Late PQ injections are rejected, which permanently desyncs the session | High (for the loss goal) |
+| 4 | C-4 Late PQ injections are rejected, which permanently desyncs the session (**fixed**: chain position replaces the freshness check) | High (for the loss goal) |
 | 5 | C-1 Both ratchet directions start from the same chain key (reflection) | High, **fix in progress in a separate task** |
 | 6 | C-6 KeyExchange from strangers is auto-accepted, contradicting the mutual-QR trust model | Medium |
 | 7 | R-5 The relay logs who talks to whom | Medium |
@@ -119,7 +119,7 @@ All HKDFs are HKDF-SHA256 with salt `"e2e-messenger-v1"`.
 - RAM-only queues with TTLs.
 - Persisted Ed25519 identity that clients pin.
 - Malformed input is rejected without panics.
-- Forwarding now flushes every 10 ms. The new test covers the full re-encrypt-and-send path, which had been flagged as untested.
+- Forwarding is woken on arrival and paced per recipient (5 ms/packet). The new test covers the full re-encrypt-and-send path, which had been flagged as untested.
 
 **Findings:**
 
@@ -136,7 +136,7 @@ Content stays E2E-encrypted, so this is a delivery attack, not a confidentiality
 **R-4 (Medium): resources are unbounded.**
 - No global cap on links, metadata entries or queues, and no rate limiting.
 - Each handshake costs an Ed25519 verification plus an X25519 operation.
-- Per-token queues are capped, at 1,024 packets after the FEC change (was 50). There's no cap on the number of tokens, so memory grows with every random token an attacker queues for.
+- Per-token queues are capped, at 2 MiB after the FEC change (was 50 packets), refusing new packets once full. There's no cap on the number of tokens, so memory grows with every random token an attacker queues for.
 
 **Fix:** a global byte budget, per-source rate limits, and cheap pre-checks before signature verification.
 

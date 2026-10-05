@@ -7,7 +7,7 @@
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use client::{
     derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
-    send_burst, ChatHistory, Client, ClientStateDto, IdentityStateStore, RoutingToken,
+    BurstSender, ChatHistory, Client, ClientStateDto, IdentityStateStore, RoutingToken,
 };
 use serde::Serialize;
 use std::{
@@ -792,9 +792,11 @@ pub async fn bootstrap(
         spawn_presence_loop(app, socket.clone()),
     ];
 
+    let bursts = BurstSender::spawn(socket.clone(), client.server_addr);
     *state.runtime.lock().await = Some(ClientRuntime {
         client,
         socket,
+        bursts,
         tasks,
     });
 
@@ -1013,8 +1015,9 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
 
 /// Encrypt and send an E2E message to an already-established session, as a
 /// burst of FEC packets sized to survive heavy loss (see `client`'s
-/// `create_fec_packets`/`send_burst`). Every 5th message's PQ
-/// ratchet-injection rides inside the same burst, transparently.
+/// `create_fec_packets`/`BurstSender`). Every 5th message's PQ
+/// ratchet-injection rides inside the same burst, transparently. Errors if
+/// the burst couldn't leave this machine at all (e.g. the network is down).
 ///
 /// Returns the message's local chat-history row id (`None` if no history is
 /// attached), so the frontend can label its own optimistic display of this
@@ -1038,14 +1041,15 @@ pub async fn send_message(
         .map_err(|e| e.to_string())?;
     let history_id = rt.client.last_recorded_id;
 
-    // The burst is paced out over a few hundred ms, so send it from its own
-    // task rather than holding the runtime lock (the receive loop needs it).
-    let socket = Arc::clone(&rt.socket);
-    let server_addr = rt.client.server_addr;
+    // The burst is paced out over a few hundred ms behind any earlier ones,
+    // so wait for it without holding the runtime lock (the receive loop
+    // needs it). Resolves once its first packet is out.
+    let bursts = rt.bursts.clone();
     drop(guard);
-    tauri::async_runtime::spawn(async move {
-        send_burst(&socket, server_addr, &packets).await;
-    });
+    bursts
+        .send(packets)
+        .await
+        .map_err(|e| format!("Message not sent: {e}"))?;
 
     Ok(history_id)
 }

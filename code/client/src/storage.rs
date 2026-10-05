@@ -5,7 +5,7 @@ use pqcrypto_kyber::kyber768::{PublicKey, SecretKey};
 use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -54,6 +54,9 @@ pub struct SymmetricSessionStateDto {
     // Older state files predate the PQ-inject replay cache.
     #[serde(default)]
     pub pq_inject_replay_cache: HashSet<String>,
+    // PQ inject secrets held for a chain position not yet reached (hex).
+    #[serde(default)]
+    pub pending_pq: BTreeMap<u64, String>,
 }
 
 impl ClientStateDto {
@@ -106,6 +109,11 @@ impl ClientStateDto {
                         .map(|k| hex::encode(k.as_bytes())),
                     skip_dict,
                     pq_inject_replay_cache,
+                    pending_pq: state
+                        .pending_pq
+                        .iter()
+                        .map(|(seq, secret)| (*seq, hex::encode(secret)))
+                        .collect(),
                 },
             );
         }
@@ -222,6 +230,10 @@ impl ClientStateDto {
                 hex::decode_to_slice(&hex_sig, &mut sig)?;
                 pq_inject_replay_cache.insert(sig);
             }
+            let mut pending_pq = BTreeMap::new();
+            for (seq, hex_secret) in dto_state.pending_pq {
+                pending_pq.insert(seq, hex::decode(&hex_secret)?);
+            }
 
             e2e_sessions.insert(
                 tok,
@@ -234,6 +246,7 @@ impl ClientStateDto {
                     peer_kyber_pub: pkp,
                     skip_dict,
                     pq_inject_replay_cache,
+                    pending_pq,
                 },
             );
         }
