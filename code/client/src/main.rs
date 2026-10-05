@@ -151,12 +151,16 @@ async fn main() -> Result<()> {
                 };
                 let text = parts[2..].join(" ");
                 let mut c = client.lock().await;
-                match c.create_encrypted_packet(token, text.as_bytes()) {
-                    Ok((msg_packet, pq_inject_packet)) => {
-                        socket.send_to(&msg_packet, server_addr).await.unwrap();
+                match c.create_encrypted_packets(token, text.as_bytes()) {
+                    Ok((msg_packets, pq_inject_packet)) => {
+                        // A long message comes back as several chunk packets.
+                        for msg_packet in &msg_packets {
+                            socket.send_to(msg_packet, server_addr).await.unwrap();
+                        }
                         println!("Sent msg!");
-                        // Every PQ_INJECT_INTERVAL messages, create_encrypted_packet
-                        // also hands back a fresh Kyber ratchet packet to send alongside.
+                        // Every PQ_INJECT_INTERVAL messages, create_encrypted_packets
+                        // also hands back a fresh Kyber ratchet packet to send after
+                        // the message's last chunk.
                         if let Some(pq_pkt) = pq_inject_packet {
                             socket.send_to(&pq_pkt, server_addr).await.unwrap();
                             println!("Sent PQ ratchet injection packet!");

@@ -30,6 +30,18 @@ const TYPE_HANDSHAKE_INIT: u8 = 0;
 const TYPE_DATA: u8 = 1;
 const TYPE_HANDSHAKE_RESP: u8 = 2;
 
+// Relay cover traffic ("dummy packets") is shaped like a forwarded chat
+// message so the two are the same size on the wire. The client pads every
+// chat message chunk to a fixed block (see code/client/src/padding.rs), so a
+// chat message's inner E2E payload is always
+//   1 type + 16 sender token + 8 seq + 24 nonce + 1024 padded block + 16 tag
+// = 1089 bytes, i.e. a 1150-byte UDP packet once wrapped for the recipient.
+// Keep this in step with the client if that layout changes.
+const CHAT_INNER_PAYLOAD_LEN: usize = 1 + 16 + 8 + 24 + 1024 + 16;
+// Inner type byte of a dummy packet, which the client ignores (the `0x00`
+// arm in `Client::handle_incoming_packet`).
+const INNER_TYPE_DUMMY: u8 = 0x00;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ServerIdentityDto {
     ed25519_secret: String,
@@ -272,9 +284,45 @@ fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> OutboundMessages {
     (messages, dummy_targets)
 }
 
-async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket) -> Result<()> {
+/// Link-encrypt `inner_payload` for the recipient behind `session_id`,
+/// behind the 16-byte zero routing prefix clients strip off. Real forwarded
+/// messages and dummy packets both go through this, so they're framed
+/// identically on the wire.
+fn wrap_for_recipient(
+    link_key: &[u8; 32],
+    session_id: &SessionId,
+    inner_payload: &[u8],
+) -> Result<Vec<u8>> {
     use rand_core::{OsRng, RngCore};
 
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(link_key));
+    let mut nonce_bytes = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = XNonce::from_slice(&nonce_bytes);
+
+    let mut full_inner = vec![0u8; 16]; // Dummy routing token prefix
+    full_inner.extend_from_slice(inner_payload);
+
+    let ciphertext = cipher
+        .encrypt(nonce, full_inner.as_slice())
+        .map_err(|_| anyhow!("Failed to encrypt outbound packet"))?;
+
+    let mut packet = vec![TYPE_DATA];
+    packet.extend_from_slice(session_id);
+    packet.extend_from_slice(&nonce_bytes);
+    packet.extend_from_slice(&ciphertext);
+    Ok(packet)
+}
+
+/// A dummy packet for the recipient behind `session_id`: the same size and
+/// framing as a forwarded chat message, with an inner type the client drops.
+fn dummy_packet(link_key: &[u8; 32], session_id: &SessionId) -> Result<Vec<u8>> {
+    let mut inner = vec![0u8; CHAT_INNER_PAYLOAD_LEN];
+    inner[0] = INNER_TYPE_DUMMY;
+    wrap_for_recipient(link_key, session_id, &inner)
+}
+
+async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket) -> Result<()> {
     let (messages, dummy_targets) = prepare_outbound_messages(tables);
     for (addr, inner_payload, recipient_session_id) in &messages {
         // Look up recipient's link key to re-encrypt
@@ -286,23 +334,7 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
             }
         };
 
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
-        let mut nonce_bytes = [0u8; 24];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
-
-        let mut full_inner = vec![0u8; 16]; // Dummy routing token prefix
-        full_inner.extend_from_slice(inner_payload.as_ref());
-
-        let ciphertext = cipher
-            .encrypt(nonce, full_inner.as_slice())
-            .map_err(|_| anyhow!("Failed to re-encrypt outbound"))?;
-
-        let mut packet = vec![TYPE_DATA];
-        packet.extend_from_slice(recipient_session_id);
-        packet.extend_from_slice(&nonce_bytes);
-        packet.extend_from_slice(&ciphertext);
-
+        let packet = wrap_for_recipient(&link_key, recipient_session_id, inner_payload)?;
         socket.send_to(&packet, addr).await?;
         info!("Sent {} bytes (re-encrypted) to {}", packet.len(), addr);
     }
@@ -316,26 +348,9 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
             }
         };
 
-        // Generate random dummy payload with variable size to match real traffic
-        let dummy_size = 32 + (OsRng.next_u32() as usize % 1469); // 32..1500
-        let mut dummy_payload = vec![0u8; dummy_size];
-        OsRng.fill_bytes(&mut dummy_payload);
-
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
-        let mut nonce_bytes = [0u8; 24];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(nonce, dummy_payload.as_ref())
-            .map_err(|_| anyhow!("Failed to encrypt dummy"))?;
-
-        let mut packet = vec![TYPE_DATA];
-        packet.extend_from_slice(recipient_session_id);
-        packet.extend_from_slice(&nonce_bytes);
-        packet.extend_from_slice(&ciphertext);
-
+        let packet = dummy_packet(&link_key, recipient_session_id)?;
         socket.send_to(&packet, addr).await?;
-        info!("Sent DUMMY packet (encrypted) to {}", addr);
+        info!("Sent DUMMY packet ({} bytes) to {}", packet.len(), addr);
     }
 
     Ok(())
@@ -444,6 +459,28 @@ mod tests {
     // ==========================================
     // Missing Edge Case: Server Relay & Handshake Tests
     // ==========================================
+
+    #[test]
+    fn test_dummy_packet_matches_forwarded_chat_packet() {
+        let mut link_key = [0u8; 32];
+        OsRng.fill_bytes(&mut link_key);
+        let session_id = [7u8; 4];
+
+        let dummy = dummy_packet(&link_key, &session_id).unwrap();
+        let chat =
+            wrap_for_recipient(&link_key, &session_id, &[0x01; CHAT_INNER_PAYLOAD_LEN]).unwrap();
+        assert_eq!(dummy.len(), 1150, "same size as a client's chat packet");
+        assert_eq!(dummy.len(), chat.len());
+        assert_eq!(dummy[..5], chat[..5], "same packet type and session id");
+
+        // Framed as the client expects: the zero routing prefix it strips,
+        // then an inner payload starting with the type byte it ignores.
+        let plaintext = XChaCha20Poly1305::new(Key::from_slice(&link_key))
+            .decrypt(XNonce::from_slice(&dummy[5..29]), &dummy[29..])
+            .unwrap();
+        assert_eq!(plaintext[..16], [0u8; 16]);
+        assert_eq!(plaintext[16], INNER_TYPE_DUMMY);
+    }
 
     #[test]
     fn test_edge_case_invalid_handshake() {

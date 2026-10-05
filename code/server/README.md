@@ -29,7 +29,9 @@ send_outbound_messages():
         Prepend a 16-byte dummy routing token prefix so client can strip uniformly.
         Send UDP packet to recipient's IP + port.
     For all active metadata entries NOT sent real messages:
-        Send dummy UDP packet (random 32-1500 byte payload, encrypted).
+        Send a dummy UDP packet the same size and framing as a forwarded chat
+        message (1150 bytes), inner type 0x00, which clients ignore.
+        (Currently disabled: prepare_outbound_messages selects no dummy targets.)
 
 sweep_expired_messages():
     For all entries in the message queue that have expired:
