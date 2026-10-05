@@ -7,7 +7,7 @@
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use client::{
     derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
-    ChatHistory, Client, ClientStateDto, IdentityStateStore, RoutingToken,
+    send_burst, ChatHistory, Client, ClientStateDto, IdentityStateStore, RoutingToken,
 };
 use serde::Serialize;
 use std::{
@@ -1011,9 +1011,10 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
     Ok(())
 }
 
-/// Encrypt and send an E2E message to an already-established session. Also
-/// sends a PQ ratchet-injection packet alongside, transparently, whenever
-/// `create_encrypted_packet` produces one (every 5th message).
+/// Encrypt and send an E2E message to an already-established session, as a
+/// burst of FEC packets sized to survive heavy loss (see `client`'s
+/// `create_fec_packets`/`send_burst`). Every 5th message's PQ
+/// ratchet-injection rides inside the same burst, transparently.
 ///
 /// Returns the message's local chat-history row id (`None` if no history is
 /// attached), so the frontend can label its own optimistic display of this
@@ -1031,23 +1032,20 @@ pub async fn send_message(
 
     let token = parse_token(&token_hex)?;
 
-    let (msg_packet, pq_inject_packet) = rt
+    let packets = rt
         .client
-        .create_encrypted_packet(token, text.as_bytes())
+        .create_fec_packets(token, text.as_bytes())
         .map_err(|e| e.to_string())?;
     let history_id = rt.client.last_recorded_id;
 
-    rt.socket
-        .send_to(&msg_packet, rt.client.server_addr)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if let Some(pq_pkt) = pq_inject_packet {
-        rt.socket
-            .send_to(&pq_pkt, rt.client.server_addr)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    // The burst is paced out over a few hundred ms, so send it from its own
+    // task rather than holding the runtime lock (the receive loop needs it).
+    let socket = Arc::clone(&rt.socket);
+    let server_addr = rt.client.server_addr;
+    drop(guard);
+    tauri::async_runtime::spawn(async move {
+        send_burst(&socket, server_addr, &packets).await;
+    });
 
     Ok(history_id)
 }

@@ -20,7 +20,7 @@ on_request(request):
         Flush any queued offline messages for this token to the outbound queue.
     If a 'Forward' request is received:
         Add (routing_token, payload, expiry_timestamp) to the message queue.
-        Queue is bounded to 50 messages per token (oldest evicted).
+        Queue is bounded to MAX_QUEUED_PER_TOKEN (1024) packets per token (oldest evicted) — clients send each message as a burst of FEC packets.
     Otherwise, discard the request.
 
 send_outbound_messages():
@@ -45,7 +45,7 @@ sweep_active_links():
 
 main():
     Load or generate server Ed25519 identity.
-    Launch a thread that calls send_outbound_messages() every 1 second.
+    Launch a thread that calls send_outbound_messages() every 10 ms (so paced FEC bursts keep their spacing).
     Launch a thread that calls sweep tasks every 120 seconds.
 ```
 

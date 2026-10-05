@@ -289,6 +289,7 @@ impl ClientStateDto {
             history: None,             // attached separately once a vault key is available
             last_recorded_id: None,
             identity_store: None, // attached separately once a vault key is available
+            fec_rx: Default::default(), // in-flight FEC state, not persisted
         })
     }
 }

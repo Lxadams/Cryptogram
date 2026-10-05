@@ -19,9 +19,11 @@ pub mod packets;
 use packets::*;
 mod history;
 mod storage;
+mod transport;
 pub use history::{ChatHistory, StoredMessage};
 use std::collections::HashSet;
 pub use storage::{ClientStateDto, IdentityStateStore};
+pub use transport::{FEC_DESIGN_LOSS, FEC_PACKET_SPACING, MAX_FEC_MESSAGE_LEN, send_burst};
 
 type HmacSha256 = Hmac<Sha256>;
 pub type SessionId = [u8; 4];
@@ -435,6 +437,10 @@ pub struct Client {
     /// message for two under two different synthetic ids. Not persisted;
     /// meaningful only in the instant after `record_message` runs.
     pub last_recorded_id: Option<i64>,
+    /// FEC receive state: half-rebuilt symbol bursts (0x07) and messages
+    /// parked until the PQ inject they depend on arrives — see
+    /// `transport`. Transient, like `inbox`: never persisted.
+    pub(crate) fec_rx: transport::FecReceiver,
 }
 
 impl Client {
@@ -459,6 +465,7 @@ impl Client {
             history: None,
             identity_store: None,
             last_recorded_id: None,
+            fec_rx: Default::default(),
         }
     }
 
@@ -705,9 +712,59 @@ impl Client {
         );
     }
 
-    /// Encrypt a message. Returns (message_packet, optional_pq_inject_packet).
-    /// Every PQ_INJECT_INTERVAL messages, a PQ inject packet is generated automatically.
+    /// Encrypt a message. Returns (message_packet, optional_pq_inject_packet),
+    /// each a single link-encrypted datagram. Every PQ_INJECT_INTERVAL
+    /// messages, a PQ inject packet is generated automatically. Front ends
+    /// talking over a lossy link use `create_fec_packets` instead.
     pub fn create_encrypted_packet(
+        &mut self,
+        target_token: RoutingToken,
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+        let (msg_payload, pq_payload) = self.encrypt_message_payloads(target_token, plaintext)?;
+        let msg_packet = self.wrap_link_encryption(target_token, &msg_payload);
+        let pq_inject_packet =
+            pq_payload.map(|inner| self.wrap_link_encryption(target_token, &inner));
+        Ok((msg_packet, pq_inject_packet))
+    }
+
+    /// Encrypt a message for a lossy link: the message and (every
+    /// PQ_INJECT_INTERVAL messages) its PQ inject travel together as one
+    /// burst of sealed FEC packets, sized to survive `FEC_DESIGN_LOSS` —
+    /// see `transport`. Hand the result to `send_burst`.
+    pub fn create_fec_packets(
+        &mut self,
+        target_token: RoutingToken,
+        plaintext: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        // Checked before encrypting: a message that can't be sent mustn't
+        // advance the ratchet or land in chat history.
+        if plaintext.len() > MAX_FEC_MESSAGE_LEN {
+            return Err(anyhow!(
+                "Message too long ({} bytes, max {MAX_FEC_MESSAGE_LEN})",
+                plaintext.len()
+            ));
+        }
+        let (msg_payload, pq_payload) = self.encrypt_message_payloads(target_token, plaintext)?;
+        let root_key = self.e2e_sessions[&target_token].root_key;
+        let symbols = transport::encode_message(
+            &root_key,
+            &self.identity.routing_token,
+            &target_token,
+            &msg_payload,
+            pq_payload.as_deref(),
+        )?;
+        Ok(symbols
+            .iter()
+            .map(|inner| self.wrap_link_encryption(target_token, inner))
+            .collect())
+    }
+
+    /// Ratchet-encrypt `plaintext` for `target_token`. Returns the inner (not
+    /// yet link-encrypted) 0x01 message payload and, every
+    /// PQ_INJECT_INTERVAL messages, the 0x05 PQ inject payload that must
+    /// reach the peer right after it.
+    fn encrypt_message_payloads(
         &mut self,
         target_token: RoutingToken,
         plaintext: &[u8],
@@ -759,17 +816,15 @@ impl Client {
         self.save();
         self.record_message(target_token, true, plaintext);
 
-        // Phase 2: link-encrypt everything (immutable borrow on self)
-        let msg_packet = self.wrap_link_encryption(target_token, &full_e2e_payload);
-
-        let pq_inject_packet = pq_ct.map(|kyber_ct| {
+        // Phase 2: build the signed PQ inject payload (immutable borrow on self)
+        let pq_payload = pq_ct.map(|kyber_ct| {
             let pqi_payload = PQInjectPayload::generate(&self.identity, target_token, kyber_ct);
             let mut inner = vec![0x05];
             inner.extend_from_slice(&pqi_payload.to_bytes());
-            self.wrap_link_encryption(target_token, &inner)
+            inner
         });
 
-        Ok((msg_packet, pq_inject_packet))
+        Ok((full_e2e_payload, pq_payload))
     }
 
     /// The checks every signed control payload (KeyExchange,
@@ -848,6 +903,18 @@ impl Client {
                         self.record_message(sender_token, false, &pt);
                         self.inbox.push((sender_token, pt, self.last_recorded_id));
                         self.last_seen.insert(sender_token, Instant::now());
+                    } else if seq_no >= session.recv_count {
+                        // Possibly encrypted after a PQ inject that hasn't
+                        // landed yet (its FEC burst can finish decoding after
+                        // this one's): park it, and `retry_deferred` replays
+                        // it once the inject arrives. Older seq numbers can
+                        // never succeed later, so those aren't kept.
+                        println!(
+                            ">> Holding message {seq_no} from {}: not decryptable yet (PQ ratchet update in flight?).",
+                            hex::encode(&sender_token[0..4])
+                        );
+                        self.fec_rx
+                            .defer(sender_token, payload.to_vec(), Instant::now());
                     } else {
                         println!(
                             ">> Received packet from {} but decryption failed (out of sync?).",
@@ -997,6 +1064,7 @@ impl Client {
                                     ">> [PQ] Received and injected post-quantum entropy from {}!",
                                     hex::encode(&pqi.routing_token[0..4])
                                 );
+                                self.retry_deferred(pqi.routing_token)?;
                             } else {
                                 println!(
                                     ">> PQInject received but no active session for this peer."
@@ -1033,8 +1101,69 @@ impl Client {
                 }
                 Ok(None)
             }
+            0x07 => {
+                // FEC symbol: [16-byte sender token | 24-byte nonce | sealed
+                // symbol] — see `transport`. Only the two ends of a session
+                // hold the seal key, so anything else is silently dropped.
+                if pkt_data.len() < 16 {
+                    return Err(anyhow!("FEC symbol payload too small"));
+                }
+                let sender_token: RoutingToken = pkt_data[..16].try_into().unwrap();
+                let Some(session) = self.e2e_sessions.get(&sender_token) else {
+                    return Ok(None);
+                };
+                let Some(symbol) = transport::open_symbol(
+                    &session.root_key,
+                    &sender_token,
+                    &self.identity.routing_token,
+                    &pkt_data[16..],
+                ) else {
+                    println!(">> [SECURITY ALERT] Dropped FEC symbol that failed authentication.");
+                    return Ok(None);
+                };
+                let object =
+                    match self
+                        .fec_rx
+                        .reassembler
+                        .ingest(sender_token, &symbol, Instant::now())
+                    {
+                        Ok(Some(object)) => object,
+                        Ok(None) => return Ok(None),
+                        Err(e) => {
+                            println!(
+                                ">> Dropped FEC symbol from {}: {e}",
+                                hex::encode(&sender_token[0..4])
+                            );
+                            return Ok(None);
+                        }
+                    };
+                let Some(parts) = transport::unbundle(&object) else {
+                    println!(">> Dropped malformed FEC object.");
+                    return Ok(None);
+                };
+                for part in parts {
+                    // Only what `create_fec_packets` bundles (a message and
+                    // its PQ inject), and only on the sealing peer's own
+                    // behalf: both carry the sender's token right after the
+                    // type byte.
+                    let own = part.get(1..17) == Some(&sender_token[..]);
+                    if own && matches!(part[0], 0x01 | 0x05) {
+                        self.handle_incoming_packet(part)?;
+                    }
+                }
+                Ok(None)
+            }
             _ => Ok(None),
         }
+    }
+
+    /// Replay messages from `sender` that the 0x01 branch parked as not yet
+    /// decryptable, now that a PQ inject has moved their receive chain on.
+    fn retry_deferred(&mut self, sender: RoutingToken) -> Result<()> {
+        for payload in self.fec_rx.take_deferred(&sender, Instant::now()) {
+            self.handle_incoming_packet(&payload)?;
+        }
+        Ok(())
     }
 }
 

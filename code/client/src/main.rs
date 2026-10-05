@@ -17,7 +17,7 @@ use tokio::{io::AsyncBufReadExt, net::UdpSocket, sync::Mutex};
 
 use client::{
     Client, ClientStateDto, parse_routing_token, parse_verifying_key, perform_handshake,
-    state_file_path,
+    send_burst, state_file_path,
 };
 
 #[tokio::main]
@@ -151,16 +151,16 @@ async fn main() -> Result<()> {
                 };
                 let text = parts[2..].join(" ");
                 let mut c = client.lock().await;
-                match c.create_encrypted_packet(token, text.as_bytes()) {
-                    Ok((msg_packet, pq_inject_packet)) => {
-                        socket.send_to(&msg_packet, server_addr).await.unwrap();
-                        println!("Sent msg!");
-                        // Every PQ_INJECT_INTERVAL messages, create_encrypted_packet
-                        // also hands back a fresh Kyber ratchet packet to send alongside.
-                        if let Some(pq_pkt) = pq_inject_packet {
-                            socket.send_to(&pq_pkt, server_addr).await.unwrap();
-                            println!("Sent PQ ratchet injection packet!");
-                        }
+                // One burst of FEC packets (with any PQ ratchet injection
+                // bundled inside), paced out on its own task so the receive
+                // loop isn't locked out while it drains.
+                match c.create_fec_packets(token, text.as_bytes()) {
+                    Ok(packets) => {
+                        println!("Sending msg as a burst of {} packets...", packets.len());
+                        let socket = Arc::clone(&socket);
+                        tokio::spawn(async move {
+                            send_burst(&socket, server_addr, &packets).await;
+                        });
                     }
                     Err(e) => println!("Error: {}", e),
                 }

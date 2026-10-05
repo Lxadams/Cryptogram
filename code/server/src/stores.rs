@@ -7,6 +7,13 @@ use std::{
 pub type SessionId = [u8; 4];
 pub type RoutingToken = [u8; 16];
 
+/// Packets held per recipient token (oldest evicted beyond this). Clients
+/// send each message as a burst of ~20-50 FEC packets, so this holds a few
+/// dozen messages for an offline recipient — and comfortably absorbs bursts
+/// to an online one between flushes. Bounded so one token can't eat the
+/// relay's RAM.
+pub const MAX_QUEUED_PER_TOKEN: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct MetadataEntry {
     pub incoming_addr: SocketAddr,
@@ -77,8 +84,8 @@ impl Tables {
             expiry: Instant::now() + ttl,
         });
 
-        // Bounded queue to prevent DoS (max 50 messages per token)
-        if queue.len() > 50 {
+        // Bounded queue to prevent DoS
+        if queue.len() > MAX_QUEUED_PER_TOKEN {
             queue.pop_front();
         }
     }

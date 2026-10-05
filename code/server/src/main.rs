@@ -19,7 +19,11 @@ use crate::stores::{SessionId, Tables};
 
 const METADATA_TTL: Duration = Duration::from_secs(1000);
 const MESSAGE_TTL: Duration = Duration::from_secs(1000);
-const OUTBOUND_TASK_INTERVAL: Duration = Duration::from_secs(1);
+// Short enough that a client's paced FEC burst (one packet every ~10ms)
+// leaves the relay with roughly the spacing it arrived with, instead of
+// being re-bunched into one line-rate blast that a single jamming spike
+// could wipe out.
+const OUTBOUND_TASK_INTERVAL: Duration = Duration::from_millis(10);
 const SWEEPING_TASK_INTERVAL: Duration = Duration::from_secs(120);
 
 // Domain-separation salt for HKDF derivations (must match client)
@@ -303,7 +307,17 @@ async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket)
         packet.extend_from_slice(&nonce_bytes);
         packet.extend_from_slice(&ciphertext);
 
-        socket.send_to(&packet, addr).await?;
+        // Already drained from the queue, so bailing out here would silently
+        // drop every remaining packet in the batch — skip just this one.
+        if let Err(e) = socket.send_to(&packet, addr).await {
+            error!(
+                "Failed to forward {} bytes to {}: {}",
+                packet.len(),
+                addr,
+                e
+            );
+            continue;
+        }
         info!("Sent {} bytes (re-encrypted) to {}", packet.len(), addr);
     }
 
@@ -598,8 +612,9 @@ mod tests {
             .expand(b"wireguard-lite-link", &mut sender_link_key)
             .unwrap();
 
-        // 2. Spam 55 messages to the offline token
-        for i in 0..55 {
+        // 2. Spam 5 more messages than the queue holds to the offline token
+        let cap = crate::stores::MAX_QUEUED_PER_TOKEN;
+        for i in 0..cap + 5 {
             let msg = format!("Spam {}", i);
             let forward_pkt = create_data_packet(
                 sender_link_key,
@@ -610,20 +625,85 @@ mod tests {
             handle_request(&tables, &server_identity, sender_addr, &forward_pkt).unwrap();
         }
 
-        // 3. Ensure offline queue is strictly bounded to 50
+        // 3. Ensure offline queue is strictly bounded to the cap
         {
             let tables_lock = tables.lock().unwrap();
             let queue = tables_lock.get_queued_packets(&receiver_token).unwrap();
             assert_eq!(
                 queue.len(),
-                50,
+                cap,
                 "Offline queue must drop messages beyond limit"
             );
 
-            // Because it pops the front (oldest), the remaining messages should be 5 to 54
+            // Because it pops the front (oldest), the first 5 are gone
             assert_eq!(queue.front().unwrap().payload, b"Spam 5");
-            assert_eq!(queue.back().unwrap().payload, b"Spam 54");
+            assert_eq!(
+                queue.back().unwrap().payload,
+                format!("Spam {}", cap + 4).as_bytes()
+            );
         }
+    }
+
+    /// A long message's FEC burst to an online recipient is far bigger than
+    /// the old 50-packet cap: every packet must come out, in order, once.
+    #[test]
+    fn test_fec_burst_to_online_recipient_is_delivered_whole() {
+        let mut tables = Tables::new();
+        let token = [0xDD; 16];
+        let addr = SocketAddr::from(([127, 0, 0, 1], 50003));
+        tables.update_metadata(token, addr, [0xEE; 4], METADATA_TTL);
+        for i in 0..300u32 {
+            tables.enqueue_message(token, i.to_be_bytes().to_vec(), MESSAGE_TTL);
+        }
+        let out = tables.outbound_messages();
+        assert_eq!(out.len(), 300);
+        for (i, message) in out.iter().enumerate() {
+            assert_eq!(message.payload, (i as u32).to_be_bytes());
+        }
+        assert!(
+            tables.outbound_messages().is_empty(),
+            "drained exactly once"
+        );
+    }
+
+    /// The whole forwarding path: queued packets for an online recipient are
+    /// re-encrypted under *their* link key, prefixed with the dummy routing
+    /// token, and actually sent over UDP — all of them, in order.
+    #[tokio::test]
+    async fn test_outbound_forwarding_reencrypts_and_sends_every_packet() {
+        let tables = Arc::new(Mutex::new(Tables::new()));
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recipient = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (session, token, link_key) = ([0x11; 4], [0x22; 16], [0x33; 32]);
+        {
+            let mut t = tables.lock().unwrap();
+            t.register_link(session, link_key);
+            t.update_metadata(
+                token,
+                recipient.local_addr().unwrap(),
+                session,
+                METADATA_TTL,
+            );
+            for i in 0..60u8 {
+                t.enqueue_message(token, vec![i; 40], MESSAGE_TTL);
+            }
+        }
+        send_outbound_messages(&tables, &relay).await.unwrap();
+
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
+        let mut buf = [0u8; 2048];
+        for i in 0..60u8 {
+            let (len, _) = recipient.recv_from(&mut buf).await.unwrap();
+            let packet = &buf[..len];
+            assert_eq!(packet[0], TYPE_DATA);
+            assert_eq!(packet[1..5], session);
+            let inner = cipher
+                .decrypt(XNonce::from_slice(&packet[5..29]), &packet[29..])
+                .unwrap();
+            assert_eq!(inner[..16], [0u8; 16]);
+            assert_eq!(inner[16..], [i; 40]);
+        }
+        assert!(tables.lock().unwrap().outbound_messages().is_empty());
     }
 
     #[test]
