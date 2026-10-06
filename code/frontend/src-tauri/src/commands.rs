@@ -122,8 +122,14 @@ fn parse_token(token_hex: &str) -> Result<RoutingToken, String> {
 /// local-dev default (`127.0.0.1:4430`, see runserver.sh); override with
 /// the `SERVER_ADDR` env var (e.g. a deployed EC2 host's `<ip>:443`) —
 /// mirrors the same override on the CLI (see code/client/src/main.rs).
+/// `SERVER_ADDR` set at launch wins; failing that, the value it had at
+/// build time is baked in, since a mobile app can't be launched with env
+/// vars (see code/frontend/ANDROID.md).
 fn server_addr_raw() -> String {
-    std::env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:4430".to_string())
+    std::env::var("SERVER_ADDR")
+        .ok()
+        .or_else(|| option_env!("SERVER_ADDR").map(str::to_string))
+        .unwrap_or_else(|| "127.0.0.1:4430".to_string())
 }
 
 /// How often we send a presence ping to each established contact.
