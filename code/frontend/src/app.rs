@@ -811,7 +811,9 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     ));
 
     view! {
-        <section class="main-screen">
+        // `chat-open`: on narrow screens, show the chat instead of the
+        // contact list (see `.main-screen.chat-open` in style.css).
+        <section class="main-screen" class:chat-open=move || selected.get().is_some()>
             <IdentityCard identity=identity />
             <div class="columns">
                 <ContactPanel contacts=contacts selected=selected />
@@ -822,7 +824,8 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
 }
 
 /// Our own identity — what a peer needs (routing token + Ed25519 key) to
-/// add us as a contact, shown both as hex (to copy-paste) and, via
+/// add us as a contact, shown both as hex (to copy-paste, folded away by
+/// default since it's long and the QR code is the usual way) and, via
 /// "Present QR code", as a QR code of the same two values for a peer's
 /// "Scan QR code" (see contact_code.rs for the payload). `name` (chosen on
 /// the login screen) is shown here for your own reference only — it's sent
@@ -840,27 +843,33 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
         <div class="identity-card">
             <div class="identity-card-header">
                 <h2>"Your Identity"</h2>
+                {identity.name.clone().map(|name| view! {
+                    <span class="identity-name">{name}</span>
+                })}
                 <button type="button" on:click=move |_| show_qr.set(true)>
                     "Present QR code"
                 </button>
             </div>
-            {identity.name.clone().map(|name| view! {
+            <details class="identity-details">
+                <summary>"Show token and key"</summary>
+                {identity.name.clone().map(|name| view! {
+                    <p>
+                        <strong>"Name: "</strong>
+                        <code>{name.clone()}</code>
+                        <CopyButton value=name />
+                    </p>
+                })}
                 <p>
-                    <strong>"Name: "</strong>
-                    <code>{name.clone()}</code>
-                    <CopyButton value=name />
+                    <strong>"Token: "</strong>
+                    <code>{identity.routing_token.clone()}</code>
+                    <CopyButton value=identity.routing_token />
                 </p>
-            })}
-            <p>
-                <strong>"Token: "</strong>
-                <code>{identity.routing_token.clone()}</code>
-                <CopyButton value=identity.routing_token />
-            </p>
-            <p>
-                <strong>"Ed25519: "</strong>
-                <code>{identity.ed25519_public.clone()}</code>
-                <CopyButton value=identity.ed25519_public />
-            </p>
+                <p>
+                    <strong>"Ed25519: "</strong>
+                    <code>{identity.ed25519_public.clone()}</code>
+                    <CopyButton value=identity.ed25519_public />
+                </p>
+            </details>
             <Show when=move || show_qr.get()>
                 <Modal title="Your QR code" on_close=Callback::new(move |()| show_qr.set(false))>
                     {match qr_svg.get_value() {
@@ -1217,7 +1226,16 @@ fn ChatPanel(
                     });
 
                     view! {
-                        <h3 class="chat-header">"Chat with " {chat_label}</h3>
+                        <div class="chat-header">
+                            <button
+                                type="button"
+                                class="back-btn secondary"
+                                on:click=move |_| selected.set(None)
+                            >
+                                "← Contacts"
+                            </button>
+                            <h3>"Chat with " {chat_label}</h3>
+                        </div>
                         <div class="transcript" node_ref=transcript_ref>
                             <For
                                 each=history
