@@ -113,6 +113,18 @@ pub async fn logout() -> Result<(), String> {
     call("logout", &()).await
 }
 
+/// Mirrors `SessionDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct SessionDto {
+    pub pseudonym: String,
+    pub identity: Option<IdentityDto>,
+}
+
+/// The session the backend already has, if any (see `App`).
+pub async fn current_session() -> Result<Option<SessionDto>, String> {
+    call("current_session", &()).await
+}
+
 #[derive(Serialize)]
 struct CreateIdentityArgs<'a> {
     pseudonym: &'a str,

@@ -5,7 +5,15 @@
    Theme: `data-theme` is set on <html> by app.rs (see toggle_theme/
    apply_theme) based on saved preference or prefers-color-scheme. The
    bare :root block below is the fallback used for the instant before that
-   JS-equivalent runs, and doubles as the dark palette. */
+   JS-equivalent runs, and doubles as the dark palette.
+
+   Layout: the app always fills the window exactly, at any size from a
+   phone to a maximised desktop window. Long content scrolls inside its
+   own panel (contact list, transcript, a too-tall form) rather than the
+   page, so the header and message box never scroll out of view. Below
+   720px wide (phones, narrow windows) the main screen shows one column at
+   a time: the contact list, or the open chat with a back button (see
+   `.main-screen.chat-open`). */
 
 :root {
   color-scheme: dark;
@@ -19,6 +27,8 @@
   --accent: #5b8cff;
   --ok: #3ecf8e;
   --error: #ff6b6b;
+  /* Outer margin around everything; tighter on small screens. */
+  --gutter: clamp(0.75rem, 2.5vw, 1.5rem);
 }
 
 :root[data-theme="dark"] {
@@ -66,13 +76,34 @@ body {
   overflow: hidden;
 }
 
+/* Scrollbars that match the theme instead of bright default bars. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
 .app {
-  max-width: 900px;
-  height: 100vh;
+  max-width: 1100px;
+  height: 100%;
   margin: 0 auto;
-  padding: 1.5rem;
+  padding: var(--gutter);
   display: flex;
   flex-direction: column;
+  gap: 0.75rem;
   min-height: 0;
 }
 
@@ -80,14 +111,26 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
   flex: none;
 }
 
 h1 {
-  font-size: 1.25rem;
+  margin: 0;
+  font-size: 1.15rem;
   color: var(--muted);
   letter-spacing: 0.02em;
+}
+
+h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.15rem;
+}
+
+h3 {
+  margin: 1rem 0 0.5rem;
+  font-size: 1rem;
 }
 
 .header-actions {
@@ -115,7 +158,14 @@ code {
   padding: 0.1rem 0.35rem;
   border-radius: 4px;
   font-size: 0.85em;
-  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+input,
+select,
+button {
+  font: inherit;
+  font-size: 0.95rem;
 }
 
 input {
@@ -125,6 +175,7 @@ input {
   padding: 0.5rem 0.7rem;
   border-radius: 6px;
   width: 100%;
+  min-width: 0;
   margin-bottom: 0.5rem;
 }
 
@@ -151,11 +202,12 @@ button.secondary {
 
 .login-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
 }
 
 .login-actions button {
-  flex: 1;
+  flex: 1 1 8rem;
 }
 
 .hint {
@@ -181,7 +233,22 @@ button.secondary {
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 1rem;
-  margin-bottom: 1rem;
+}
+
+/* Login, Create identity and Connect: a form-width column, centred, that
+   scrolls on its own if the window is too short for it. */
+.login-screen,
+.connect-screen {
+  width: 100%;
+  max-width: 440px;
+  margin: 0 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.login-screen > p:first-child,
+.connect-screen > p:first-child {
+  margin-top: 0;
 }
 
 .identities-heading {
@@ -199,6 +266,7 @@ button.secondary {
 
 .identity-select {
   flex: 1;
+  min-width: 0;
   background: var(--sunken);
   border: 1px solid var(--border);
   color: var(--text);
@@ -220,6 +288,7 @@ button.secondary {
 .visibility-toggle,
 .copy-btn {
   display: inline-flex;
+  flex: none;
   align-items: center;
   justify-content: center;
   background: transparent;
@@ -283,24 +352,56 @@ button.danger {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  gap: 0.75rem;
 }
 
 .identity-card {
   flex: none;
+  padding: 0.75rem 1rem;
 }
 
 .identity-card-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
 }
 
-.identity-card p {
+.identity-card-header h2 {
+  margin: 0;
+}
+
+.identity-name {
+  color: var(--muted);
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.identity-card-header button {
+  margin-left: auto;
+}
+
+/* Token and key are long and only needed to add someone by hand (the QR
+   code covers the usual case), so they're folded away by default. */
+.identity-details {
+  margin-top: 0.5rem;
+}
+
+.identity-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.identity-details p {
   display: flex;
   align-items: center;
   gap: 0.4rem;
   flex-wrap: wrap;
+  margin: 0.5rem 0 0;
 }
 
 .copy-btn.copied {
@@ -310,8 +411,8 @@ button.danger {
 
 .columns {
   display: grid;
-  grid-template-columns: 260px 1fr;
-  gap: 1rem;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  gap: 0.75rem;
   align-items: stretch;
   flex: 1;
   min-height: 0;
@@ -325,28 +426,27 @@ button.danger {
 .contact-list {
   list-style: none;
   padding: 0;
-  margin: 0 0 1rem 0;
+  margin: 0 0 0.5rem 0;
 }
 
+/* Name | status | remove. The name takes what's left and truncates, so
+   the status pill and button stay on the row however long it is. */
 .contact-list li {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
+  gap: 0.4rem;
   padding: 0.5rem;
   border-radius: 6px;
   cursor: pointer;
 }
 
-/* The contact list is a narrow sidebar column (see .columns) — the
-   remove-contact confirm (name/status + a "Remove?" prompt and up to three
-   buttons) doesn't fit on one line next to those, so it wraps onto a full
-   width row of its own underneath instead of overlapping them. */
+/* The remove-contact confirm ("Remove?" + Yes/No) gets a full-width row
+   of its own underneath, in place of the remove button. */
 .contact-list li .identity-confirm {
-  flex-basis: 100%;
+  grid-column: 1 / -1;
   flex-wrap: wrap;
   justify-content: flex-end;
-  margin-top: 0.3rem;
 }
 
 .contact-list li:hover {
@@ -360,6 +460,9 @@ button.danger {
 
 .contact-name {
   font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .contact-label {
@@ -385,7 +488,25 @@ button.danger {
 }
 
 .chat-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
   margin: 0 0 0.75rem 0;
+  min-width: 0;
+}
+
+.chat-header h3 {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Back to the contact list. Only exists in the one-column layout. */
+.back-btn {
+  display: none;
+  flex: none;
+  padding: 0.3rem 0.6rem;
 }
 
 .status {
@@ -393,6 +514,7 @@ button.danger {
   padding: 0.1rem 0.5rem;
   border-radius: 999px;
   text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .status-established {
@@ -406,10 +528,15 @@ button.danger {
 }
 
 .chat-panel {
-  min-height: 320px;
+  min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.chat-panel > .hint {
+  margin: 0;
 }
 
 .transcript {
@@ -426,7 +553,7 @@ button.danger {
   margin: 0;
   padding: 0.5rem 0.75rem;
   border-radius: 8px;
-  max-width: 70%;
+  max-width: min(75%, 36rem);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -445,10 +572,15 @@ button.danger {
 .composer {
   display: flex;
   gap: 0.5rem;
+  flex: none;
 }
 
 .composer input {
   margin-bottom: 0;
+}
+
+.composer button {
+  flex: none;
 }
 
 /* "Scan QR code" in the Add contact section: full width, the primary way
@@ -469,7 +601,7 @@ button.danger {
 }
 
 .modal {
-  width: min(100%, 360px);
+  width: min(100%, 380px);
   max-height: 100%;
   overflow: auto;
   background: var(--panel);
@@ -516,4 +648,56 @@ button.danger {
   object-fit: cover;
   background: var(--sunken);
   border-radius: 8px;
+}
+
+/* One column: phones and narrow windows. The contact list (with your
+   identity above it) fills the screen until a chat is opened, then the
+   chat fills it instead, with a back button to return. */
+@media (max-width: 719px) {
+  .columns {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .contact-panel,
+  .chat-panel {
+    flex: 1;
+  }
+
+  .main-screen:not(.chat-open) .chat-panel,
+  .main-screen.chat-open .identity-card,
+  .main-screen.chat-open .contact-panel {
+    display: none;
+  }
+
+  .back-btn {
+    display: inline-flex;
+  }
+
+  .transcript p {
+    max-width: 85%;
+  }
+}
+
+/* Touch screens: bigger targets, and 16px text in fields so mobile
+   browsers don't zoom in when one is focused. */
+@media (pointer: coarse) {
+  input,
+  select,
+  button {
+    font-size: 1rem;
+  }
+
+  input,
+  select,
+  button:not(.icon-btn, .visibility-toggle, .copy-btn) {
+    min-height: 2.75rem;
+  }
+
+  .icon-btn,
+  .visibility-toggle,
+  .copy-btn {
+    min-width: 2.25rem;
+    min-height: 2.25rem;
+  }
 }

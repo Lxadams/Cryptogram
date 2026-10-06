@@ -4,8 +4,8 @@ How to build this Tauri app as an Android APK and install it on a phone.
 Written for Ubuntu, including WSL2 on Windows.
 
 - **Once per machine:** steps 1–4 (toolchain).
-- **Once per repo:** step 5 (generate the Android project). Skip it if
-  `src-tauri/gen/android/` is already committed.
+- **Once per repo:** step 5 (generate the Android project). Already done:
+  `src-tauri/gen/android/` is committed.
 - **Every build:** steps 6–8 (set the relay address, build, install).
 
 **Shortcut:** once steps 1–4 are done, run
@@ -36,7 +36,8 @@ its own OpenSSL from source.
 sudo apt install -y openjdk-21-jdk
 ```
 
-The generated Android project uses Gradle 9, which needs JDK 17 or newer.
+The Android project's build tools (Gradle 8.14, Android Gradle Plugin 8.11)
+need JDK 17 or newer.
 
 ## 3. Android SDK and NDK
 
@@ -55,10 +56,10 @@ You don't need Android Studio for this.
    ```bash
    SDKM=~/Android/Sdk/cmdline-tools/latest/bin/sdkmanager
    $SDKM --list | grep -E '^\s*ndk;'      # pick the newest version without -rc/-beta
-   $SDKM "platform-tools" "platforms;android-37" "ndk;<version>"
+   $SDKM "platform-tools" "platforms;android-36" "ndk;<version>"
    yes | $SDKM --licenses
    ```
-   `android-37` matches `compileSdk` in
+   `android-36` matches `compileSdk` in
    `src-tauri/gen/android/app/build.gradle.kts`. If that file says a
    different number, install that platform instead. Accepting the licenses
    lets Gradle download build-tools and anything else it needs on its own.
@@ -72,7 +73,11 @@ export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export ANDROID_HOME=$HOME/Android/Sdk
 export NDK_HOME=$ANDROID_HOME/ndk/<version>   # the version you installed in step 3
 export PATH=$PATH:$ANDROID_HOME/platform-tools
+export RANLIB_aarch64_linux_android=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
 ```
+
+The last line is for SQLCipher's OpenSSL build. It otherwise looks for
+`aarch64-linux-android-ranlib`, a tool the NDK no longer includes.
 
 Then add the Rust target for 64-bit ARM, which nearly every phone from the
 last several years uses:
@@ -86,21 +91,29 @@ For an old 32-bit phone, also add `armv7-linux-androideabi` and build with
 
 ## 5. Generate the Android project (once per repo)
 
+**Already done.** `src-tauri/gen/android/` is committed, so skip this
+step. It's only needed if that folder is ever deleted and regenerated with:
+
 ```bash
 cd code/frontend
 cargo tauri android init
 ```
 
-This creates `src-tauri/gen/android/`. Next, let the QR scanner use the
-camera. In `src-tauri/gen/android/app/src/main/AndroidManifest.xml`, add
-this line next to the existing `INTERNET` permission:
+Regenerating overwrites hand-written changes, which you'd need to restore
+from git afterwards. They're all under
+`src-tauri/gen/android/app/src/main/`:
 
-```xml
-<uses-permission android:name="android.permission.CAMERA" />
-```
+- `AndroidManifest.xml`: the camera, notification and foreground-service
+  permissions, the `MessageService` declaration, backups switched off, and
+  no Android TV launcher entry.
+- `java/.../MainActivity.kt`, `NativeBridge.kt` and `MessageService.kt`:
+  background receiving and notifications (see
+  [Receiving in the background](#receiving-in-the-background)), plus
+  keeping the UI clear of the status bar, navigation bar and keyboard.
+- `res/values/strings.xml`, `res/drawable/ic_stat_message.xml` and
+  `res/xml/data_extraction_rules.xml`.
 
-Commit `src-tauri/gen/android/` so nobody else needs to repeat this step.
-Its own `.gitignore` already excludes build output.
+The folder's own `.gitignore` already excludes build output.
 
 ## 6. Set the relay address
 
@@ -118,6 +131,9 @@ export SERVER_ADDR=relay.example.com:443   # TODO: replace with the production r
 - If it isn't set, the app falls back to `127.0.0.1:4430`. On a phone that
   address is the phone itself, so the app won't connect.
 - The phone must be able to reach that host on that UDP port.
+- The relay must run the same version of `code/server` as the app. Older
+  relays send each message only once, without waiting for the phone to
+  confirm it, so messages sent while the phone is asleep get lost.
 
 ## 7. Build the APK
 
@@ -133,6 +149,9 @@ cargo tauri android build --debug --apk --target aarch64
 - `--debug` signs the APK automatically with this machine's debug key,
   which is all you need to install it on your own phone. A release build
   needs a signing keystore set up first.
+- A debug build installs as `nz.ac.waikato.compx374.e2e_messenger.debug`
+  (`debugApplicationIdSuffix` in `src-tauri/tauri.conf.json`). That makes it
+  a separate app from any release build, with its own identities.
 - Use `build`, not `cargo tauri android dev`. Dev mode loads the UI from a
   `trunk serve` running on your PC, so the phone would have to reach your
   dev server. Under WSL, `trunk serve`'s file watcher has also crashed
@@ -166,19 +185,59 @@ cargo tauri android build --debug --apk --target aarch64
 
 ## 9. First run
 
-1. **Create identity**, then log in, the same way as on desktop.
-2. On the **Connect** screen, paste the relay's public key. It's the
+1. Allow notifications when Android asks (Android 13 and newer). Without
+   them, the app still receives messages in the background but can't tell
+   you about them.
+2. **Create identity**, then log in, the same way as on desktop.
+3. On the **Connect** screen, paste the relay's public key. It's the
    `Server Static Pubkey:` line the server prints when it starts. Typing 64
    hex characters on a phone is painful, so send it to yourself through a
    notes or chat app and paste it.
-3. Add contacts with **Scan QR code** (Android asks for camera permission
+4. Add contacts with **Scan QR code** (Android asks for camera permission
    the first time) or by pasting a routing token and Ed25519 key.
+
+## Receiving in the background
+
+While you're logged in and connected, the app runs a foreground service
+that keeps it connected to the relay when it's not on screen. Android
+shows this as an ongoing "Connected" notification.
+
+- A message that arrives while the app is in the background shows a "New
+  message" notification. It names the sender but never shows the text.
+  Opening the app clears it.
+- While the app isn't on screen, it stops telling your contacts you're
+  online, to save battery. They see you as offline until you open it
+  again, but their messages still reach you.
+- Swiping the app away from the recent-apps screen doesn't log you out. The
+  app keeps receiving, and reopening it goes straight back to your chats.
+- **Log out** stops the service and the notification.
+- If Android kills the app anyway, or the phone restarts, nothing is
+  received until you open the app and log in again. Logging in needs your
+  passcode, so this can't happen automatically. The relay holds messages
+  for up to 7 days, and they arrive once you're back.
+- In deep sleep (screen off and phone still for a while), Android may pause
+  the app's network access until the phone next wakes. Messages then arrive
+  late but aren't lost. Some phone makers also stop background apps more
+  aggressively. If messages only arrive when you open the app, set
+  Settings → Apps → e2e-messenger → Battery to **Unrestricted**.
+
+## How it differs from desktop
+
+- **One login per identity.** Desktop uses a file lock to stop two copies
+  of the app logging into the same identity. Android has no file locking
+  (`try_acquire_session_lock` in `src-tauri/src/commands.rs`), but only one
+  copy of the app can run there anyway, and the app itself still won't
+  delete the identity you're logged into.
+- **No backups.** Android's cloud backup and phone-to-phone transfer are
+  switched off for this app, so identities never leave the phone.
 
 ## Updating the app
 
 Build again (step 7) and install over the top, using `adb install -r` or by
 opening the new APK. Identities and chats survive an update but **not** an
-uninstall.
+uninstall. Backups are off (see
+[How it differs from desktop](#how-it-differs-from-desktop)), so
+reinstalling doesn't bring them back.
 
 An APK built on a different computer is signed with a different debug key.
 Android refuses to install it over the existing app ("App not installed" /
@@ -220,7 +279,10 @@ must be on the same Wi-Fi.
 | Symptom | Fix |
 |---|---|
 | `android init`/`build` can't find the SDK or NDK | Run `echo $ANDROID_HOME $NDK_HOME` in the same terminal. `NDK_HOME` must point at the versioned folder inside `ndk/`. |
+| `aarch64-linux-android-ranlib: not found` while building `openssl-sys` | `RANLIB_aarch64_linux_android` isn't set (step 4). |
 | Gradle complains about the Java version | `JAVA_HOME` must point at JDK 17 or newer. |
 | The app opens but Connect fails or times out | `SERVER_ADDR` wasn't exported when you built (export it and build again), or the phone can't reach that host over UDP. |
 | "App not installed" | See [Updating the app](#updating-the-app). |
-| The QR scanner says the camera is blocked | The `CAMERA` permission is missing from the manifest (step 5), or it was denied. Grant it in Settings → Apps → e2e-messenger → Permissions. |
+| No notifications for new messages | Notifications were denied. Allow them in Settings → Apps → e2e-messenger → Notifications. |
+| Messages only arrive when you open the app | The relay is an older version (see step 6), or the phone is stopping the app in the background (see [Receiving in the background](#receiving-in-the-background)). |
+| The QR scanner says the camera is blocked | Camera permission was denied. Grant it in Settings → Apps → e2e-messenger → Permissions. |
