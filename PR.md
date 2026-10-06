@@ -25,12 +25,15 @@ Closes issue: #36
 **Relay and client: messages survive a recipient that's offline or asleep**
 
 7. **Delivery receipts at the relay.**
-   - **Before:** the relay sent each queued packet once to the recipient's last known address, then deleted it, so anything sent to a phone that had gone to sleep was lost. The queue was also capped at 50 packets, dropping the oldest first. Every contact sends a presence ping every 20 seconds, so after about 17 minutes offline those pings had pushed out the real messages.
-   - **Now:** each forwarded packet carries a delivery ID in the envelope's 16-byte prefix. The recipient confirms it with a new `TYPE_ACK` (3) packet. Until then the relay resends with backoff (2s, 4s, 8s… up to 60s), and immediately when the recipient syncs from a new address or after more than 30 seconds of silence.
-   - Packets are kept for up to 7 days, with at most 512 per recipient.
+   - **Before:** the relay sent each queued packet once to the recipient's last known address, then deleted it. Anything sent to a phone that had gone to sleep, or whose app had just been killed, was lost. Presence pings, which every contact sends every 20 seconds, were also queued like messages:
+     - Before #32, they pushed real messages out of the old 50-packet queue after about 17 minutes offline.
+     - Under #32's 2 MiB cap, which refuses new packets once full, they would eventually lock real messages out instead.
+   - **Now:** each forwarded packet carries a delivery ID in the envelope's 16-byte prefix. The recipient confirms it with a new `TYPE_ACK` (3) packet. Until then the relay resends it with backoff (2s, 4s, 8s… up to 60s), and immediately when the recipient syncs from a new address or after more than 30 seconds of silence. Resends go through #32's 5 ms per-recipient pacing like everything else.
+   - Packets are kept for up to 7 days, within #32's 2 MiB cap per recipient.
    - Presence pings (inner type `0x06`) are sent once, and only to recipients that are online.
    - An ack only counts if it comes from the recipient's current link session.
-8. **Client side.** A new `Client::handle_relay_packet` opens a packet, handles it, then sends the ack. The ack goes after the packet is handled, so a crash in between causes a resend rather than a lost message. Recent delivery IDs are remembered so a resend is acked again but never handled twice, since a resent KeyExchange would restart the session. The CLI and the Tauri app both use it.
+   - **Links stay alive while in use.** Every authentic packet refreshes its link's expiry, which is now 7 days after last use. Before, it was 1 hour after the handshake (finding R-3 in `implementation-review.md`), so a long-running app went deaf after an hour. Now a phone that slept overnight wakes up to a working link.
+8. **Client side.** A new `Client::handle_relay_packet` opens a packet, handles it, then sends the ack. The ack goes after the packet is handled, so a crash in between causes a resend rather than a lost message. Recent delivery IDs are remembered so a resend is acked again but never handled twice, since a resent KeyExchange would restart the session. The CLI, the Tauri app and #32's `lossy_link` example all use it.
 
 **Frontend layout**
 
@@ -44,18 +47,22 @@ Closes issue: #36
 
 **Docs and tooling**
 
-10. **Docs.** ANDROID.md (including the "Receiving in the background" section), a link from the README, and `doable-cryptographic-flow.md` updated for delivery receipts.
+10. **Docs.** ANDROID.md (including the "Receiving in the background" section), a link from the README, and updates for delivery receipts in `doable-cryptographic-flow.md`, `raptorq-fec-transport.md` and the relay's README.
 11. **`runpeer.sh`.** It now strips the environment that VS Code's snap leaks into its terminal. That environment crashed the WebKitGTK window and moved identity storage under `~/snap`.
 
-### ⚠️ Before merging: conflicts with main (#32, RaptorQ FEC)
-#32 was merged into main after this branch was made, and a test merge conflicts in 5 files:
-- `code/server/src/main.rs`
-- `code/server/src/stores.rs`
-- `code/client/src/lib.rs`
-- `code/client/src/storage.rs`
-- `code/frontend/src-tauri/src/commands.rs`
+### Merged with main (#32, RaptorQ FEC)
+`main` is merged into this branch, so this builds on #32. The relay keeps #32's design:
+- forwarding on arrival
+- 5 ms pacing per recipient
+- a 2 MiB queue cap that refuses new packets once full
 
-This isn't a mechanical merge. #32's relay forwards on arrival, paces each recipient at 5 ms per packet, and caps queues by size, refusing new packets rather than dropping old ones. The delivery IDs, acks and resends from item 7 need to be rebuilt on top of its `take_due`/`DuePacket` queue, and `handle_relay_packet` on top of its FEC receive path.
+The one change is that packets stay in that queue until they're acked. `take_due` now releases the oldest packet that's due (new, or its resend time reached) without removing it.
+
+#32's tests are adapted to match. A backlog still goes out whole, in order and one packet per pacing slot, and the packets then stay queued until acked.
+
+FEC and acks work at different layers:
+- **FEC** rebuilds a message from whichever symbols arrive.
+- **Acks** make the relay keep trying until the recipient actually has the packets, which FEC can't do for a phone that's asleep or offline.
 
 ### ⚠️ Wire format and deployment
 - **New relay packet type:** acks (type 3). The 16-byte prefix on forwarded packets now holds the delivery ID instead of zeros.
@@ -63,9 +70,15 @@ This isn't a mechanical merge. #32's relay forwards on arrival, paces each recip
 - **Android build:** needs `RANLIB_aarch64_linux_android` set, or OpenSSL's build fails (ANDROID.md, step 4).
 
 ### Testing
-- **Unit tests:** relay 13 (6 new: resend backoff, acks only from the recipient's session, resend after silence or an address change, presence pings not queued, backoff cap), client 95 (3 new: ack and resend handling, no ack for relay dummy packets, delivery-ID memory), Tauri backend 14. Clippy is clean on all three.
+- **Unit tests:** all passing, and clippy is clean on all three.
+  - **Relay: 17.** 7 are new: resend backoff, acks only from the recipient's session, resend after silence or an address change, presence pings sent once and never queued for an offline recipient, link kept alive by use, and the backoff cap. #32's pacing and forwarding tests are adapted to ack-based retention.
+  - **Client: 117.** 3 are new: ack and resend handling, no ack for relay dummy packets, and delivery-ID memory.
+  - **Tauri backend: 14.**
+- **End to end, through the merged relay over real UDP:**
+  - **`lossy_link` at 70% loss** on the jammed side: 20/20 messages delivered each way, with both ratchets in step.
+  - **Recipient restarted:** Bob's CLI is killed while the relay still has his address. Alice messages him, Bob restarts from his saved state, and the message arrives. Against `main`'s relay, the same test loses it.
 - **APK:** the debug build for arm64 builds without warnings.
-- **On a Galaxy S23+** (debug build, relay on a PC on the same Wi-Fi):
+- **On a Galaxy S23+** (debug build, relay on a PC on the same Wi-Fi, before merging `main`):
   - Added a contact by QR code and received messages.
   - Confirmed the foreground service is running (`dumpsys`).
   - Swiped the app away and reopened it twice. Each time the window was rebuilt, in the same process, with the session intact (logcat).
@@ -84,5 +97,7 @@ This isn't a mechanical merge. #32's relay forwards on arrival, paces each recip
   - Should the token and key show by default on wide windows?
   - Should the "ESTABLISHED" pill be dropped? The online dot already marks established contacts, and the pill is what cuts off long names in the sidebar.
 - Set up signing for release builds.
+- **Ack overhead under heavy loss.** At 70% loss, acks get lost too, so the relay resends symbols FEC had already made unnecessary. In the `lossy_link` run, Bob sent 764 packets to Alice and 1944 reached her jammed link. Acking once per decoded message, covering all its symbols, would cut this.
+- **No handshake after a relay restart.** Clients never redo the handshake, so after a relay restart (or a link left unused for 7 days) you still need to log out and back in. This is what remains of R-3.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
