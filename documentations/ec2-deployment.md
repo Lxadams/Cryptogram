@@ -19,11 +19,10 @@ sudo usermod -aG docker ubuntu   # so you don't need sudo for docker commands
 Log out/in for the group change to apply — or just use `sudo docker` for
 any manual checks in the meantime.
 
-**Security group must allow inbound UDP 443 and TCP 443.** EC2's default
-security group only opens SSH (22). Add explicit inbound rules for UDP port
-443 (the relay) and TCP port 443 (the plain-HTTP `GET /pubkey` endpoint the
-desktop app fetches the relay's key from), source `0.0.0.0/0` — this is a
-public relay by design. SSH (22) also needs
+**Security group must allow inbound UDP 443.** EC2's default security
+group only opens SSH (22). Add an explicit inbound rule for UDP port 443
+(the relay), source `0.0.0.0/0` — this is a public relay by design. The
+relay serves nothing over TCP. SSH (22) also needs
 to stay open to `0.0.0.0/0`, since GitHub Actions runners have no fixed IP
 you can allowlist.
 
@@ -47,12 +46,12 @@ fine here — you're not compiling Rust on it.
 
 ## After the first successful deploy
 
-The desktop app fetches the server's pubkey itself (`GET /pubkey` over
-TCP 443) and pins it on first connect. To check it by hand, or for the CLI
-client, which still takes it as an argument:
+Clients ship with the server's pubkey rather than asking the server for
+it: build the app with it in `SERVER_PUBKEY` (e.g.
+`SERVER_PUBKEY=<hex> ./runpeer-lan.sh --mobile <EC2_HOST>:443`), and pass
+it to the CLI client as its argument. Read it from the boot log:
 
 ```
-curl http://<EC2_HOST>:443/pubkey
 ssh ubuntu@<EC2_HOST> "docker logs server 2>&1 | grep 'Static Pubkey'"
 ```
 

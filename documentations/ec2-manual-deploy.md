@@ -61,7 +61,6 @@ docker run -d \
   --name server \
   --restart unless-stopped \
   -p 443:443/udp \
-  -p 443:443/tcp \
   -v server_identity:/data \
   -e RUST_LOG=info \
   server:latest
@@ -80,12 +79,11 @@ Still on the instance (or from WSL via `ssh ... "..."`):
 docker logs server --tail 20
 ```
 
-You should see the same four lines the container prints on a fresh boot:
+You should see the same three lines the container prints on a fresh boot:
 ```
 No existing server identity found. Generating new Ed25519 keypair...
 UDP server listening on 0.0.0.0:443
 Server Static Pubkey: <hex>
-HTTP pubkey endpoint listening on http://0.0.0.0:443/pubkey
 ```
 
 On a *re*-deploy against an existing `server_identity` volume, the first
@@ -103,7 +101,7 @@ ssh -i /path/to/your-key.pem ubuntu@<EC2_HOST> '
   docker load -i server.tar &&
   docker stop server || true &&
   docker rm server || true
-  docker run -d --name server --restart unless-stopped -p 443:443/udp -p 443:443/tcp \
+  docker run -d --name server --restart unless-stopped -p 443:443/udp \
     -v server_identity:/data -e RUST_LOG=info server:latest &&
   rm server.tar && docker image prune -f
 '

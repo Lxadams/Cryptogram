@@ -28,9 +28,6 @@ const MAX_RESEND_DELAY: Duration = Duration::from_secs(60);
 /// is resent straight away instead of waiting out its backoff.
 const SILENCE_BEFORE_RESEND: Duration = Duration::from_secs(30);
 
-/// How long a fire-and-forget packet waits for its recipient's pacing slot.
-const EPHEMERAL_TTL: Duration = Duration::from_secs(30);
-
 /// How long a link key lives after its last use (see `touch_link`). Clients
 /// don't redo the handshake, so this must outlast a phone asleep overnight,
 /// or it wakes to a link the relay has forgotten; it matches how long
@@ -50,8 +47,6 @@ pub struct OutboundMessage {
     pub id: DeliveryId,
     pub payload: Vec<u8>,
     pub expiry: Instant,
-    /// Sent once, never resent or acknowledged (presence pings).
-    ephemeral: bool,
     /// When it's next due to be sent: straight away when queued, then
     /// after each send, the resend backoff.
     next_attempt: Instant,
@@ -155,25 +150,6 @@ impl Tables {
         payload: Vec<u8>,
         ttl: Duration,
     ) -> Option<DeliveryId> {
-        self.push(receiver_token, payload, ttl, false)
-    }
-
-    /// Queue a packet for a single send, only if the recipient is reachable
-    /// right now. For traffic that's useless late, like presence pings, and
-    /// that would otherwise fill an offline recipient's queue.
-    pub fn enqueue_ephemeral(&mut self, receiver_token: RoutingToken, payload: Vec<u8>) {
-        if self.metadata.contains_key(&receiver_token) {
-            self.push(receiver_token, payload, EPHEMERAL_TTL, true);
-        }
-    }
-
-    fn push(
-        &mut self,
-        receiver_token: RoutingToken,
-        payload: Vec<u8>,
-        ttl: Duration,
-        ephemeral: bool,
-    ) -> Option<DeliveryId> {
         let queue = self.message_queues.entry(receiver_token).or_default();
         if queue.bytes + payload.len() > MAX_QUEUED_BYTES_PER_TOKEN {
             return None;
@@ -186,7 +162,6 @@ impl Tables {
             id,
             payload,
             expiry: now + ttl,
-            ephemeral,
             next_attempt: now,
             attempts: 0,
         });
@@ -260,9 +235,8 @@ impl Tables {
     /// blasted at line rate, while a live burst passes straight through.
     /// The packet released is the oldest one due (new, or its resend
     /// backoff passed), so a backlog goes out in order. It stays queued
-    /// until acknowledged, with its next resend pushed back; only an
-    /// ephemeral packet is dropped once sent. Also returns when this next
-    /// needs calling, if anything is still waiting for an online recipient.
+    /// until acknowledged, with its next resend pushed back. Also returns
+    /// when this next needs calling, if anything is still waiting for an online recipient.
     pub fn take_due(
         &mut self,
         now: Instant,
@@ -284,14 +258,8 @@ impl Tables {
                     id: packet.id,
                     payload: packet.payload.clone(),
                 });
-                if packet.ephemeral {
-                    let len = packet.payload.len();
-                    queue.packets.remove(i);
-                    queue.bytes -= len;
-                } else {
-                    packet.attempts += 1;
-                    packet.next_attempt = now + resend_delay(packet.attempts);
-                }
+                packet.attempts += 1;
+                packet.next_attempt = now + resend_delay(packet.attempts);
                 queue.next_send = Some(now + spacing);
             }
             // This recipient's next send: its earliest packet due, but not
@@ -399,21 +367,6 @@ mod tests {
         tables.update_metadata(TOKEN, addr(50001), SESSION, Duration::from_secs(60));
         let now = Instant::now() + SPACING * 3;
         assert_eq!(tables.take_due(now, SPACING).0.len(), 1);
-    }
-
-    #[test]
-    fn ephemeral_is_dropped_when_offline_and_sent_once_when_online() {
-        let mut tables = Tables::new();
-        tables.enqueue_ephemeral(TOKEN, b"ping".to_vec());
-        assert!(tables.get_queued_packets(&TOKEN).is_none());
-
-        let mut tables = online_tables();
-        tables.enqueue_ephemeral(TOKEN, b"ping".to_vec());
-        let now = Instant::now();
-        let (due, next_due) = tables.take_due(now, SPACING);
-        assert_eq!(due.len(), 1);
-        assert_eq!(next_due, None, "nothing left to resend");
-        assert!(tables.get_queued_packets(&TOKEN).is_none());
     }
 
     #[test]

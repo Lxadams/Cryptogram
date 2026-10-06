@@ -41,11 +41,14 @@ cargo build
 
 ip="$(lan_ip)"
 if $reachable && [ -n "$ip" ]; then
+  # Clients are built with the relay's key rather than asking for it; from
+  # this machine runpeer-lan.sh reads it itself.
+  pubkey="$(./target/debug/server --print-pubkey)"
   echo
   echo "Relay reachable on your network at $ip:$PORT"
   echo "  Desktop peer:  ./runpeer-lan.sh --pc $ip"
   echo "  Android app:   ./runpeer-lan.sh --mobile $ip"
-  echo "Each client also needs the Server Static Pubkey printed below."
+  echo "From another machine, put SERVER_PUBKEY=$pubkey in front."
   echo
 fi
 

@@ -1,23 +1,20 @@
 use anyhow::{Result, anyhow};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{
-    net::{TcpListener, UdpSocket},
-    sync::Notify,
-};
+use tokio::{net::UdpSocket, sync::Notify};
 use tracing::{debug, error, info, warn};
 use x25519_dalek::PublicKey as X25519PublicKey;
 mod stores;
 
-use crate::stores::{DeliveryId, SessionId, Tables};
+use crate::stores::{DeliveryId, RoutingToken, SessionId, Tables};
 
 const METADATA_TTL: Duration = Duration::from_secs(1000);
 // How long a packet waits for an offline recipient to come back and
@@ -35,6 +32,11 @@ const SWEEPING_TASK_INTERVAL: Duration = Duration::from_secs(120);
 // Domain-separation salt for HKDF derivations (must match client)
 const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
 
+// Domain separators for proving routing-token ownership (must match client;
+// see `routing_token_for` and `sync_signing_input`).
+const ROUTING_TOKEN_LABEL: &[u8] = b"e2e-messenger/routing-token/v1";
+const SYNC_SIGNATURE_LABEL: &[u8] = b"e2e-messenger/sync/v1";
+
 // Request Types
 const TYPE_HANDSHAKE_INIT: u8 = 0;
 const TYPE_DATA: u8 = 1;
@@ -43,6 +45,13 @@ const TYPE_HANDSHAKE_RESP: u8 = 2;
 // queue. Format: [1 byte type] [4 byte SessionId] [24 byte Nonce]
 // [link-encrypted: 16 byte own routing token | 16 byte delivery ID ...]
 const TYPE_ACK: u8 = 3;
+// A client telling the relay its routing token lives at this address, and
+// proving it owns that token. Format: [1 byte type] [4 byte SessionId]
+// [24 byte Nonce] [link-encrypted: 16 byte routing token | 32 byte token
+// public key | 64 byte signature]. The token must be `routing_token_for`
+// the key, and the signature must cover `sync_signing_input` for this link,
+// so nobody else can redirect (or ack away) someone's queued packets.
+const TYPE_SYNC: u8 = 4;
 
 // Relay cover traffic ("dummy packets") is shaped like a forwarded chat
 // packet so the two are the same size on the wire. Clients send chat as FEC
@@ -56,43 +65,49 @@ const CHAT_INNER_PAYLOAD_LEN: usize = 1 + 16 + 24 + 12 + 1024 + 16;
 // Inner type byte of a dummy packet, which the client ignores (the `0x00`
 // arm in `Client::handle_incoming_packet`).
 const INNER_TYPE_DUMMY: u8 = 0x00;
-// Inner type byte of a presence ping (`0x06` in the client). Useless once
-// stale, so it's never held for an offline recipient (see
-// `Tables::enqueue_ephemeral`).
-const INNER_TYPE_PRESENCE: u8 = 0x06;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ServerIdentityDto {
     ed25519_secret: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt().with_env_filter("info").init();
-
-    // Generate server static identity
-
-    let identity_path = "server_identity.json";
-    let server_identity = if let Ok(json) = fs::read_to_string(identity_path) {
+/// Load the relay's static Ed25519 identity from `path`, or generate one
+/// and save it there if there isn't one yet.
+fn load_or_create_identity(path: &str) -> Result<SigningKey> {
+    if let Ok(json) = fs::read_to_string(path) {
         let dto: ServerIdentityDto = serde_json::from_str(&json)?;
         let mut sec_bytes = [0u8; 32];
         hex::decode_to_slice(&dto.ed25519_secret, &mut sec_bytes)?;
-        SigningKey::from_bytes(&sec_bytes)
-    } else {
-        info!("No existing server identity found. Generating new Ed25519 keypair...");
-        let mut identity_bytes = [0u8; 32];
-        let mut rng = rand_core::OsRng;
-        rand_core::RngCore::fill_bytes(&mut rng, &mut identity_bytes);
-        let key = SigningKey::from_bytes(&identity_bytes);
-        let dto = ServerIdentityDto {
-            ed25519_secret: hex::encode(identity_bytes),
-        };
-        fs::write(identity_path, serde_json::to_string_pretty(&dto)?)?;
-        key
+        return Ok(SigningKey::from_bytes(&sec_bytes));
+    }
+    info!("No existing server identity found. Generating new Ed25519 keypair...");
+    let mut identity_bytes = [0u8; 32];
+    let mut rng = rand_core::OsRng;
+    rand_core::RngCore::fill_bytes(&mut rng, &mut identity_bytes);
+    let dto = ServerIdentityDto {
+        ed25519_secret: hex::encode(identity_bytes),
     };
+    fs::write(path, serde_json::to_string_pretty(&dto)?)?;
+    Ok(SigningKey::from_bytes(&identity_bytes))
+}
 
-    let server_pub = server_identity.verifying_key();
+#[tokio::main]
+async fn main() -> Result<()> {
+    // `--print-pubkey` prints the identity pubkey (hex) and exits, so build
+    // scripts can bake it into clients: they ship with it instead of asking
+    // the relay (see `relay_pubkey` in code/frontend/src-tauri/src/commands.rs).
+    // No logging then, so stdout is just the key.
+    let print_pubkey = std::env::args().nth(1).as_deref() == Some("--print-pubkey");
+    if !print_pubkey {
+        tracing_subscriber::fmt().with_env_filter("info").init();
+    }
+
+    let server_identity = load_or_create_identity("server_identity.json")?;
+    let server_pub_hex = hex::encode(server_identity.verifying_key().as_bytes());
+    if print_pubkey {
+        println!("{server_pub_hex}");
+        return Ok(());
+    }
 
     let mut buffer = [0u8; 2048];
 
@@ -101,16 +116,7 @@ async fn main() -> Result<()> {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4430".to_string());
     let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
     info!("UDP server listening on {}", socket.local_addr()?);
-    let server_pub_hex = hex::encode(server_pub.as_bytes());
     info!("Server Static Pubkey: {}", server_pub_hex);
-
-    // TCP and UDP have separate port spaces, so the pubkey endpoint can
-    // share the relay's address and clients only need to know one.
-    let http_listener = TcpListener::bind(&bind_addr).await?;
-    info!(
-        "HTTP pubkey endpoint listening on http://{}/pubkey",
-        http_listener.local_addr()?
-    );
 
     let tables = Arc::new(Mutex::new(Tables::new()));
     // Wakes the outbound task the moment something may be ready to forward
@@ -123,14 +129,14 @@ async fn main() -> Result<()> {
         Arc::clone(&outbound_wake),
     );
     spawn_sweeping_task(Arc::clone(&tables));
-    spawn_pubkey_http_task(http_listener, server_pub_hex);
 
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
                 // Per-packet logging is debug-only: a message is tens to
                 // hundreds of packets, and this loop must keep draining.
-                debug!("Received {} bytes from {}", len, addr);
+                // Logs never name a client's address or routing token.
+                debug!("Received {} bytes", len);
                 if let Err(e) =
                     match handle_request(&tables, &server_identity, addr, &buffer[..len]) {
                         Ok(Some(resp)) => {
@@ -146,7 +152,7 @@ async fn main() -> Result<()> {
                         Err(e) => Err(e),
                     }
                 {
-                    error!("Request handling error from {}: {}", addr, e);
+                    error!("Request handling error: {}", e);
                 }
             }
             Err(e) => {
@@ -220,38 +226,45 @@ fn handle_request(
             return Ok(Some(resp));
         }
         TYPE_DATA => {
-            // Data format: [1 byte type] [4 byte SessionId] [24 byte Nonce] [Ciphertext...]
-            let (session_id, plaintext) = open_link_payload(tables, payload)?;
-
-            if plaintext.len() < 16 {
+            // Data format: [1 byte type] [4 byte SessionId] [24 byte Nonce]
+            // [link-encrypted: 16 byte recipient's routing token | inner payload]
+            let (_, _, plaintext) = open_link_payload(tables, payload)?;
+            let Some((routing_token, inner_payload)) = plaintext.split_first_chunk::<16>() else {
                 return Err(anyhow!("Decrypted payload too small for routing token"));
-            }
-
-            let mut routing_token = [0u8; 16];
-            routing_token.copy_from_slice(&plaintext[0..16]);
-
-            let inner_payload = &plaintext[16..];
-
+            };
             if inner_payload.is_empty() {
-                debug!("Sync Request mapped to token {:?}", routing_token);
-                let mut tables = tables.lock().unwrap();
-                tables.update_metadata(routing_token, socket_address, session_id, METADATA_TTL);
-            } else if inner_payload[0] == INNER_TYPE_PRESENCE {
-                let mut tables = tables.lock().unwrap();
-                tables.enqueue_ephemeral(routing_token, inner_payload.to_vec());
-            } else {
-                debug!("Forward Request for token {:?}", routing_token);
-                let mut tables = tables.lock().unwrap();
-                if tables
-                    .enqueue_message(routing_token, inner_payload.to_vec(), MESSAGE_TTL)
-                    .is_none()
-                {
-                    warn!("Queue full for token {:?}; dropped packet", routing_token);
-                }
+                return Err(anyhow!("Data packet with nothing to forward"));
+            }
+            debug!("Forward request");
+            let mut tables = tables.lock().unwrap();
+            if tables
+                .enqueue_message(*routing_token, inner_payload.to_vec(), MESSAGE_TTL)
+                .is_none()
+            {
+                warn!("A recipient's queue is full; dropped a packet");
             }
         }
+        TYPE_SYNC => {
+            let (session_id, link_key, plaintext) = open_link_payload(tables, payload)?;
+            if plaintext.len() != 16 + 32 + 64 {
+                return Err(anyhow!("Malformed sync"));
+            }
+            let routing_token: RoutingToken = plaintext[..16].try_into().unwrap();
+            let token_key = VerifyingKey::from_bytes(plaintext[16..48].try_into().unwrap())
+                .map_err(|_| anyhow!("Invalid token key in sync"))?;
+            if routing_token_for(&token_key) != routing_token {
+                return Err(anyhow!("Sync for a routing token its key doesn't own"));
+            }
+            let signature = Signature::from_bytes(plaintext[48..].try_into().unwrap());
+            token_key
+                .verify_strict(&sync_signing_input(&link_key), &signature)
+                .map_err(|_| anyhow!("Invalid sync signature"))?;
+            debug!("Sync request");
+            let mut tables = tables.lock().unwrap();
+            tables.update_metadata(routing_token, socket_address, session_id, METADATA_TTL);
+        }
         TYPE_ACK => {
-            let (session_id, plaintext) = open_link_payload(tables, payload)?;
+            let (session_id, _, plaintext) = open_link_payload(tables, payload)?;
             // Our own routing token, then whole 16-byte delivery IDs.
             let Some((routing_token, ids)) = plaintext.split_first_chunk::<16>() else {
                 return Err(anyhow!("Malformed ack"));
@@ -264,19 +277,44 @@ fn handle_request(
                 .lock()
                 .unwrap()
                 .acknowledge(routing_token, &session_id, ids);
-            debug!("Ack for token {:?}: {} delivered", routing_token, removed);
+            debug!("Ack: {} delivered", removed);
         }
         _ => return Err(anyhow!("Unknown packet type")),
     }
     Ok(None)
 }
 
-/// Decrypt a link-encrypted packet (`TYPE_DATA` or `TYPE_ACK`):
-/// [1 byte type] [4 byte SessionId] [24 byte Nonce] [Ciphertext...].
-/// Returns its session ID and plaintext.
-fn open_link_payload(tables: &Arc<Mutex<Tables>>, payload: &[u8]) -> Result<(SessionId, Vec<u8>)> {
+/// The routing token owned by `token_key`: a truncated hash of it, so a
+/// sync can prove ownership by signing with the matching secret key. Must
+/// match `routing_token_for` in the client.
+fn routing_token_for(token_key: &VerifyingKey) -> RoutingToken {
+    let digest = Sha256::new()
+        .chain_update(ROUTING_TOKEN_LABEL)
+        .chain_update(token_key.as_bytes())
+        .finalize();
+    digest[..16].try_into().unwrap()
+}
+
+/// What a sync's signature covers: a value derived from the link key, which
+/// only this link's two ends know, so a signed sync proves nothing on any
+/// other link. Must match `sync_signing_input` in the client.
+fn sync_signing_input(link_key: &[u8; 32]) -> Vec<u8> {
+    let mut binding = [0u8; 32];
+    Hkdf::<Sha256>::new(Some(HKDF_SALT), link_key)
+        .expand(b"sync-binding", &mut binding)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    [SYNC_SIGNATURE_LABEL, &binding].concat()
+}
+
+/// Decrypt a link-encrypted packet (`TYPE_DATA`, `TYPE_SYNC` or
+/// `TYPE_ACK`): [1 byte type] [4 byte SessionId] [24 byte Nonce]
+/// [Ciphertext...]. Returns its session ID, link key and plaintext.
+fn open_link_payload(
+    tables: &Arc<Mutex<Tables>>,
+    payload: &[u8],
+) -> Result<(SessionId, [u8; 32], Vec<u8>)> {
     if payload.len() < 1 + 4 + 24 + 16 {
-        // 16 bytes for auth tag. If length is exactly 45, decrypted is 0 bytes (sync)
+        // 16 bytes for the auth tag
         return Err(anyhow!("Data packet too small"));
     }
     let mut session_id = [0u8; 4];
@@ -299,7 +337,7 @@ fn open_link_payload(tables: &Arc<Mutex<Tables>>, payload: &[u8]) -> Result<(Ses
         .map_err(|_| anyhow!("Invalid link encryption MAC"))?;
     // Authentic traffic on this link, so keep it.
     tables.lock().unwrap().touch_link(&session_id);
-    Ok((session_id, plaintext))
+    Ok((session_id, link_key, plaintext))
 }
 
 fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>, wake: Arc<Notify>) {
@@ -315,23 +353,6 @@ fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>, wake:
                 },
                 None => wake.notified().await,
             }
-        }
-    });
-}
-
-/// Serve the relay's Ed25519 identity pubkey (hex) at `GET /pubkey`, so
-/// clients can fetch it instead of copying it out of the boot log. This is
-/// plain HTTP, so the response is not authenticated: clients pin the key on
-/// first fetch and refuse a different one later (see `check_relay_pin` in
-/// code/frontend/src-tauri/src/commands.rs).
-fn spawn_pubkey_http_task(listener: TcpListener, server_pub_hex: String) {
-    let app = axum::Router::new().route(
-        "/pubkey",
-        axum::routing::get(move || std::future::ready(server_pub_hex.clone())),
-    );
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            error!("HTTP pubkey endpoint stopped: {}", e);
         }
     });
 }
@@ -411,13 +432,8 @@ async fn send_due_packets(tables: &Mutex<Tables>, socket: &UdpSocket) -> Option<
         // Stays queued until acknowledged, so a failed send is resent like
         // a lost one.
         match socket.send_to(&packet, due.addr).await {
-            Ok(_) => debug!("Sent {} bytes (re-encrypted) to {}", packet.len(), due.addr),
-            Err(e) => error!(
-                "Failed to forward {} bytes to {}: {}",
-                packet.len(),
-                due.addr,
-                e
-            ),
+            Ok(_) => debug!("Sent {} bytes (re-encrypted)", packet.len()),
+            Err(e) => error!("Failed to forward {} bytes: {}", packet.len(), e),
         }
     }
     next_due
@@ -455,19 +471,80 @@ mod tests {
         let mut plaintext = Vec::new();
         plaintext.extend_from_slice(&routing_token);
         plaintext.extend_from_slice(payload);
+        create_link_packet(TYPE_DATA, link_key, session_id, &plaintext)
+    }
 
+    fn create_link_packet(
+        packet_type: u8,
+        link_key: [u8; 32],
+        session_id: [u8; 4],
+        plaintext: &[u8],
+    ) -> Vec<u8> {
         let mut nonce_bytes = [0u8; 24];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
-        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
+        let ciphertext = cipher.encrypt(nonce, plaintext).unwrap();
 
-        let mut packet = vec![TYPE_DATA];
+        let mut packet = vec![packet_type];
         packet.extend_from_slice(&session_id);
         packet.extend_from_slice(&nonce_bytes);
         packet.extend_from_slice(&ciphertext);
         packet
+    }
+
+    fn random_signing_key() -> SigningKey {
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        SigningKey::from_bytes(&bytes)
+    }
+
+    /// A sync for `token`, proved by `signer` over the link with key
+    /// `signed_for`, sent over the link with key `link_key` — the same link,
+    /// for an honest client.
+    fn create_sync_packet_as(
+        link_key: [u8; 32],
+        session_id: [u8; 4],
+        token: RoutingToken,
+        signer: &SigningKey,
+        signed_for: [u8; 32],
+    ) -> Vec<u8> {
+        let mut plaintext = token.to_vec();
+        plaintext.extend_from_slice(signer.verifying_key().as_bytes());
+        plaintext.extend_from_slice(&signer.sign(&sync_signing_input(&signed_for)).to_bytes());
+        create_link_packet(TYPE_SYNC, link_key, session_id, &plaintext)
+    }
+
+    /// The sync an honest client sends: for the token its key owns.
+    fn create_sync_packet(
+        link_key: [u8; 32],
+        session_id: [u8; 4],
+        token_key: &SigningKey,
+    ) -> Vec<u8> {
+        let token = routing_token_for(&token_key.verifying_key());
+        create_sync_packet_as(link_key, session_id, token, token_key, link_key)
+    }
+
+    /// Handshake a new client link from `addr`, returning its link key.
+    fn link_up(
+        tables: &Arc<Mutex<Tables>>,
+        server_identity: &SigningKey,
+        addr: SocketAddr,
+        session_id: [u8; 4],
+    ) -> [u8; 32] {
+        let client_secret = EphemeralSecret::random_from_rng(OsRng);
+        let hs_pkt = create_handshake_packet(&client_secret, session_id);
+        let resp = handle_request(tables, server_identity, addr, &hs_pkt)
+            .unwrap()
+            .unwrap();
+        let server_eph_pub = X25519PublicKey::from(<[u8; 32]>::try_from(&resp[5..37]).unwrap());
+        let shared_secret = client_secret.diffie_hellman(&server_eph_pub);
+        let mut link_key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
+            .expand(b"wireguard-lite-link", &mut link_key)
+            .unwrap();
+        link_key
     }
 
     #[test]
@@ -479,7 +556,8 @@ mod tests {
         let server_identity = SigningKey::from_bytes(&identity_bytes);
         let client_secret = EphemeralSecret::random_from_rng(OsRng);
         let session_id = [0xAA; 4];
-        let routing_token = [0xBB; 16];
+        let token_key = random_signing_key();
+        let routing_token = routing_token_for(&token_key.verifying_key());
         let socket_address = SocketAddr::from(([127, 0, 0, 1], 50000));
 
         // 1. Handshake
@@ -499,8 +577,8 @@ mod tests {
             .expand(b"wireguard-lite-link", &mut link_key)
             .unwrap();
 
-        // 2. Sync Request (empty payload)
-        let sync_pkt = create_data_packet(link_key, session_id, routing_token, b"");
+        // 2. Sync Request, signed with the token's key
+        let sync_pkt = create_sync_packet(link_key, session_id, &token_key);
         handle_request(&tables, &server_identity, socket_address, &sync_pkt).unwrap();
 
         {
@@ -605,7 +683,8 @@ mod tests {
         let receiver_secret = EphemeralSecret::random_from_rng(OsRng);
         let sender_session = [0xAA; 4];
         let receiver_session = [0xBB; 4];
-        let receiver_token = [0xCC; 16];
+        let receiver_token_key = random_signing_key();
+        let receiver_token = routing_token_for(&receiver_token_key.verifying_key());
 
         // 1. Sender does handshake
         let hs_pkt = create_handshake_packet(&sender_secret, sender_session);
@@ -662,7 +741,7 @@ mod tests {
             .unwrap();
 
         // 4. Receiver sends sync packet
-        let sync_pkt = create_data_packet(receiver_link_key, receiver_session, receiver_token, b"");
+        let sync_pkt = create_sync_packet(receiver_link_key, receiver_session, &receiver_token_key);
         handle_request(&tables, &server_identity, receiver_addr, &sync_pkt).unwrap();
 
         // 5. Check that the queued packet was flushed to the outbound queue
@@ -709,44 +788,81 @@ mod tests {
         );
     }
 
+    /// Someone with their own link session can't sync a routing token they
+    /// don't own, so they can't redirect its owner's queued packets to
+    /// themselves (or ack them away).
     #[test]
-    fn test_presence_ping_not_queued_for_offline_recipient() {
+    fn test_sync_for_someone_elses_token_is_rejected() {
         let tables = Arc::new(Mutex::new(Tables::new()));
-        let mut identity_bytes = [0u8; 32];
-        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
-        let server_identity = SigningKey::from_bytes(&identity_bytes);
-        let sender_addr = SocketAddr::from(([127, 0, 0, 1], 50001));
-        let sender_secret = EphemeralSecret::random_from_rng(OsRng);
-        let sender_session = [0xAA; 4];
-        let receiver_token = [0xCC; 16];
+        let server_identity = random_signing_key();
+        let addr = SocketAddr::from(([127, 0, 0, 1], 50001));
+        let session = [0xAA; 4];
+        let link_key = link_up(&tables, &server_identity, addr, session);
+        let victim_key = random_signing_key();
+        let victim_token = routing_token_for(&victim_key.verifying_key());
+        let attacker_key = random_signing_key();
 
-        let hs_pkt = create_handshake_packet(&sender_secret, sender_session);
-        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt)
-            .unwrap()
-            .unwrap();
-        let mut server_eph_pub_bytes = [0u8; 32];
-        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
-        let shared_secret =
-            sender_secret.diffie_hellman(&X25519PublicKey::from(server_eph_pub_bytes));
-        let mut sender_link_key = [0u8; 32];
-        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
-            .expand(b"wireguard-lite-link", &mut sender_link_key)
-            .unwrap();
+        // Their own key, claiming the victim's token.
+        let claim = create_sync_packet_as(link_key, session, victim_token, &attacker_key, link_key);
+        let err = handle_request(&tables, &server_identity, addr, &claim).unwrap_err();
+        assert!(err.to_string().contains("doesn't own"), "{err}");
 
-        let ping = create_data_packet(
-            sender_link_key,
-            sender_session,
-            receiver_token,
-            &[INNER_TYPE_PRESENCE, 1, 2, 3],
-        );
-        handle_request(&tables, &server_identity, sender_addr, &ping).unwrap();
-        assert!(
+        // The victim's public key (it's no secret), but not its signature.
+        let mut forged = victim_token.to_vec();
+        forged.extend_from_slice(victim_key.verifying_key().as_bytes());
+        forged.extend_from_slice(&attacker_key.sign(&sync_signing_input(&link_key)).to_bytes());
+        let forged = create_link_packet(TYPE_SYNC, link_key, session, &forged);
+        let err = handle_request(&tables, &server_identity, addr, &forged).unwrap_err();
+        assert!(err.to_string().contains("signature"), "{err}");
+
+        assert!(tables.lock().unwrap().get_metadata(&victim_token).is_none());
+    }
+
+    /// A sync is signed for one link, so a copy of it can't be replayed on
+    /// another.
+    #[test]
+    fn test_sync_signed_for_another_link_is_rejected() {
+        let tables = Arc::new(Mutex::new(Tables::new()));
+        let server_identity = random_signing_key();
+        let addr = SocketAddr::from(([127, 0, 0, 1], 50001));
+        let first_link = link_up(&tables, &server_identity, addr, [0xAA; 4]);
+        let second_link = link_up(&tables, &server_identity, addr, [0xBB; 4]);
+        let token_key = random_signing_key();
+        let token = routing_token_for(&token_key.verifying_key());
+
+        let replayed = create_sync_packet_as(second_link, [0xBB; 4], token, &token_key, first_link);
+        assert!(handle_request(&tables, &server_identity, addr, &replayed).is_err());
+        assert!(tables.lock().unwrap().get_metadata(&token).is_none());
+
+        let honest = create_sync_packet(second_link, [0xBB; 4], &token_key);
+        handle_request(&tables, &server_identity, addr, &honest).unwrap();
+        assert_eq!(
             tables
                 .lock()
                 .unwrap()
-                .get_queued_packets(&receiver_token)
-                .is_none()
+                .get_metadata(&token)
+                .unwrap()
+                .session_id,
+            [0xBB; 4]
         );
+    }
+
+    /// An empty data packet used to be how a client synced, unsigned. It's
+    /// refused now, rather than queued or treated as a sync.
+    #[test]
+    fn test_empty_data_packet_is_not_a_sync() {
+        let tables = Arc::new(Mutex::new(Tables::new()));
+        let server_identity = random_signing_key();
+        let addr = SocketAddr::from(([127, 0, 0, 1], 50001));
+        let session = [0xAA; 4];
+        let link_key = link_up(&tables, &server_identity, addr, session);
+        let token = [0xCC; 16];
+
+        let old_style_sync = create_data_packet(link_key, session, token, b"");
+        assert!(handle_request(&tables, &server_identity, addr, &old_style_sync).is_err());
+        let tables = tables.lock().unwrap();
+        assert!(tables.get_metadata(&token).is_none());
+        assert!(tables.get_queued_packets(&token).is_none());
     }
 
     #[test]

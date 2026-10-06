@@ -23,6 +23,8 @@ pub fn run() {
             commands::list_contacts,
             commands::connect_to_peer,
             commands::remove_contact,
+            commands::connection_requests,
+            commands::dismiss_connection_request,
             commands::send_message,
             commands::poll_inbox,
             commands::chat_history,

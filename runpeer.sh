@@ -18,6 +18,13 @@
 # hosting the Trunk dev server (a minute or two); every peer after that
 # reuses it and starts almost instantly. Requires the relay server to
 # already be running (./runserver.sh in another terminal).
+#
+# The app checks the relay against the public key it's given in
+# SERVER_PUBKEY, rather than asking the relay for one (see
+# relay_pubkey_hex() in code/frontend/src-tauri/src/commands.rs). For the
+# local relay this script reads it from the relay's identity file; for any
+# other (SERVER_ADDR set), set SERVER_PUBKEY to the "Server Static Pubkey"
+# that relay prints at startup.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,6 +42,15 @@ DEV_PORT=1420
 # the binary with cwd left at `$FRONTEND_DIR` — two different processes,
 # two different `identities/` directories, confirmed by testing two peers.
 cd "$FRONTEND_DIR"
+
+if [ -z "${SERVER_PUBKEY:-}" ]; then
+  if [ -n "${SERVER_ADDR:-}" ]; then
+    echo "error: set SERVER_PUBKEY to the \"Server Static Pubkey\" the relay at $SERVER_ADDR prints." >&2
+    exit 1
+  fi
+  SERVER_PUBKEY="$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-pubkey)"
+  export SERVER_PUBKEY
+fi
 
 # VS Code installed as a snap leaks its sandbox environment into its
 # integrated terminal: GTK_PATH, GIO_MODULE_DIR etc. point at libraries under

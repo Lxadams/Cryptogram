@@ -16,14 +16,16 @@ on_request(request):
         Sign (ClientPub || ServerPub) with server Ed25519 identity.
         Return handshake response.
     Any link-encrypted request ('Sync', 'Forward', 'Ack') refreshes its link's expiry.
-    If a 'Sync' request is received (empty inner payload after link decryption):
+    If a 'Sync' request is received (type 4: routing token + token public key + signature):
+        Reject it unless the token is the hash of the public key and the signature, by
+        that key, covers a value derived from this link's key (so only the token's
+        owner can sync it, and only on its own link).
         Update the 'Metadata' table with (routing_token, incoming IP, incoming port, expiry_timestamp).
         If the address changed, or this token was silent for over 30 s (asleep), make
         everything still queued for it due now, so it's resent straight away.
         Wake the outbound task.
-    If a 'Forward' request is received:
-        A presence ping (inner type 0x06) is queued only if the recipient is online, and sent once.
-        Anything else is added to the message queue with a random 16-byte delivery ID,
+    If a 'Forward' request is received (type 1, with a non-empty inner payload):
+        Add it to the message queue with a random 16-byte delivery ID,
         kept until acknowledged or expired (7 days).
         Queue is bounded to MAX_QUEUED_BYTES_PER_TOKEN (2 MiB) per token; once full, new packets are refused (older ones kept) — clients send each message as a burst of FEC packets.
         Wake the outbound task.
@@ -36,7 +38,6 @@ send_due_packets():
         Take the oldest ONE packet that's due (new, or its resend backoff passed);
         next slot for this token is RELAY_PACKET_SPACING (5 ms) later.
         It stays queued until acked; its next resend is 2 s later, doubling to at most 60 s.
-        (A presence ping is dropped once sent instead.)
         Re-encrypt payload with recipient's link key (XChaCha20-Poly1305).
         Prepend the 16-byte delivery ID, which the client echoes back in its ack.
         Send UDP packet to recipient's IP + port.

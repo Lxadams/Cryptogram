@@ -472,19 +472,12 @@ button.danger {
   min-width: 0;
 }
 
-.presence-dot {
-  flex: none;
-  width: 0.5rem;
-  height: 0.5rem;
-  border-radius: 50%;
-}
-
-.presence-dot.online {
-  background: var(--ok);
-}
-
-.presence-dot.offline {
-  background: var(--error);
+/* "Waiting for them to scan your code", on its own row under a pending
+   contact. */
+.contact-list li .contact-hint {
+  grid-column: 1 / -1;
+  font-size: 0.8rem;
+  color: var(--muted);
 }
 
 .chat-header {
@@ -537,6 +530,10 @@ button.danger {
 
 .chat-panel > .hint {
   margin: 0;
+}
+
+.chat-panel > .chat-pending {
+  margin: 0 0 0.75rem;
 }
 
 .transcript {
@@ -625,6 +622,23 @@ button.danger {
 .modal .error {
   text-align: center;
   margin-bottom: 0;
+}
+
+.modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.modal-actions button {
+  flex: 1 1 8rem;
+}
+
+/* The "Your QR code" dialog is wider than the others: a bigger code reads
+   from further away. */
+.modal:has(.qr-code) {
+  width: min(100%, 520px);
 }
 
 /* Stays black-on-white in both themes (see qr::svg_for) — scanners need

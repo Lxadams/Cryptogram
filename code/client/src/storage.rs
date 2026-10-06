@@ -1,8 +1,9 @@
-use crate::{Client, RecvPqInjects, SymmetricSessionState, UserIdentity};
+use crate::{Client, RecvPqInjects, SymmetricSessionState, UserIdentity, routing_token_for};
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use pqcrypto_kyber::kyber768::{PublicKey, SecretKey};
 use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
+use rand_core::{OsRng, RngCore};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -28,7 +29,13 @@ pub struct ClientStateDto {
 
 #[derive(Serialize, Deserialize)]
 pub struct UserIdentityDto {
+    /// Always derived from `token_secret` on load; kept for readability.
     pub routing_token: String,
+    /// The key the routing token is a hash of (see `routing_token_for`).
+    /// Older state files predate it, and had a random routing token that
+    /// can't be proved to the relay, so they get a new token on load.
+    #[serde(default)]
+    pub token_secret: String,
     pub ed25519_secret: String,
     pub ed25519_public: String,
     pub x25519_secret: String,
@@ -78,6 +85,7 @@ impl ClientStateDto {
     fn from_client(client: &Client) -> Self {
         let identity = UserIdentityDto {
             routing_token: hex::encode(client.identity.routing_token),
+            token_secret: hex::encode(client.identity.token_secret.to_bytes()),
             ed25519_secret: hex::encode(client.identity.ed25519_secret.to_bytes()),
             ed25519_public: hex::encode(client.identity.ed25519_public.as_bytes()),
             x25519_secret: hex::encode(client.identity.x25519_secret.to_bytes()),
@@ -146,8 +154,17 @@ impl ClientStateDto {
     }
 
     fn into_client(self, path: &str) -> Result<Client> {
-        let mut r_token = [0u8; 16];
-        hex::decode_to_slice(&self.identity.routing_token, &mut r_token)?;
+        let mut token_sec = [0u8; 32];
+        if self.identity.token_secret.is_empty() {
+            tracing::warn!(
+                "This identity predates signed routing tokens, so it gets a new routing token. Contacts need to add it again."
+            );
+            OsRng.fill_bytes(&mut token_sec);
+        } else {
+            hex::decode_to_slice(&self.identity.token_secret, &mut token_sec)?;
+        }
+        let token_secret = SigningKey::from_bytes(&token_sec);
+        let token_public = token_secret.verifying_key();
 
         let mut ed_sec = [0u8; 32];
         hex::decode_to_slice(&self.identity.ed25519_secret, &mut ed_sec)?;
@@ -171,7 +188,9 @@ impl ClientStateDto {
             .map_err(|_| anyhow::anyhow!("Kyber sec err"))?;
 
         let identity = UserIdentity {
-            routing_token: r_token,
+            routing_token: routing_token_for(&token_public),
+            token_secret,
+            token_public,
             ed25519_secret,
             ed25519_public,
             x25519_secret,
@@ -293,14 +312,15 @@ impl ClientStateDto {
             state_path: path.to_string(),
             local_name: String::new(), // always re-supplied at launch, not persisted
             contact_names,
-            inbox: Vec::new(),         // transient handoff buffer, not persisted
-            last_seen: HashMap::new(), // live status, not persisted — see Client::last_seen
-            history: None,             // attached separately once a vault key is available
+            inbox: Vec::new(), // transient handoff buffer, not persisted
+            history: None,     // attached separately once a vault key is available
             last_recorded_id: None,
             identity_store: None, // attached separately once a vault key is available
             reassembler: Default::default(), // live state, not persisted — see Client::reassembler
             fec_rx: Default::default(), // in-flight FEC state, not persisted
             recent_deliveries: Default::default(), // live state, not persisted
+            awaiting_session_est: Default::default(), // live state, not persisted
+            connection_requests: Vec::new(), // live state, not persisted
         })
     }
 }
@@ -457,6 +477,30 @@ mod identity_state_store_tests {
         let db = ScratchDb::new("empty");
         let store = IdentityStateStore::open(&db.0, &[3u8; 32]).unwrap();
         assert!(store.load(&db.0.to_string_lossy()).unwrap().is_none());
+    }
+
+    /// A state file from before routing tokens were derived from a key has
+    /// a random token the relay won't accept syncs for, so it loads with a
+    /// new, provable one (and the rest of the identity unchanged).
+    #[test]
+    fn test_identity_without_token_key_gets_a_provable_token() {
+        let original = Client::new(test_addr());
+        let mut dto = ClientStateDto::from_client(&original);
+        dto.identity.token_secret.clear();
+        let loaded = dto.into_client("unused").unwrap();
+
+        assert_ne!(
+            loaded.identity.routing_token,
+            original.identity.routing_token
+        );
+        assert_eq!(
+            loaded.identity.routing_token,
+            routing_token_for(&loaded.identity.token_public)
+        );
+        assert_eq!(
+            loaded.identity.ed25519_public,
+            original.identity.ed25519_public
+        );
     }
 
     #[test]

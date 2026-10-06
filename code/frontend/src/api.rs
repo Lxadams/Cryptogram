@@ -71,7 +71,6 @@ pub struct ContactDto {
     pub token: String,
     pub status: String,
     pub name: Option<String>,
-    pub online: bool,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -191,6 +190,25 @@ struct RemoveContactArgs<'a> {
 /// identity.
 pub async fn remove_contact(token_hex: &str) -> Result<(), String> {
     call("remove_contact", &RemoveContactArgs { token_hex }).await
+}
+
+/// People who tried to connect but aren't contacts yet, newest first
+/// (token hex). Scanning their code is what accepts.
+pub async fn connection_requests() -> Result<Vec<String>, String> {
+    call("connection_requests", &()).await
+}
+
+#[derive(Serialize)]
+struct DismissRequestArgs<'a> {
+    token_hex: &'a str,
+}
+
+pub async fn dismiss_connection_request(token_hex: &str) -> Result<(), String> {
+    call(
+        "dismiss_connection_request",
+        &DismissRequestArgs { token_hex },
+    )
+    .await
 }
 
 #[derive(Serialize)]

@@ -12,7 +12,7 @@ use client::{
 };
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     fs::{self, File, TryLockError},
     io,
     net::SocketAddr,
@@ -142,96 +142,22 @@ fn server_addr_raw() -> String {
         .unwrap_or_else(|| "127.0.0.1:4430".to_string())
 }
 
-/// Ask the relay for its Ed25519 identity pubkey over its `GET /pubkey`
-/// HTTP endpoint, served over TCP on the same `host:port` as its UDP relay
-/// socket (see `spawn_pubkey_http_task` in code/server/src/main.rs).
-///
-/// Plain HTTP, so this answer is only as trustworthy as the network path:
-/// `bootstrap` pins it on first use rather than trusting it every time.
-async fn fetch_relay_pubkey(server_addr_raw: &str) -> Result<String, String> {
-    let url = format!("http://{server_addr_raw}/pubkey");
-    // reqwest's own message only says the request failed; the innermost
-    // source is the useful part (e.g. "Connection refused").
-    let unreachable = |e: reqwest::Error| {
-        let mut cause: &dyn std::error::Error = &e;
-        while let Some(next) = cause.source() {
-            cause = next;
-        }
-        format!("Couldn't fetch the relay's public key from {url} ({cause}). Is the relay running?")
-    };
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?
-        .get(&url)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(unreachable)?
-        .text()
-        .await
-        .map_err(unreachable)
+/// The relay's Ed25519 identity pubkey (hex), which authenticates its side of
+/// the link handshake. It ships with the app rather than being asked of the
+/// relay, which anyone on the network path could answer with their own key.
+/// `SERVER_PUBKEY` set at launch wins; failing that, the value it had at
+/// build time is baked in, as for `server_addr_raw`. The relay prints it at
+/// startup ("Server Static Pubkey"), or with `--print-pubkey`.
+fn relay_pubkey_hex() -> Result<String, String> {
+    std::env::var("SERVER_PUBKEY")
+        .ok()
+        .or_else(|| option_env!("SERVER_PUBKEY").map(str::to_string))
+        .ok_or_else(|| {
+            "This build doesn't know the relay's public key. Set SERVER_PUBKEY to the \
+             \"Server Static Pubkey\" the relay prints, when building or launching the app."
+                .to_string()
+        })
 }
-
-/// Relay pubkeys this app has already trusted once, keyed by the
-/// `SERVER_ADDR` they were reached at: this app's equivalent of SSH's
-/// `known_hosts`. Shared by every identity, like `identities_root`.
-fn known_relays_path(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_local_data_dir()
-        .map(|dir| dir.join("known_relays.json"))
-        .map_err(|e| e.to_string())
-}
-
-fn load_known_relays(path: &Path) -> Result<BTreeMap<String, String>, String> {
-    match fs::read_to_string(path) {
-        Ok(json) => serde_json::from_str(&json).map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Trust-on-first-use check for a relay pubkey from `fetch_relay_pubkey`.
-/// `Ok(true)` if this exact key is already pinned for `server_addr_raw`,
-/// `Ok(false)` if nothing is pinned for it yet (the caller pins it with
-/// `pin_relay_pubkey` once a handshake has verified against it), and `Err`
-/// if a *different* key is pinned: either the relay's identity was reset,
-/// or something between us and the relay handed us its own key.
-fn check_relay_pin(path: &Path, server_addr_raw: &str, pubkey_hex: &str) -> Result<bool, String> {
-    match load_known_relays(path)?.get(server_addr_raw) {
-        None => Ok(false),
-        Some(pinned) if pinned == pubkey_hex => Ok(true),
-        Some(pinned) => Err(format!(
-            "The relay at {server_addr_raw} sent a different public key ({pubkey_hex}) \
-             than the one trusted on first connect ({pinned}). Refusing to connect. \
-             If the relay's identity was deliberately reset, remove its entry from {}.",
-            path.display()
-        )),
-    }
-}
-
-/// Record `pubkey_hex` as the trusted key for `server_addr_raw`. Re-reads
-/// the file first so a pin another peer process wrote meanwhile isn't lost.
-fn pin_relay_pubkey(path: &Path, server_addr_raw: &str, pubkey_hex: &str) -> Result<(), String> {
-    let mut known = load_known_relays(path)?;
-    known.insert(server_addr_raw.to_string(), pubkey_hex.to_string());
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string_pretty(&known).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
-}
-
-/// How often we send a presence ping to each established contact.
-/// Independent of `spawn_keepalive_loop`'s 15s NAT-mapping keepalive —
-/// that one's timing-critical against router UDP timeouts, this one is
-/// just a UI-freshness tradeoff and free to differ.
-const PRESENCE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// A contact counts as "online" if we've heard from them (ping or chat
-/// message) within this long. A little over 2x the ping interval, so one
-/// dropped UDP packet doesn't immediately flip the marker to offline.
-const PRESENCE_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(45);
 
 #[derive(Serialize, Clone)]
 pub struct IdentityDto {
@@ -829,49 +755,18 @@ mod tests {
         let names = list_pseudonyms_sync(&root);
         assert_eq!(names, vec!["dave".to_string(), "erin".to_string()]);
     }
-
-    const RELAY_KEY_A: &str = "aa00000000000000000000000000000000000000000000000000000000000000";
-    const RELAY_KEY_B: &str = "bb00000000000000000000000000000000000000000000000000000000000000";
-
-    #[test]
-    fn test_relay_pubkey_is_trusted_on_first_use_then_pinned() {
-        let path = scratch_dir("relay_pin_first_use").join("known_relays.json");
-        assert!(!check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap());
-        pin_relay_pubkey(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap();
-        assert!(check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap());
-    }
-
-    #[test]
-    fn test_relay_pubkey_change_is_rejected() {
-        let path = scratch_dir("relay_pin_changed").join("known_relays.json");
-        pin_relay_pubkey(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap();
-        let err = check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_B).unwrap_err();
-        assert!(err.contains("different public key"), "{err}");
-    }
-
-    #[test]
-    fn test_relay_pins_are_per_address() {
-        let path = scratch_dir("relay_pin_per_address").join("known_relays.json");
-        pin_relay_pubkey(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap();
-        pin_relay_pubkey(&path, "3.25.64.73:443", RELAY_KEY_B).unwrap();
-        assert!(check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap());
-        assert!(check_relay_pin(&path, "3.25.64.73:443", RELAY_KEY_B).unwrap());
-    }
 }
 
 #[derive(Serialize, Clone)]
 pub struct ContactDto {
     pub token: String,
     /// "established" once the PQXDH session handshake completed, otherwise
-    /// "pending" (KeyExchange sent/received, waiting on SessionEstablish).
+    /// "pending" (added, waiting for them to add us back and the handshake
+    /// to finish).
     pub status: String,
     /// The display name this contact chose for themselves, learned from
     /// their KeyExchange (see `Client::contact_names`), if they set one.
     pub name: Option<String>,
-    /// True if we've heard a presence ping or chat message from this
-    /// contact within `PRESENCE_FRESHNESS`. Always false for a merely
-    /// "pending" contact — there's no session to ping over yet.
-    pub online: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -906,18 +801,13 @@ fn identity_dto(client: &Client) -> IdentityDto {
 /// inbound packets. Must be called once before any other command will work.
 /// Mirrors what the CLI's `main()` does at startup, just triggered by a UI
 /// button instead of running unconditionally on process start — except the
-/// relay's pubkey is fetched from the relay and pinned on first use (see
-/// `fetch_relay_pubkey`, `check_relay_pin`) instead of passed in by hand.
+/// relay's pubkey comes with the app (see `relay_pubkey_hex`) instead of being
+/// passed in by hand.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<IdentityDto, String> {
+    let server_pub =
+        parse_verifying_key(&relay_pubkey_hex()?).map_err(|e| format!("SERVER_PUBKEY: {e}"))?;
     let server_addr_raw = server_addr_raw();
-    let server_pub = parse_verifying_key(&fetch_relay_pubkey(&server_addr_raw).await?)
-        .map_err(|e| format!("Relay public key: {e}"))?;
-    // Canonical lowercase hex, so the pin compares keys rather than spellings.
-    let server_pub_hex = hex::encode(server_pub.as_bytes());
-    let known_relays_path = known_relays_path(&app)?;
-    let already_pinned = check_relay_pin(&known_relays_path, &server_addr_raw, &server_pub_hex)?;
-
     let server_addr: SocketAddr = tokio::net::lookup_host(&server_addr_raw)
         .await
         .map_err(|e| e.to_string())?
@@ -961,11 +851,6 @@ pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Ide
     perform_handshake(&mut client, &socket, &server_pub)
         .await
         .map_err(|e| e.to_string())?;
-    // Pinned only now that a handshake has verified against it, so a bogus
-    // key from something that can't also answer as the relay is never kept.
-    if !already_pinned {
-        pin_relay_pubkey(&known_relays_path, &server_addr_raw, &server_pub_hex)?;
-    }
     client.save();
 
     let identity = identity_dto(&client);
@@ -975,8 +860,7 @@ pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Ide
     // relative to the `state.runtime` write below doesn't matter.
     let tasks = vec![
         spawn_receive_loop(app.clone(), socket.clone()),
-        spawn_keepalive_loop(app.clone(), socket.clone()),
-        spawn_presence_loop(app, socket.clone()),
+        spawn_keepalive_loop(app, socket.clone()),
     ];
 
     let bursts = BurstSender::spawn(socket.clone(), client.server_addr);
@@ -1024,7 +908,7 @@ async fn end_session(state: &AppState) {
     }
 }
 
-/// Background task: periodically resend an empty `sync` packet to the relay
+/// Background task: periodically resend a (signed) `sync` packet to the relay
 /// (the same packet type `perform_handshake` sends once at bootstrap).
 ///
 /// This only matters once the relay and client are on different machines.
@@ -1062,49 +946,6 @@ fn spawn_keepalive_loop(
             let server_addr = rt.client.server_addr;
             drop(guard);
             let _ = socket.send_to(&sync_packet, server_addr).await;
-        }
-    })
-}
-
-/// Background task: send a signed presence ping (see `PresencePayload`) to
-/// every established contact on a fixed interval, so peers can show an
-/// online/offline marker. Paused while the app is off screen (see
-/// `background::on_screen`), so contacts then show us offline; the
-/// keepalive loop keeps us reachable for messages regardless. Separate from `spawn_keepalive_loop` on purpose
-/// — that one sends a single fixed packet to the relay and touches no
-/// protocol state, this one fans out to N contacts and advances no ratchet
-/// state either (pings are signed, not E2E-encrypted), so the two loops
-/// have nothing meaningful to share beyond both being timers.
-fn spawn_presence_loop(
-    app: AppHandle,
-    socket: Arc<UdpSocket>,
-) -> tauri::async_runtime::JoinHandle<()> {
-    tauri::async_runtime::spawn(async move {
-        let state = app.state::<AppState>();
-        let mut ticker = tokio::time::interval(PRESENCE_PING_INTERVAL);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {}
-                _ = background::BACK_ON_SCREEN.notified() => {}
-            }
-            if !background::on_screen() {
-                continue;
-            }
-            let guard = state.runtime.lock().await;
-            let Some(rt) = guard.as_ref() else {
-                continue;
-            };
-            let server_addr = rt.client.server_addr;
-            let packets: Vec<Vec<u8>> = rt
-                .client
-                .e2e_sessions
-                .keys()
-                .map(|&token| rt.client.generate_presence_packet(token))
-                .collect();
-            drop(guard);
-            for packet in packets {
-                let _ = socket.send_to(&packet, server_addr).await;
-            }
         }
     })
 }
@@ -1188,7 +1029,6 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
                 }
                 .to_string(),
                 name: client.contact_names.get(token).cloned(),
-                online: established && client.is_online(token, PRESENCE_FRESHNESS),
             }
         })
         .collect();
@@ -1199,10 +1039,12 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
     Ok(contacts)
 }
 
-/// Start a key exchange with a peer identified by their QR-scanned
-/// `(routing_token, ed25519_public_key)` pair. Real trust anchor: the
-/// signature check against this exact key happens on the reply (see
-/// `Client::handle_incoming_packet`, 0x02 branch, initiator path).
+/// Add a contact by their QR-scanned `(routing_token, ed25519_public_key)`
+/// pair and send them a key exchange. Only contacts added this way can
+/// connect to us, so the session comes up once they've added us too. Real
+/// trust anchor: their KeyExchange must carry this exact key (see
+/// `Client::add_contact` and the 0x02 branch of
+/// `Client::handle_incoming_packet`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn connect_to_peer(
     state: State<'_, AppState>,
@@ -1216,13 +1058,41 @@ pub async fn connect_to_peer(
 
     let peer_ed25519 = parse_verifying_key(&ed25519_hex).map_err(|e| e.to_string())?;
 
-    rt.client.pending_contacts.insert(token, peer_ed25519);
-    let req_packet = rt.client.create_kx_request(token);
+    let req_packet = rt.client.add_contact(token, peer_ed25519);
     rt.socket
         .send_to(&req_packet, rt.client.server_addr)
         .await
         .map_err(|e| e.to_string())?;
 
+    Ok(())
+}
+
+/// People who tried to connect but aren't contacts yet, newest first, as
+/// token hex (see `Client::connection_requests`). Their request was
+/// dropped; the frontend asks the user to scan their code, which is what
+/// accepts it.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn connection_requests(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let guard = state.runtime.lock().await;
+    let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
+    Ok(rt
+        .client
+        .connection_requests()
+        .iter()
+        .map(hex::encode)
+        .collect())
+}
+
+/// Stop listing a connection request ("Not now"), until they send another.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn dismiss_connection_request(
+    state: State<'_, AppState>,
+    token_hex: String,
+) -> Result<(), String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    rt.client
+        .dismiss_connection_request(&parse_token(&token_hex)?);
     Ok(())
 }
 

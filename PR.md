@@ -1,103 +1,121 @@
-Logan - Android app, reliable background delivery and a responsive UI
+Logan - Bug Fixes: close the open holes, plus easier contact adding and QR scanning
 
-Closes issue: #36
+Closes issue: #40
 
 ### Changes in this PR:
 
-**Android app**
-1. **Android project and build guide.** `code/frontend/src-tauri/gen/android/` is committed, and `code/frontend/ANDROID.md` covers toolchain setup through to installing on a phone. Android apps can't be launched with environment variables, so the relay address is baked in at build time (`SERVER_ADDR`, read with `option_env!` in `server_addr_raw`).
-2. **Receiving in the background.** While someone is logged in, a foreground service (`MessageService.kt`) keeps the process from being frozen, so the UDP socket keeps receiving. Android shows an ongoing "Connected" notification while it runs. A message that arrives while the app is off screen shows a notification that names the sender but never the text.
-   - The bridge between Kotlin and Rust (`NativeBridge.kt` ↔ `src-tauri/src/background.rs`) works by having a Kotlin thread block in a native `nextEvent()` call.
-   - It goes that way round because Tauri's own Rust-to-Kotlin plugin calls `expect` an activity to exist. They would panic once the app has been swiped away.
-3. **Swiping the app away.** While logged in, the app keeps running instead of exiting. Previously tao called `process::exit` when the last window closed. On reopen, the window is rebuilt from `tauri.conf.json` and the frontend picks up the session again through a new `current_session` command, so you go straight back to your chats.
-4. **Presence pings pause while the app is off screen.** This saves battery, because each ping wakes the radio. Contacts see you as offline until you reopen the app, but messages still arrive. The keepalive also syncs immediately when the app comes back on screen.
-5. **Session handling.**
-   - Android's standard library has no file locking, so the session lock now accepts `Unsupported`.
-   - `login` ends any existing session first.
-   - `bootstrap` stops the previous connection's background loops.
-   - `delete_identity` refuses to delete the identity that's logged in.
-6. **Manifest.**
-   - Cloud backup and device transfer are switched off (`allowBackup="false"` and `data_extraction_rules.xml`), so identities never leave the phone.
-   - Adds the camera, notification and foreground-service permissions.
-   - Drops the template's Android TV launcher entry.
-   - `MainActivity` pads the app clear of the status bar, navigation bar and keyboard. Android 15+ forces edge-to-edge, and older WebViews report the CSS safe-area insets as zero, so this is done natively.
+**Stage 2: closing the open holes**
 
-**Relay and client: messages survive a recipient that's offline or asleep**
+1. **Contact requests are accepted only from scanned contacts.** The "auto-accepting for demo" path is gone. A KeyExchange from someone you haven't added is dropped before it touches any contact state, so knowing your token is no longer enough to open a session with you. Both people now add each other (by scanning, or by pasting token + key), through a new `Client::add_contact`.
+   - **Why the handshake changed too.** Once both sides scan, both send a KeyExchange, and they can cross. Under the old flow each side would then create its own session and accept the other's, leaving them on different sessions. There was also a second problem: whoever scans first has their KeyExchange dropped, so the other side would never get their Kyber key, and PQ injections in that direction would silently stop.
+   - **The fix:**
+     - **One establisher.** The contact with the lower routing token always sends the SessionEstablish, and one from the other side is dropped.
+     - **A "have your keys" flag.** The KeyExchange gains a 1-byte `has_peer_keys` flag ("I already have your KeyExchange"). A contact without your keys gets yours again. The establisher sends SessionEstablish only once the other side has its keys.
+     - **Ask once.** The responder asks for a session once (`awaiting_session_est`), so crossing KeyExchanges produce one SessionEstablish, not two.
+   - Removing a contact and adding them back still works, from either side.
+2. **Presence is removed entirely:**
+   - the ping loop (`spawn_presence_loop`) and `PresencePayload` (`0x06`)
+   - the relay's queue for presence pings (`enqueue_ephemeral`)
+   - `Client::is_online`, `last_seen`, and the online dots in the UI
+   - Android's `appVisible` bridge, which existed only to pause pings off screen. This replaces #36's "presence pings pause while the app is off screen".
+3. **Syncs prove token ownership.**
+   - **Before:** anyone with a link session could sync any routing token. Tokens are in QR codes, so someone could have a victim's queued messages sent to themselves, and ack them away so the victim never got them.
+   - **Token:** the routing token is now the hash of a per-token Ed25519 key, `SHA-256("e2e-messenger/routing-token/v1" ‖ token_pub)[..16]`, kept separate from the identity key.
+   - **New sync packet:** a sync is a new link packet type, `TYPE_SYNC` (4), carrying `token | token_pub | signature`. The signature covers a value derived from the link key, so a signed sync is useless on any other link.
+   - **Relay checks:** the relay checks that the token is the hash of the key and verifies the signature with `verify_strict`.
+   - **Old syncs rejected:** an empty `TYPE_DATA` packet, the old unsigned sync, is now rejected.
+   - **Acks:** "acks only count from the token's current session" now actually means the owner.
+4. **The relay's key ships with the app.**
+   - **Endpoint removed:** the plain-HTTP `GET /pubkey` endpoint is removed. Whoever answered first on the network path could swap the key, and anyone probing could identify the server. The relay no longer listens on TCP at all, and `axum` is gone.
+   - **No more trust-on-first-use:** the pinning that worked around this (`known_relays.json`, `reqwest`) is removed too.
+   - **Where the key comes from now:** the app takes the key from `SERVER_PUBKEY`, set at launch or baked in at build time like `SERVER_ADDR` (`relay_pubkey_hex` in `commands.rs`).
+   - **Script support:** the relay has a new `--print-pubkey` flag. `runpeer.sh` and `runpeer-lan.sh` use it to fill the key in for a relay on the same machine, and `runserver-lan.sh` prints it for other machines.
+   - **TCP 443 removed** from the server's Dockerfile, `docker-compose.yml`, the deploy workflow and the EC2 docs.
+5. **No tokens or IP addresses in relay logs.** "Request handling error from {addr}", "Queue full for token…" and the debug lines for received, sent, synced, forwarded and acked packets no longer name an address or token.
 
-7. **Delivery receipts at the relay.**
-   - **Before:** the relay sent each queued packet once to the recipient's last known address, then deleted it. Anything sent to a phone that had gone to sleep, or whose app had just been killed, was lost. Presence pings, which every contact sends every 20 seconds, were also queued like messages:
-     - Before #32, they pushed real messages out of the old 50-packet queue after about 17 minutes offline.
-     - Under #32's 2 MiB cap, which refuses new packets once full, they would eventually lock real messages out instead.
-   - **Now:** each forwarded packet carries a delivery ID in the envelope's 16-byte prefix. The recipient confirms it with a new `TYPE_ACK` (3) packet. Until then the relay resends it with backoff (2s, 4s, 8s… up to 60s), and immediately when the recipient syncs from a new address or after more than 30 seconds of silence. Resends go through #32's 5 ms per-recipient pacing like everything else.
-   - Packets are kept for up to 7 days, within #32's 2 MiB cap per recipient.
-   - Presence pings (inner type `0x06`) are sent once, and only to recipients that are online.
-   - An ack only counts if it comes from the recipient's current link session.
-   - **Links stay alive while in use.** Every authentic packet refreshes its link's expiry, which is now 7 days after last use. Before, it was 1 hour after the handshake (finding R-3 in `implementation-review.md`), so a long-running app went deaf after an hour. Now a phone that slept overnight wakes up to a working link.
-8. **Client side.** A new `Client::handle_relay_packet` opens a packet, handles it, then sends the ack. The ack goes after the packet is handled, so a crash in between causes a resend rather than a lost message. Recent delivery IDs are remembered so a resend is acked again but never handled twice, since a resent KeyExchange would restart the session. The CLI, the Tauri app and #32's `lossy_link` example all use it.
+**Adding contacts: from the first two-phone test**
 
-**Frontend layout**
+Two phones connected fine, but adding a contact looked broken: one side showed "pending" and the other showed nothing. That was the intended behaviour from item 1, just invisible.
 
-9. **The app fits the window at any size.** Long content scrolls inside its own panel, so the header and message box stay in view. This fixes the default 800×600 window, where the message box was pushed off-screen and couldn't be reached.
-   - **Under 720px wide** (phones and narrow windows), the main screen shows one column: the contact list, or the open chat with a "← Contacts" button.
-   - **Identity card:** now a single row, with the token and key folded under "Show token and key".
-   - **Login, create identity and connect screens:** a centred column at most 440px wide.
-   - **Contact rows:** stay on one line, and long names are cut off with "…".
-   - **Touch screens:** bigger tap targets.
-   - **Scrollbars:** match the theme.
+6. **Pending hint and connection-request pop-up.**
+   - **Pending hint:** a pending contact now shows "Waiting for them to scan your code", in the list and in its chat.
+   - **Pop-up:** when someone who isn't a contact tries to connect, a pop-up says "Someone (a1b2c3d4...) wants to connect with you", with **Scan their code** and **Not now**. Scanning them back is what accepts. There's still no accept-without-scanning button, which would bring back what item 1 removed.
+   - **Bounded and unverified:** the client remembers only the token and time of recent requests (at most 8, for 10 minutes, in memory only). The pop-up shows only the token prefix, never the name they sent, since nothing in it is verified until the scan.
+   - **New Tauri commands:** `connection_requests` and `dismiss_connection_request`.
+7. **QR codes that scan from further away.**
+   - **Smaller code:** contact codes are now `CG2:` plus the token and key packed with Base45 (RFC 9285), at error correction L. That makes a 29×29 code, down from 37×37, so each square is about 22% bigger. The "Your QR code" dialog is also wider (520px, up from 380).
+   - **Old codes:** a v1 code gets a clear "from an older version of the app" message.
+   - **Scanner:**
+     - asks for up to 1080p with continuous autofocus (left alone, Android WebViews tend to pick 640×480)
+     - decodes at 1280px wide, up from 640
+     - uses the WebView's `BarcodeDetector` where there is one
+   - **`rqrr` still runs on every frame.** On the emulator the built-in detector exists but returns nothing, because Google Play services can't download its barcode module, and it gives no error. Decoding a 1280×720 frame with `rqrr` takes about 11 ms natively.
 
-**Docs and tooling**
+**Tooling and docs**
 
-10. **Docs.** ANDROID.md (including the "Receiving in the background" section), a link from the README, and updates for delivery receipts in `doable-cryptographic-flow.md`, `raptorq-fec-transport.md` and the relay's README.
-11. **`runpeer.sh`.** It now strips the environment that VS Code's snap leaks into its terminal. That environment crashed the WebKitGTK window and moved identity storage under `~/snap`.
-
-### Merged with main (#32, RaptorQ FEC)
-`main` is merged into this branch, so this builds on #32. The relay keeps #32's design:
-- forwarding on arrival
-- 5 ms pacing per recipient
-- a 2 MiB queue cap that refuses new packets once full
-
-The one change is that packets stay in that queue until they're acked. `take_due` now releases the oldest packet that's due (new, or its resend time reached) without removing it.
-
-#32's tests are adapted to match. A backlog still goes out whole, in order and one packet per pacing slot, and the packets then stay queued until acked.
-
-FEC and acks work at different layers:
-- **FEC** rebuilds a message from whichever symbols arrive.
-- **Acks** make the relay keep trying until the recipient actually has the packets, which FEC can't do for a phone that's asleep or offline.
+8. **`build-apk.sh`** builds a debug APK for LAN testing with this machine's IP and the local relay's key baked in. It finds the JDK, SDK and NDK if they aren't set, and handles the ranlib workaround. `--emulator` adds x86_64 code, so one APK runs on phones and the emulator.
+9. **`run-emulator.sh`** creates a Pixel 6 emulator (`e2e-test`, Android 15, 2 GB of RAM, webcam as the back camera) on first run, then boots it, installs the newest APK and opens the app. This makes it possible to test with one phone.
+10. **Docs:** the frontend README (relay key, and the add-each-other steps), ANDROID.md (relay key at build time, first run, presence bullet removed), the relay's README (signed sync, no presence queue) and the EC2 deploy guides (no TCP 443, how clients get the key).
 
 ### ⚠️ Wire format and deployment
-- **New relay packet type:** acks (type 3). The 16-byte prefix on forwarded packets now holds the delivery ID instead of zeros.
-- **Older clients:** they ignore the delivery ID, but never send acks, so the relay keeps resending to them (at most every 60 seconds, for up to 7 days). Deploy the relay and update all clients together.
-- **Android build:** needs `RANLIB_aarch64_linux_android` set, or OpenSSL's build fails (ANDROID.md, step 4).
+Everything here is breaking. **Deploy the relay and update every client together.**
+- **Wire format changes:**
+  - **Syncs:** the new `TYPE_SYNC` (4) replaces the empty `TYPE_DATA` sync. An older client's syncs are rejected, so the relay never sends it anything.
+  - **KeyExchange:** now 1385 bytes, up from 1384, because of the `has_peer_keys` byte.
+  - **Presence:** `PresencePayload` (`0x06`) no longer exists.
+  - **Contact QR codes:** now `CG2:`. Old and new builds can't read each other's codes.
+- **Everyone has to re-add their contacts.** An identity saved before this change has a random routing token it can't prove to the relay. So on first load it gets a new token derived from a fresh token key, with a warning in the log. Its old contacts stop working, and their chat history is left with no way to view it.
+- **Every build needs `SERVER_PUBKEY`.** Without it, Connect fails with an error explaining what's missing.
+  - Desktop: `runpeer.sh` sets it for a local relay.
+  - Phones: `build-apk.sh` and `runpeer-lan.sh --mobile` set it.
+  - Production builds need the deployed relay's key (ANDROID.md, step 6).
+  - The relay's identity persists in the `server_identity` volume, so the key doesn't change between deploys.
+- **EC2:** the inbound TCP 443 rule in the security group can be deleted by hand.
+- **New files need adding:** `build-apk.sh` and `run-emulator.sh` are new and untracked, so `git add` them.
 
 ### Testing
-- **Unit tests:** all passing, and clippy is clean on all three.
-  - **Relay: 17.** 7 are new: resend backoff, acks only from the recipient's session, resend after silence or an address change, presence pings sent once and never queued for an offline recipient, link kept alive by use, and the backoff cap. #32's pacing and forwarding tests are adapted to ack-based retention.
-  - **Client: 117.** 3 are new: ack and resend handling, no ack for relay dummy packets, and delivery-ID memory.
-  - **Tauri backend: 14.**
-- **End to end, through the merged relay over real UDP:**
-  - **`lossy_link` at 70% loss** on the jammed side: 20/20 messages delivered each way, with both ratchets in step.
-  - **Recipient restarted:** Bob's CLI is killed while the relay still has his address. Alice messages him, Bob restarts from his saved state, and the message arrives. Against `main`'s relay, the same test loses it.
-- **APK:** the debug build for arm64 builds without warnings.
-- **On a Galaxy S23+** (debug build, relay on a PC on the same Wi-Fi, before merging `main`):
-  - Added a contact by QR code and received messages.
-  - Confirmed the foreground service is running (`dumpsys`).
-  - Swiped the app away and reopened it twice. Each time the window was rebuilt, in the same process, with the session intact (logcat).
-  - Presence pings paused on Home and resumed on reopen (logcat).
-- **Layout:** screenshots in headless Firefox at 384×832, 640×480, 800×600 and 1280×800 against a mocked backend, then installed on the S23+.
+- **Unit tests:** all passing, and clippy is clean on every crate (frontend native and WASM).
+  - **Relay: 18.** New:
+    - a sync for someone else's token is rejected, whether claimed with your own key or with the victim's public key and a forged signature
+    - a sync signed for another link is rejected
+    - an empty data packet is no longer a sync
+  - **Client: 119.** New:
+    - each scan order: establisher first, responder first, both before either hears back
+    - re-adding a removed contact, from either side
+    - a stranger's KeyExchange leaves no contact state
+    - a SessionEstablish from the responder is dropped
+    - the sync proves token ownership
+    - an old identity migrates to a provable token
+    - connection requests are listed, dismissed and cleared on add
+    - tampered or misaddressed requests are never noted
+  - **Tauri backend: 14.** The trust-on-first-use pinning tests are removed with the feature.
+  - **Frontend: 10.** New: RFC 9285's Base45 examples, round trips, damaged codes, the old-version message, the code's size pinned at 29×29, and `rqrr` reading back what's drawn.
+  - **Repeat runs:** roles depend on random tokens, so the handshake tests were run 25 times with no failures.
+- **End to end, with the real relay and two CLI clients:** 18 checks, run 5 times, with each side taking the establisher role in different runs.
+  - `--print-pubkey` works, and nothing listens on TCP
+  - a one-sided request is ignored
+  - the session comes up once both sides add each other
+  - messages get through both ways, including a 3,000-character one that crosses a PQ refresh
+  - the relay log has no client addresses or routing tokens, and no request errors
+- **`lossy_link` at 70% loss on both sides:** 5/5 messages each way, with both ratchets in step.
+- **Android:**
+  - The APK builds for arm64 and x86_64 (which also compiles the Kotlin change).
+  - The app installs and runs on the emulator, and its WebView offers `BarcodeDetector` with QR support.
+  - Two phones both connected to the relay. That test showed the silent one-sided request and led to item 6.
 - **Not tested yet:**
-  - Seeing the new-message notification on a locked phone.
-  - The battery impact.
-  - A release (signed) build.
+  - the full two-phone handshake with the new pop-up
+  - the camera changes (resolution, autofocus, the Samsung's `BarcodeDetector`) on a real phone
+  - Connect from the emulator to the relay
+  - clicking through the desktop app
 
 ### Follow-ups
-- Fill in the production relay address in ANDROID.md (still a TODO).
-- **Process death:** if Android kills the app, nothing is received until you log in again. Logging in needs the passcode, so it can't happen automatically; the relay holds messages for up to 7 days.
-- **Deep sleep:** in Doze, Android can delay delivery until the phone wakes. Push notifications via Firebase Cloud Messaging would avoid this, but Google would see when messages arrive.
-- **UI decisions:**
-  - Should the token and key show by default on wide windows?
-  - Should the "ESTABLISHED" pill be dropped? The online dot already marks established contacts, and the pill is what cuts off long names in the sidebar.
-- Set up signing for release builds.
-- **Ack overhead under heavy loss.** At 70% loss, acks get lost too, so the relay resends symbols FEC had already made unnecessary. In the `lossy_link` run, Bob sent 764 packets to Alice and 1944 reached her jammed link. Acking once per decoded message, covering all its symbols, would cut this.
-- **No handshake after a relay restart.** Clients never redo the handshake, so after a relay restart (or a link left unused for 7 days) you still need to log out and back in. This is what remains of R-3.
+- **A rare session mismatch.** Re-adding the same contact twice in quick succession, or both people re-adding each other at once after one removed the other, can produce two SessionEstablishes. If packet loss then reorders them, the two sides end up on different sessions. Removing and re-adding the contact fixes it.
+- **A slow SessionEstablish is dropped (this was already the case).** One held at the relay for more than 5 minutes fails the timestamp check. Re-adding the contact recovers.
+- **The pop-up needs the app open.** No Android notification is posted for connection requests.
+- **The requester's token isn't proven to the receiver.** The pop-up only prompts a scan, and the scan is the trust step.
+- **The token key doesn't hide who you are from the relay yet.** The relay still sees each client's identity Ed25519 key in the link handshake, so it can link a token to an identity. This matters if we move to per-contact tokens.
+- **Link packets have no replay protection.** A captured sync replayed from another address redirects that token's deliveries until the owner's next keepalive (15 s). The packets stay queued and can't be read or acked, so the effect is a delay.
+- **Production setup.** ANDROID.md still has a TODO for the production relay address, and now its key too. Release signing is also still to do.
+- **Emulator scanning.** The emulator's camera is the laptop webcam, usually fixed-focus. Scanning a phone's code with it is hard; the phone scanning the emulator's screen works better.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

@@ -18,8 +18,8 @@ pub struct ClientRuntime {
     pub socket: Arc<UdpSocket>,
     /// Paces message bursts out over `socket`, one at a time and in order.
     pub bursts: BurstSender,
-    /// Handles to the background tasks `bootstrap` spawned (receive,
-    /// keepalive, presence loops) — aborted by `logout` so they don't keep
+    /// Handles to the background tasks `bootstrap` spawned (receive and
+    /// keepalive loops) — aborted by `logout` so they don't keep
     /// running against an abandoned socket/identity after the user switches
     /// identities without closing the whole app.
     pub tasks: Vec<tauri::async_runtime::JoinHandle<()>>,

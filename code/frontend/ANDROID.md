@@ -115,15 +115,21 @@ from git afterwards. They're all under
 
 The folder's own `.gitignore` already excludes build output.
 
-## 6. Set the relay address
+## 6. Set the relay address and key
 
 An Android app can't be launched with environment variables. Instead, the
-relay address is read when you **build** the app and baked into it (see
-`server_addr_raw()` in `src-tauri/src/commands.rs`):
+relay address and its public key are read when you **build** the app and
+baked into it (see `server_addr_raw()` and `relay_pubkey_hex()` in
+`src-tauri/src/commands.rs`):
 
 ```bash
 export SERVER_ADDR=relay.example.com:443   # TODO: replace with the production relay
+export SERVER_PUBKEY=<hex>                 # the relay's "Server Static Pubkey"
 ```
+
+The app only connects to a relay with that key; it never asks the relay
+for it. `./runpeer-lan.sh --mobile` sets `SERVER_PUBKEY` itself when the
+relay runs on the same machine.
 
 - The format is `host:port`, using a hostname or an IP. Don't include
   `https://`: the app talks to the relay over a raw UDP socket.
@@ -193,12 +199,10 @@ cargo tauri android build --debug --apk --target aarch64
    them, the app still receives messages in the background but can't tell
    you about them.
 2. **Create identity**, then log in, the same way as on desktop.
-3. On the **Connect** screen, paste the relay's public key. It's the
-   `Server Static Pubkey:` line the server prints when it starts. Typing 64
-   hex characters on a phone is painful, so send it to yourself through a
-   notes or chat app and paste it.
+3. Press **Connect**. The relay's public key is already built in (step 6).
 4. Add contacts with **Scan QR code** (Android asks for camera permission
-   the first time) or by pasting a routing token and Ed25519 key.
+   the first time) or by pasting a routing token and Ed25519 key. You each
+   add the other; a contact stays "pending" until both have.
 
 ## Receiving in the background
 
@@ -209,9 +213,6 @@ shows this as an ongoing "Connected" notification.
 - A message that arrives while the app is in the background shows a "New
   message" notification. It names the sender but never shows the text.
   Opening the app clears it.
-- While the app isn't on screen, it stops telling your contacts you're
-  online, to save battery. They see you as offline until you open it
-  again, but their messages still reach you.
 - Swiping the app away from the recent-apps screen doesn't log you out. The
   app keeps receiving, and reopening it goes straight back to your chats.
 - **Log out** stops the service and the notification.

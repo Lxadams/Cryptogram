@@ -132,10 +132,9 @@ async fn main() -> Result<()> {
                 let mut c = client.lock().await;
                 // Trust is asserted here from the (assumed) QR-scanned key;
                 // the reply's signature is checked against this on receipt.
-                c.pending_contacts.insert(token, bob_ed25519);
-                let req_packet = c.create_kx_request(token);
+                let req_packet = c.add_contact(token, bob_ed25519);
                 socket.send_to(&req_packet, server_addr).await.unwrap();
-                println!("Sent connection request! Waiting for Bob...");
+                println!("Sent connection request! They need to connect to you too.");
             }
             "msg" => {
                 if parts.len() < 3 {

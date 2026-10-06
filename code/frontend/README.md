@@ -48,8 +48,9 @@ From the repo root:
 ```
 ./runserver.sh
 ```
-It also serves its `Server Static Pubkey` at `GET /pubkey` (TCP, same
-address as the UDP relay), which each peer fetches on its Connect screen.
+`runpeer.sh` reads the relay's `Server Static Pubkey` from its identity
+file and builds it into the app, which checks the relay against it on
+Connect (see `relay_pubkey_hex` in `src-tauri/src/commands.rs`).
 
 ### Terminal 2+ — launch a peer, one per terminal
 
@@ -97,11 +98,10 @@ today this passcode only gates *which* identity file loads — it is not yet
 a real encryption key, so `client_state.json` is still plaintext on disk
 (same as the old `client_state.json`/`.peers/` files were).
 
-After logging in, press Connect on the Connect screen. The app fetches the
-relay's pubkey from the relay and pins it per `SERVER_ADDR` in
-`known_relays.json` (in the app data directory, next to `identities/`); if
-the relay later presents a different key, Connect refuses until you remove
-that entry. Once connected, your identity (name + routing token + Ed25519
+After logging in, press Connect on the Connect screen. The app checks the
+relay against the pubkey it was given in `SERVER_PUBKEY` (set at launch, or
+baked in at build time; `runpeer.sh` sets it for the local relay) and
+refuses to connect to anything else. Once connected, your identity (name + routing token + Ed25519
 key) is shown — the routing token + Ed25519 key are what a peer needs to add you as a
 contact (stand-in for scanning a QR code, per the Micro-QR design in
 `doable-cryptographic-flow.md`). The name is whatever username you logged
@@ -128,14 +128,14 @@ Android, set up the toolchain first; see [ANDROID.md](ANDROID.md).
 
 1. In alice's window, copy her identity (routing token + Ed25519 key) —
    just those two fields, same as before names existed.
-2. In bob's window, paste those into "Add contact" and submit. As soon as
-   Alice's KeyExchange (and her auto-reply) round-trip, bob's contact list
-   shows "alice" by herself — nobody typed her name in on bob's side.
-3. Repeat in the other direction: copy bob's identity, add it as a
-   contact in alice's window, and her contact list will pick up "bob" the
-   same way.
-4. Once both sides have sent a connection request to each other, each
-   window's contact list should flip that contact's status from
+2. In bob's window, paste those into "Add contact" and submit. Alice
+   shows up as "pending": a connection request only counts once the other
+   side has added you too, so alice's client ignores bob's until then.
+3. Repeat in the other direction: copy bob's identity and add it as a
+   contact in alice's window.
+4. Now that both sides have added each other, the KeyExchange goes
+   through: each contact list shows the other's name ("alice", "bob" —
+   nobody typed them in) and flips that contact's status from
    "pending" to "established" — at that point you can select the contact
    and send messages in either window. The same pattern (both sides add
    each other) applies for any additional peers.
