@@ -107,6 +107,20 @@ moment you connect to someone, so a peer's contact list shows "alice"
 instead of your hex token with no extra step on their end (see
 `Client::local_name`/`contact_names` in `code/client/src/lib.rs`).
 
+### Peers on other devices (LAN)
+
+`runserver.sh` only accepts peers on the same machine. To let other PCs
+and phones on your network connect, start the relay with
+`./runserver-lan.sh` instead. It prints this machine's IP. On WSL2, it
+also warns you if WSL needs switching to mirrored networking, and says how.
+Then, on each client:
+```
+./runpeer-lan.sh --pc <server-ip>       # desktop peer
+./runpeer-lan.sh --mobile <server-ip>   # build + install the Android app
+```
+Leave out `<server-ip>` when the relay runs on that same machine. For
+Android, set up the toolchain first; see [ANDROID.md](ANDROID.md).
+
 ### Testing messaging between peers
 
 1. In alice's window, copy her identity (routing token + Ed25519 key) —

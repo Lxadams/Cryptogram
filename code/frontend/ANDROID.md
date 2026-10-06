@@ -8,6 +8,11 @@ Written for Ubuntu, including WSL2 on Windows.
   `src-tauri/gen/android/` is committed.
 - **Every build:** steps 6–8 (set the relay address, build, install).
 
+**Shortcut:** once steps 1–4 are done, run
+`./runpeer-lan.sh --mobile <relay-ip-or-host[:port]>` from the repo root.
+It does steps 5–8 for you. Without a port it uses 4430, so for a relay on
+443 write `relay.example.com:443`.
+
 ## 1. Base toolchain
 
 Skip this if `./runpeer.sh` already works on this machine.
@@ -245,14 +250,13 @@ same machine to avoid this.
 Use this if the production relay isn't running yet. The phone and the PC
 must be on the same Wi-Fi.
 
-1. Start the relay listening on all network interfaces. By default it only
-   listens on `127.0.0.1`, which the phone can't reach.
-   ```bash
-   cd code/server
-   BIND_ADDR=0.0.0.0:4430 cargo run
-   ```
+1. Start the relay from the repo root with `./runserver-lan.sh`. The
+   regular `runserver.sh` only listens on `127.0.0.1`, which the phone
+   can't reach. `runserver-lan.sh` listens on all network interfaces and
+   prints this machine's IP.
 2. **WSL2 only:** by default WSL sits behind a private network that the
-   phone can't see into.
+   phone can't see into. `runserver-lan.sh` warns you about this, and these
+   are the steps it suggests.
    1. Add these lines to `C:\Users\<you>\.wslconfig`:
       ```ini
       [wsl2]
@@ -263,8 +267,12 @@ must be on the same Wi-Fi.
       ```powershell
       New-NetFirewallHyperVRule -Name E2E-Relay -DisplayName "E2E relay (UDP 4430)" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol UDP -LocalPorts 4430
       ```
-3. Build with `SERVER_ADDR=<your PC's Wi-Fi IP>:4430`. You can find the IP
-   with `ipconfig` on Windows.
+3. Build with `./runpeer-lan.sh --mobile`. With no IP given, it bakes in
+   this machine's IP. If the IP changes later, build again.
+4. If the phone still can't connect, your Wi-Fi may block devices from
+   talking to each other. This is common on campus and office networks.
+   Turn on the phone's hotspot, connect the PC to it, and run steps 1 and 3
+   again.
 
 ## Troubleshooting
 
