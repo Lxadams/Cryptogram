@@ -16,8 +16,8 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::{io::AsyncBufReadExt, net::UdpSocket, sync::Mutex};
 
 use client::{
-    Client, ClientStateDto, parse_routing_token, parse_verifying_key, perform_handshake,
-    state_file_path,
+    BurstSender, Client, ClientStateDto, parse_routing_token, parse_verifying_key,
+    perform_handshake, state_file_path,
 };
 
 #[tokio::main]
@@ -60,6 +60,8 @@ async fn main() -> Result<()> {
 
     let client = Arc::new(Mutex::new(client_obj));
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    // Message bursts go out one at a time, in order, paced on their own task.
+    let bursts = BurstSender::spawn(Arc::clone(&socket), server_addr);
 
     // Link-layer handshake with the relay (X25519 DH + Ed25519 mutual auth),
     // then announce ourselves so the relay can route to our current IP.
@@ -148,20 +150,19 @@ async fn main() -> Result<()> {
                     }
                 };
                 let text = parts[2..].join(" ");
-                let mut c = client.lock().await;
-                match c.create_encrypted_packets(token, text.as_bytes()) {
-                    Ok((msg_packets, pq_inject_packet)) => {
-                        // A long message comes back as several chunk packets.
-                        for msg_packet in &msg_packets {
-                            socket.send_to(msg_packet, server_addr).await.unwrap();
-                        }
-                        println!("Sent msg!");
-                        // Every PQ_INJECT_INTERVAL messages, create_encrypted_packets
-                        // also hands back a fresh Kyber ratchet packet to send after
-                        // the message's last chunk.
-                        if let Some(pq_pkt) = pq_inject_packet {
-                            socket.send_to(&pq_pkt, server_addr).await.unwrap();
-                            println!("Sent PQ ratchet injection packet!");
+                // One burst of FEC packets (with any PQ ratchet injection
+                // bundled inside). The lock is released before sending so the
+                // receive loop isn't locked out while the burst drains.
+                let packets = client
+                    .lock()
+                    .await
+                    .create_fec_packets(token, text.as_bytes());
+                match packets {
+                    Ok(packets) => {
+                        let count = packets.len();
+                        match bursts.send(packets).await {
+                            Ok(()) => println!("Sending msg as a burst of {count} packets..."),
+                            Err(e) => println!("Error: msg not sent: {e}"),
                         }
                     }
                     Err(e) => println!("Error: {}", e),

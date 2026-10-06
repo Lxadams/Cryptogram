@@ -7,7 +7,7 @@ This document describes the cryptographic architecture of the E2E Messenger MVP 
 ## 1. Architectural Role Summary
 
 *   **Clients (Alice & Bob)**: Generate all keys locally in memory. Trust is established strictly in person via Micro-QR codes (48 bytes). The clients handle all asymmetric/symmetric cryptography and the Deferred Key Exchange protocol.
-*   **Server Relay**: A blind RAM-only router. It has zero knowledge of User IDs or E2E keys. It uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID to identify the link key, decrypts the outer shell, reads the 16-byte Routing Token, re-encrypts the inner payload with the recipient's link key, and forwards it to their active IP. Every forwarded packet waits in a RAM queue (bounded to 512 per recipient, kept up to 7 days) until the recipient acknowledges it, and is resent until then, so a recipient that's offline, asleep or behind a changed NAT mapping still gets it once it syncs again. Presence pings are the exception: they're sent once, and only to a recipient that's online.
+*   **Server Relay**: A blind RAM-only router. It has zero knowledge of User IDs or E2E keys. It uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID to identify the link key, decrypts the outer shell, reads the 16-byte Routing Token, re-encrypts the inner payload with the recipient's link key, and forwards it to their active IP. Every forwarded packet waits in a RAM queue (bounded to 2 MiB per recipient, refusing new packets once full, and kept up to 7 days) until the recipient acknowledges it, and is resent until then, so a recipient that's offline, asleep or behind a changed NAT mapping still gets it once it syncs again. Presence pings are the exception: they're sent once, and only to a recipient that's online.
 
 ---
 
@@ -177,9 +177,9 @@ Raw UDP Datagram
 | Test | Description |
 |---|---|
 | `test_edge_case_offline_queuing_and_sync` | Asserts that messages sent to an offline receiver are securely queued in RAM, sent as soon as the receiver boots, handshakes, and sends a Sync packet, and only leave the queue once the receiver acks them. |
-| `test_edge_case_offline_queue_dos_bounds` | Spams 5 more messages than fit to an offline routing token. Asserts the server strictly bounds the queue to 512 messages, popping the oldest to prevent RAM exhaustion (DoS protection). |
+| `test_edge_case_offline_queue_dos_bounds` | Spams more packets than fit to an offline routing token. Asserts the server strictly bounds the queue to 2 MiB, refusing new packets and keeping the oldest, to prevent RAM exhaustion (DoS protection). |
 | `test_presence_ping_not_queued_for_offline_recipient` | Asserts a presence ping to an offline receiver is dropped rather than queued, so pings can't push real messages out of the queue. |
-| `stores::tests::*` | Unacknowledged messages are resent with backoff; acks only count from the recipient's own link session; a sync from a new address or after silence resends at once; resend delays double up to 60s. |
+| `stores::tests::*` | Unacknowledged packets are resent with backoff; acks only count from the recipient's own link session; a sync from a new address or after silence resends at once; resend delays double up to 60s; a link in use isn't swept. |
 | `test_relay_packet_is_acked_and_resend_handled_once` (client) | A forwarded packet is handled and acked; the same packet resent is only acked again. |
 | `test_edge_case_offline_queue_ttl_expiry` | Enqueues a message with an expired TTL. Asserts the background sweeper safely destroys the expired message and cleans up the empty queue HashMap entry. |
 

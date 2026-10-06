@@ -4,24 +4,29 @@ use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::{
-    collections::HashSet,
     fs,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::net::UdpSocket;
-use tracing::{error, info};
+use tokio::{net::UdpSocket, sync::Notify};
+use tracing::{debug, error, info, warn};
 use x25519_dalek::PublicKey as X25519PublicKey;
 mod stores;
 
 use crate::stores::{DeliveryId, SessionId, Tables};
 
 const METADATA_TTL: Duration = Duration::from_secs(1000);
-// How long a message waits for an offline recipient to come back and
+// How long a packet waits for an offline recipient to come back and
 // acknowledge it. Long enough to cover a phone that's been off for a while.
 const MESSAGE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const OUTBOUND_TASK_INTERVAL: Duration = Duration::from_secs(1);
+// Minimum gap between packets the relay sends one recipient. Half a
+// client's FEC burst spacing (10ms): a live burst passes straight through
+// with the spacing it arrived with — even two peers sending at once keep
+// up — while a backlog (a recipient coming back online) is spread out
+// instead of blasted at line rate, which would overflow their socket
+// buffer and hand a jamming spike whole messages at a time.
+const RELAY_PACKET_SPACING: Duration = Duration::from_millis(5);
 const SWEEPING_TASK_INTERVAL: Duration = Duration::from_secs(120);
 
 // Domain-separation salt for HKDF derivations (must match client)
@@ -31,19 +36,20 @@ const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
 const TYPE_HANDSHAKE_INIT: u8 = 0;
 const TYPE_DATA: u8 = 1;
 const TYPE_HANDSHAKE_RESP: u8 = 2;
-// Recipient confirming it has forwarded messages, so they can leave its
+// Recipient confirming it has forwarded packets, so they can leave its
 // queue. Format: [1 byte type] [4 byte SessionId] [24 byte Nonce]
 // [link-encrypted: 16 byte own routing token | 16 byte delivery ID ...]
 const TYPE_ACK: u8 = 3;
 
 // Relay cover traffic ("dummy packets") is shaped like a forwarded chat
-// message so the two are the same size on the wire. The client pads every
-// chat message chunk to a fixed block (see code/client/src/padding.rs), so a
-// chat message's inner E2E payload is always
-//   1 type + 16 sender token + 8 seq + 24 nonce + 1024 padded block + 16 tag
-// = 1089 bytes, i.e. a 1150-byte UDP packet once wrapped for the recipient.
+// packet so the two are the same size on the wire. Clients send chat as FEC
+// symbols (see code/client/src/transport.rs), and since every chunk inside
+// is padded to a fixed block (code/client/src/padding.rs), every symbol is
+// the maximum 1024 bytes. So a forwarded packet's inner payload is always
+//   1 type + 16 sender token + 24 nonce + 12 FEC header + 1024 symbol + 16 tag
+// = 1093 bytes, i.e. a 1154-byte UDP packet once wrapped for the recipient.
 // Keep this in step with the client if that layout changes.
-const CHAT_INNER_PAYLOAD_LEN: usize = 1 + 16 + 8 + 24 + 1024 + 16;
+const CHAT_INNER_PAYLOAD_LEN: usize = 1 + 16 + 24 + 12 + 1024 + 16;
 // Inner type byte of a dummy packet, which the client ignores (the `0x00`
 // arm in `Client::handle_incoming_packet`).
 const INNER_TYPE_DUMMY: u8 = 0x00;
@@ -98,14 +104,23 @@ async fn main() -> Result<()> {
     );
 
     let tables = Arc::new(Mutex::new(Tables::new()));
+    // Wakes the outbound task the moment something may be ready to forward
+    // (a packet queued, a recipient synced), instead of it polling.
+    let outbound_wake = Arc::new(Notify::new());
 
-    spawn_outbound_task(Arc::clone(&tables), Arc::clone(&socket));
+    spawn_outbound_task(
+        Arc::clone(&tables),
+        Arc::clone(&socket),
+        Arc::clone(&outbound_wake),
+    );
     spawn_sweeping_task(Arc::clone(&tables));
 
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
-                info!("Received {} bytes from {}", len, addr);
+                // Per-packet logging is debug-only: a message is tens to
+                // hundreds of packets, and this loop must keep draining.
+                debug!("Received {} bytes from {}", len, addr);
                 if let Err(e) =
                     match handle_request(&tables, &server_identity, addr, &buffer[..len]) {
                         Ok(Some(resp)) => {
@@ -114,7 +129,10 @@ async fn main() -> Result<()> {
                             }
                             Ok(())
                         }
-                        Ok(None) => Ok(()),
+                        Ok(None) => {
+                            outbound_wake.notify_one();
+                            Ok(())
+                        }
                         Err(e) => Err(e),
                     }
                 {
@@ -205,16 +223,21 @@ fn handle_request(
             let inner_payload = &plaintext[16..];
 
             if inner_payload.is_empty() {
-                info!("Sync Request mapped to token {:?}", routing_token);
+                debug!("Sync Request mapped to token {:?}", routing_token);
                 let mut tables = tables.lock().unwrap();
                 tables.update_metadata(routing_token, socket_address, session_id, METADATA_TTL);
             } else if inner_payload[0] == INNER_TYPE_PRESENCE {
                 let mut tables = tables.lock().unwrap();
                 tables.enqueue_ephemeral(routing_token, inner_payload.to_vec());
             } else {
-                info!("Forward Request for token {:?}", routing_token);
+                debug!("Forward Request for token {:?}", routing_token);
                 let mut tables = tables.lock().unwrap();
-                tables.enqueue_message(routing_token, inner_payload.to_vec(), MESSAGE_TTL);
+                if tables
+                    .enqueue_message(routing_token, inner_payload.to_vec(), MESSAGE_TTL)
+                    .is_none()
+                {
+                    warn!("Queue full for token {:?}; dropped packet", routing_token);
+                }
             }
         }
         TYPE_ACK => {
@@ -232,7 +255,7 @@ fn handle_request(
                 .lock()
                 .unwrap()
                 .acknowledge(&routing_token, &session_id, &ids);
-            info!("Ack for token {:?}: {} delivered", routing_token, removed);
+            debug!("Ack for token {:?}: {} delivered", routing_token, removed);
         }
         _ => return Err(anyhow!("Unknown packet type")),
     }
@@ -265,16 +288,24 @@ fn open_link_payload(tables: &Arc<Mutex<Tables>>, payload: &[u8]) -> Result<(Ses
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
         .map_err(|_| anyhow!("Invalid link encryption MAC"))?;
+    // Authentic traffic on this link, so keep it.
+    tables.lock().unwrap().touch_link(&session_id);
     Ok((session_id, plaintext))
 }
 
-fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>) {
+fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>, wake: Arc<Notify>) {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = send_outbound_messages(&tables, &socket).await {
-                error!("Error sending outbound messages: {}", e);
+            let next_due = send_due_packets(&tables, &socket).await;
+            // Sleep until the next pacing slot, or until something new
+            // arrives (`notify_one` keeps a wake-up that lands mid-send).
+            match next_due {
+                Some(at) => tokio::select! {
+                    _ = tokio::time::sleep_until(at.into()) => {}
+                    _ = wake.notified() => {}
+                },
+                None => wake.notified().await,
             }
-            tokio::time::sleep(OUTBOUND_TASK_INTERVAL).await;
         }
     });
 }
@@ -293,36 +324,6 @@ fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
     });
 }
 
-type OutboundMessages = (
-    Vec<(String, DeliveryId, Vec<u8>, SessionId)>,
-    Vec<(String, SessionId)>,
-);
-
-fn prepare_outbound_messages(tables: &Arc<Mutex<Tables>>) -> OutboundMessages {
-    let (messages, dummy_targets) = {
-        let mut tables = tables.lock().unwrap();
-        let mut sent_tokens = HashSet::new();
-        let mut messages = Vec::new();
-
-        for message in tables.outbound_messages() {
-            if let Some(metadata) = tables.get_metadata(&message.receiver_token) {
-                messages.push((
-                    metadata.incoming_addr.to_string(),
-                    message.id,
-                    message.payload,
-                    metadata.session_id,
-                ));
-                sent_tokens.insert(message.receiver_token);
-            }
-        }
-
-        let dummy_targets = Vec::new();
-
-        (messages, dummy_targets)
-    };
-    (messages, dummy_targets)
-}
-
 /// Link-encrypt `inner_payload` for the recipient behind `session_id`,
 /// behind a 16-byte prefix holding its delivery ID, which the client echoes
 /// back in its ack (all zeros for a dummy packet, which needs no ack). Real
@@ -333,7 +334,7 @@ fn wrap_for_recipient(
     session_id: &SessionId,
     delivery_id: &DeliveryId,
     inner_payload: &[u8],
-) -> Result<Vec<u8>> {
+) -> Vec<u8> {
     use rand_core::{OsRng, RngCore};
 
     let cipher = XChaCha20Poly1305::new(Key::from_slice(link_key));
@@ -346,56 +347,54 @@ fn wrap_for_recipient(
 
     let ciphertext = cipher
         .encrypt(nonce, full_inner.as_slice())
-        .map_err(|_| anyhow!("Failed to encrypt outbound packet"))?;
+        .expect("XChaCha20-Poly1305 encryption is infallible for in-memory buffers");
 
     let mut packet = vec![TYPE_DATA];
     packet.extend_from_slice(session_id);
     packet.extend_from_slice(&nonce_bytes);
     packet.extend_from_slice(&ciphertext);
-    Ok(packet)
+    packet
 }
 
 /// A dummy packet for the recipient behind `session_id`: the same size and
-/// framing as a forwarded chat message, with an inner type the client drops.
-fn dummy_packet(link_key: &[u8; 32], session_id: &SessionId) -> Result<Vec<u8>> {
+/// framing as a forwarded chat packet, with an inner type the client drops.
+/// Cover traffic is switched off for now (nothing sends these), but this
+/// keeps them ready to match real traffic when it's turned back on.
+#[allow(dead_code)]
+fn dummy_packet(link_key: &[u8; 32], session_id: &SessionId) -> Vec<u8> {
     let mut inner = vec![0u8; CHAT_INNER_PAYLOAD_LEN];
     inner[0] = INNER_TYPE_DUMMY;
     wrap_for_recipient(link_key, session_id, &[0u8; 16], &inner)
 }
 
-async fn send_outbound_messages(tables: &Arc<Mutex<Tables>>, socket: &UdpSocket) -> Result<()> {
-    let (messages, dummy_targets) = prepare_outbound_messages(tables);
-    for (addr, delivery_id, inner_payload, recipient_session_id) in &messages {
-        // Look up recipient's link key to re-encrypt
-        let link_key = {
-            let tables = tables.lock().unwrap();
-            match tables.get_link_key(recipient_session_id) {
-                Some(k) => *k,
-                None => continue,
-            }
-        };
-
-        let packet =
-            wrap_for_recipient(&link_key, recipient_session_id, delivery_id, inner_payload)?;
-        socket.send_to(&packet, addr).await?;
-        info!("Sent {} bytes (re-encrypted) to {}", packet.len(), addr);
+/// Forward every packet whose recipient's pacing slot is due (see
+/// `Tables::take_due`), re-encrypted under the recipient's link key.
+/// Returns when the next slot falls due, if anything is still waiting.
+async fn send_due_packets(tables: &Mutex<Tables>, socket: &UdpSocket) -> Option<Instant> {
+    let (due, next_due) = {
+        let mut tables = tables.lock().unwrap();
+        let (due, next_due) = tables.take_due(Instant::now(), RELAY_PACKET_SPACING);
+        let due: Vec<_> = due
+            .into_iter()
+            .filter_map(|packet| Some((*tables.get_link_key(&packet.session_id)?, packet)))
+            .collect();
+        (due, next_due)
+    };
+    for (link_key, due) in due {
+        let packet = wrap_for_recipient(&link_key, &due.session_id, &due.id, &due.payload);
+        // Stays queued until acknowledged, so a failed send is resent like
+        // a lost one.
+        match socket.send_to(&packet, due.addr).await {
+            Ok(_) => debug!("Sent {} bytes (re-encrypted) to {}", packet.len(), due.addr),
+            Err(e) => error!(
+                "Failed to forward {} bytes to {}: {}",
+                packet.len(),
+                due.addr,
+                e
+            ),
+        }
     }
-
-    for (addr, recipient_session_id) in &dummy_targets {
-        let link_key = {
-            let tables = tables.lock().unwrap();
-            match tables.get_link_key(recipient_session_id) {
-                Some(k) => *k,
-                None => continue,
-            }
-        };
-
-        let packet = dummy_packet(&link_key, recipient_session_id)?;
-        socket.send_to(&packet, addr).await?;
-        info!("Sent DUMMY packet ({} bytes) to {}", packet.len(), addr);
-    }
-
-    Ok(())
+    next_due
 }
 
 #[cfg(test)]
@@ -491,9 +490,9 @@ mod tests {
 
         {
             let mut tables_lock = tables.lock().unwrap();
-            let msgs = tables_lock.outbound_messages();
+            let (msgs, _) = tables_lock.take_due(Instant::now(), RELAY_PACKET_SPACING);
             assert_eq!(msgs.len(), 1);
-            assert_eq!(msgs[0].receiver_token, routing_token);
+            assert_eq!(msgs[0].addr, socket_address);
             assert_eq!(msgs[0].payload, b"Hello");
         }
     }
@@ -508,20 +507,19 @@ mod tests {
         OsRng.fill_bytes(&mut link_key);
         let session_id = [7u8; 4];
 
-        let dummy = dummy_packet(&link_key, &session_id).unwrap();
+        let dummy = dummy_packet(&link_key, &session_id);
         let chat = wrap_for_recipient(
             &link_key,
             &session_id,
             &[0x42; 16],
-            &[0x01; CHAT_INNER_PAYLOAD_LEN],
-        )
-        .unwrap();
-        assert_eq!(dummy.len(), 1150, "same size as a client's chat packet");
+            &[0x07; CHAT_INNER_PAYLOAD_LEN],
+        );
+        assert_eq!(dummy.len(), 1154, "same size as a client's FEC chat packet");
         assert_eq!(dummy.len(), chat.len());
         assert_eq!(dummy[..5], chat[..5], "same packet type and session id");
 
-        // Framed as the client expects: the zero routing prefix it strips,
-        // then an inner payload starting with the type byte it ignores.
+        // Framed as the client expects: an all-zero delivery ID (nothing to
+        // ack), then an inner payload starting with the type byte it ignores.
         let plaintext = XChaCha20Poly1305::new(Key::from_slice(&link_key))
             .decrypt(XNonce::from_slice(&dummy[5..29]), &dummy[29..])
             .unwrap();
@@ -610,8 +608,9 @@ mod tests {
         // Ensure it's in the offline queue, NOT the outbound queue
         {
             let mut tables_lock = tables.lock().unwrap();
-            let msgs = tables_lock.outbound_messages();
+            let (msgs, next_due) = tables_lock.take_due(Instant::now(), RELAY_PACKET_SPACING);
             assert_eq!(msgs.len(), 0, "Should not be outbound yet");
+            assert!(next_due.is_none(), "an offline recipient schedules nothing");
             assert_eq!(
                 tables_lock
                     .get_queued_packets(&receiver_token)
@@ -643,7 +642,7 @@ mod tests {
         // 5. Check that the queued packet was flushed to the outbound queue
         {
             let mut tables_lock = tables.lock().unwrap();
-            let msgs = tables_lock.outbound_messages();
+            let (msgs, _) = tables_lock.take_due(Instant::now(), RELAY_PACKET_SPACING);
             assert_eq!(
                 msgs.len(),
                 1,
@@ -751,33 +750,152 @@ mod tests {
             .expand(b"wireguard-lite-link", &mut sender_link_key)
             .unwrap();
 
-        // 2. Spam 5 more messages than fit to the offline token
-        for i in 0..stores::MAX_QUEUED_PER_TOKEN + 5 {
-            let msg = format!("Spam {}", i);
-            let forward_pkt = create_data_packet(
-                sender_link_key,
-                sender_session,
-                receiver_token,
-                msg.as_bytes(),
-            );
+        // 2. Spam an offline token with more than its queue holds
+        let cap = crate::stores::MAX_QUEUED_BYTES_PER_TOKEN;
+        let packet = vec![0xAB; 1000];
+        let fits = cap / packet.len();
+        for i in 0..fits + 5 {
+            let mut msg = packet.clone();
+            msg[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let forward_pkt =
+                create_data_packet(sender_link_key, sender_session, receiver_token, &msg);
             handle_request(&tables, &server_identity, sender_addr, &forward_pkt).unwrap();
         }
 
-        // 3. Ensure offline queue is strictly bounded
+        // 3. The queue is bounded by bytes, and keeps the *oldest* packets:
+        // later ones are refused, rather than earlier ones evicted.
         {
             let tables_lock = tables.lock().unwrap();
             let queue = tables_lock.get_queued_packets(&receiver_token).unwrap();
             assert_eq!(
                 queue.len(),
-                stores::MAX_QUEUED_PER_TOKEN,
-                "Offline queue must drop messages beyond limit"
+                fits,
+                "Offline queue must refuse packets beyond limit"
             );
-
-            // Because it pops the front (oldest), the first 5 are gone
-            assert_eq!(queue.front().unwrap().payload, b"Spam 5");
-            let last = format!("Spam {}", stores::MAX_QUEUED_PER_TOKEN + 4);
-            assert_eq!(queue.back().unwrap().payload, last.as_bytes());
+            assert_eq!(queue.front().unwrap().payload[..8], 0u64.to_be_bytes());
+            assert_eq!(
+                queue.back().unwrap().payload[..8],
+                (fits as u64 - 1).to_be_bytes()
+            );
         }
+    }
+
+    /// A backlog for an online recipient comes out whole, in order, and one
+    /// packet per pacing slot — never all at once. Then nothing more until
+    /// the first unacknowledged packet is due a resend.
+    #[test]
+    fn test_backlog_is_paced_out_whole_and_in_order() {
+        let mut tables = Tables::new();
+        let token = [0xDD; 16];
+        let addr = SocketAddr::from(([127, 0, 0, 1], 50003));
+        tables.update_metadata(token, addr, [0xEE; 4], METADATA_TTL);
+        for i in 0..300u32 {
+            tables.enqueue_message(token, i.to_be_bytes().to_vec(), MESSAGE_TTL);
+        }
+        let start = Instant::now();
+        let mut now = start;
+        for i in 0..300u32 {
+            let (due, next_due) = tables.take_due(now, RELAY_PACKET_SPACING);
+            assert_eq!(due.len(), 1, "one packet per slot");
+            assert_eq!(due[0].payload, i.to_be_bytes());
+            let (early, _) = tables.take_due(now, RELAY_PACKET_SPACING);
+            assert!(early.is_empty(), "nothing before the next slot");
+            if i < 299 {
+                assert_eq!(next_due, Some(now + RELAY_PACKET_SPACING));
+            } else {
+                assert_eq!(
+                    next_due,
+                    Some(start + crate::stores::FIRST_RESEND_DELAY),
+                    "all sent; next is the first resend"
+                );
+            }
+            now += RELAY_PACKET_SPACING;
+        }
+    }
+
+    /// Recipients are paced independently: one's backlog doesn't hold up
+    /// another's packets.
+    #[test]
+    fn test_recipients_are_paced_independently() {
+        let mut tables = Tables::new();
+        let (a, b) = ([0xA1; 16], [0xB1; 16]);
+        tables.update_metadata(
+            a,
+            SocketAddr::from(([127, 0, 0, 1], 1)),
+            [1; 4],
+            METADATA_TTL,
+        );
+        tables.update_metadata(
+            b,
+            SocketAddr::from(([127, 0, 0, 1], 2)),
+            [2; 4],
+            METADATA_TTL,
+        );
+        for _ in 0..10 {
+            tables.enqueue_message(a, vec![0xA], MESSAGE_TTL);
+        }
+        tables.enqueue_message(b, vec![0xB], MESSAGE_TTL);
+        let (due, _) = tables.take_due(Instant::now(), RELAY_PACKET_SPACING);
+        let mut payloads: Vec<_> = due.iter().map(|p| p.payload.clone()).collect();
+        payloads.sort();
+        assert_eq!(payloads, [vec![0xA], vec![0xB]]);
+    }
+
+    /// The whole forwarding path: packets queued for an online recipient are
+    /// re-encrypted under *their* link key, prefixed with their delivery ID,
+    /// and sent over UDP — all of them, in order, paced, as soon as the
+    /// outbound task is woken. They stay queued until acked.
+    #[tokio::test]
+    async fn test_outbound_forwarding_reencrypts_and_paces_every_packet() {
+        let tables = Arc::new(Mutex::new(Tables::new()));
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let recipient = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let wake = Arc::new(Notify::new());
+        spawn_outbound_task(Arc::clone(&tables), relay, Arc::clone(&wake));
+        let (session, token, link_key) = ([0x11; 4], [0x22; 16], [0x33; 32]);
+        {
+            let mut t = tables.lock().unwrap();
+            t.register_link(session, link_key);
+            t.update_metadata(
+                token,
+                recipient.local_addr().unwrap(),
+                session,
+                METADATA_TTL,
+            );
+            for i in 0..60u8 {
+                t.enqueue_message(token, vec![i; 40], MESSAGE_TTL);
+            }
+        }
+        let started = Instant::now();
+        wake.notify_one();
+
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
+        let mut buf = [0u8; 2048];
+        let mut ids = Vec::new();
+        for i in 0..60u8 {
+            let (len, _) = recipient.recv_from(&mut buf).await.unwrap();
+            let packet = &buf[..len];
+            assert_eq!(packet[0], TYPE_DATA);
+            assert_eq!(packet[1..5], session);
+            let inner = cipher
+                .decrypt(XNonce::from_slice(&packet[5..29]), &packet[29..])
+                .unwrap();
+            ids.push(DeliveryId::try_from(&inner[..16]).unwrap());
+            assert_eq!(inner[16..], [i; 40]);
+        }
+        assert!(started.elapsed() >= RELAY_PACKET_SPACING * 59, "paced");
+        let mut t = tables.lock().unwrap();
+        assert_eq!(
+            t.get_queued_packets(&token).unwrap().len(),
+            60,
+            "awaiting acks"
+        );
+        assert_eq!(
+            t.acknowledge(&token, &session, &ids),
+            60,
+            "IDs match the queue"
+        );
+        assert!(t.get_queued_packets(&token).is_none());
     }
 
     #[test]

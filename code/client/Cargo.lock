@@ -157,6 +157,7 @@ dependencies = [
  "argon2",
  "chacha20poly1305",
  "ed25519-dalek",
+ "fec",
  "hex",
  "hkdf",
  "hmac",
@@ -329,6 +330,13 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "fec"
+version = "0.1.0"
+dependencies = [
+ "raptorq",
+]
 
 [[package]]
 name = "fiat-crypto"
@@ -714,6 +722,12 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "raptorq"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "redox_syscall"
