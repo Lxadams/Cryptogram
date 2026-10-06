@@ -103,12 +103,21 @@ fn try_acquire_session_lock(lock_path: &Path) -> Result<File, String> {
         .truncate(true)
         .open(lock_path)
         .map_err(|e| e.to_string())?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => {
-            Err("This identity is already logged in elsewhere on this machine.".to_string())
+
+    #[cfg(target_os = "android")]
+    {
+        Ok(file)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => {
+                Err("This identity is already logged in elsewhere on this machine.".to_string())
+            }
+            Err(TryLockError::Error(e)) => Err(e.to_string()),
         }
-        Err(TryLockError::Error(e)) => Err(e.to_string()),
     }
 }
 
