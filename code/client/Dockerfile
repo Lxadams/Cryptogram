@@ -1,5 +1,8 @@
 FROM rust:1-slim AS builder
 WORKDIR /app
+# Path dependency of the client (RaptorQ FEC), resolved as ../fec.
+COPY fec/Cargo.toml ./fec/
+COPY fec/src ./fec/src
 COPY client/Cargo.toml client/Cargo.lock ./client/
 COPY client/src ./client/src
 WORKDIR /app/client

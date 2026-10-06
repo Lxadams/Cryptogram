@@ -24,9 +24,14 @@ mod chunks;
 mod history;
 mod padding;
 mod storage;
+mod transport;
+pub use chunks::MAX_MESSAGE_LEN;
 pub use history::{ChatHistory, StoredMessage};
 use std::collections::HashSet;
 pub use storage::{ClientStateDto, IdentityStateStore};
+pub use transport::{BurstSender, send_burst};
+#[cfg(test)]
+mod test_support;
 
 type HmacSha256 = Hmac<Sha256>;
 pub type SessionId = [u8; 4];
@@ -35,7 +40,11 @@ pub type RoutingToken = [u8; 16];
 /// packets, then an optional PQ inject packet to send after them. Every one
 /// is safe to deliver more than once, in any order, so a resend should
 /// resend them all alike, the PQ inject included.
-pub type OutgoingPackets = (Vec<Vec<u8>>, Option<Vec<u8>>);
+#[cfg(test)]
+pub(crate) type OutgoingPackets = (Vec<Vec<u8>>, Option<Vec<u8>>);
+/// The same pair before link encryption, from `encrypt_message_payloads`:
+/// a message's inner 0x01 chunk payloads and its optional 0x05 PQ inject.
+type MessagePayloads = (Vec<Vec<u8>>, Option<Vec<u8>>);
 
 // PQ injection interval: inject fresh Kyber entropy every N ratchet steps
 // (one per chunk; see `create_encrypted_packets`)
@@ -518,6 +527,10 @@ pub struct Client {
     /// Chunks of long incoming messages still waiting on the rest (see
     /// `chunks`). Live local state, not persisted, like `inbox`.
     reassembler: chunks::Reassembler,
+    /// FEC receive state: half-rebuilt symbol bursts (0x07) and messages
+    /// parked until the PQ inject they depend on arrives — see
+    /// `transport`. Transient, like `inbox`: never persisted.
+    pub(crate) fec_rx: transport::FecReceiver,
 }
 
 impl Client {
@@ -543,6 +556,7 @@ impl Client {
             identity_store: None,
             last_recorded_id: None,
             reassembler: chunks::Reassembler::default(),
+            fec_rx: Default::default(),
         }
     }
 
@@ -625,7 +639,7 @@ impl Client {
 
     /// Build a signed presence ping for `target_token` (see
     /// `PresencePayload`) and link-encrypt it for the relay, the same way
-    /// `create_encrypted_packets` does for a chat message. Deliberately
+    /// `create_fec_packets` does for a chat message. Deliberately
     /// outside the E2E double ratchet — see the doc comment on
     /// `PresencePayload` for why.
     pub fn generate_presence_packet(&self, target_token: RoutingToken) -> Vec<u8> {
@@ -790,25 +804,76 @@ impl Client {
         );
     }
 
-    /// Encrypt a message. Returns (message_packets, optional_pq_inject_packet);
-    /// send them in that order.
-    ///
-    /// The message is split into chunks (see `chunks`), each padded to a
-    /// fixed size (see `padding`) and sent as its own ratcheted chat packet,
-    /// so every packet is 1150 bytes on the wire whatever the message
-    /// length. Messages over `chunks::MAX_MESSAGE_LEN` bytes are rejected
-    /// before the ratchet moves.
-    ///
-    /// Every PQ_INJECT_INTERVAL ratchet steps, a PQ inject packet is
-    /// generated automatically — checked once per message, not per chunk, so
-    /// it always follows the message's last chunk. It carries the position
-    /// it applies at, so the receiver copes with it arriving out of order
-    /// (see `SymmetricSessionState::accept_pq_inject`).
-    pub fn create_encrypted_packets(
+    /// Encrypt a message as single link-encrypted datagrams: (message_packets,
+    /// optional_pq_inject_packet); send them in that order. Test-only — real
+    /// front ends send with `create_fec_packets`, which never lets the
+    /// inject travel apart from its message.
+    #[cfg(test)]
+    pub(crate) fn create_encrypted_packets(
         &mut self,
         target_token: RoutingToken,
         plaintext: &[u8],
     ) -> Result<OutgoingPackets> {
+        let (msg_payloads, pq_payload) = self.encrypt_message_payloads(target_token, plaintext)?;
+        let msg_packets = msg_payloads
+            .iter()
+            .map(|payload| self.wrap_link_encryption(target_token, payload))
+            .collect();
+        let pq_inject_packet =
+            pq_payload.map(|inner| self.wrap_link_encryption(target_token, &inner));
+        Ok((msg_packets, pq_inject_packet))
+    }
+
+    /// Encrypt a message for a lossy link: its chunk packets and (when due)
+    /// its PQ inject travel together as one burst of sealed FEC packets,
+    /// sized to survive heavy loss — see `transport`. Hand the result to a
+    /// `BurstSender`. Messages over `MAX_MESSAGE_LEN` bytes are rejected
+    /// before the ratchet moves.
+    pub fn create_fec_packets(
+        &mut self,
+        target_token: RoutingToken,
+        plaintext: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        let (msg_payloads, pq_payload) = self.encrypt_message_payloads(target_token, plaintext)?;
+        let session = &self.e2e_sessions[&target_token];
+        // The seq number of the message's last chunk doubles as its FEC
+        // object id: unique within the session, unlike a random id.
+        // (`FecReceiver` keeps each session's ids apart.)
+        let object_id = (session.send_count - 1) as u32;
+        let symbols = transport::encode_message(
+            &session.root_key,
+            &self.identity.routing_token,
+            &target_token,
+            object_id,
+            &msg_payloads,
+            pq_payload.as_deref(),
+        )?;
+        Ok(symbols
+            .iter()
+            .map(|inner| self.wrap_link_encryption(target_token, inner))
+            .collect())
+    }
+
+    /// Ratchet-encrypt `plaintext` for `target_token`. Returns the inner (not
+    /// yet link-encrypted) 0x01 payload of each chunk and, when due, the 0x05
+    /// PQ inject payload that follows them.
+    ///
+    /// The message is split into chunks (see `chunks`), each padded to a
+    /// fixed size (see `padding`) and encrypted as its own ratcheted chat
+    /// payload, so every one is the same size whatever the message length.
+    /// Messages over `chunks::MAX_MESSAGE_LEN` bytes are rejected before the
+    /// ratchet moves.
+    ///
+    /// Every PQ_INJECT_INTERVAL ratchet steps, a PQ inject is generated
+    /// automatically — checked once per message, not per chunk, so it always
+    /// follows the message's last chunk. It carries the position it applies
+    /// at, so the receiver copes with it arriving out of order (see
+    /// `SymmetricSessionState::accept_pq_inject`).
+    fn encrypt_message_payloads(
+        &mut self,
+        target_token: RoutingToken,
+        plaintext: &[u8],
+    ) -> Result<MessagePayloads> {
         let padded_chunks = chunks::split(plaintext)?
             .iter()
             .map(|chunk| padding::pad(chunk))
@@ -869,13 +934,8 @@ impl Client {
         self.save();
         self.record_message(target_token, true, plaintext);
 
-        // Phase 2: link-encrypt everything (immutable borrow on self)
-        let msg_packets = e2e_payloads
-            .iter()
-            .map(|payload| self.wrap_link_encryption(target_token, payload))
-            .collect();
-
-        let pq_inject_packet = pq_ct.map(|(applies_at, kyber_ct, binding)| {
+        // Phase 2: build the signed PQ inject payload (immutable borrow on self)
+        let pq_payload = pq_ct.map(|(applies_at, kyber_ct, binding)| {
             let pqi_payload = PQInjectPayload::generate(
                 &self.identity,
                 target_token,
@@ -885,10 +945,10 @@ impl Client {
             );
             let mut inner = vec![0x05];
             inner.extend_from_slice(&pqi_payload.to_bytes());
-            self.wrap_link_encryption(target_token, &inner)
+            inner
         });
 
-        Ok((msg_packets, pq_inject_packet))
+        Ok((e2e_payloads, pq_payload))
     }
 
     /// The checks every signed control payload (KeyExchange,
@@ -954,77 +1014,8 @@ impl Client {
 
         match pkt_type {
             0x01 => {
-                // Msg: [16-byte sender_token | 8-byte seq_no | 24-byte nonce |
-                //       ciphertext of a `padding::PADDED_LEN`-byte padded block]
-                // Each one carries one chunk of a message (see `chunks`).
-                if pkt_data.len() < 16 + 8 + 24 {
-                    return Err(anyhow!("Msg payload too small"));
-                }
-                let mut sender_token = [0u8; 16];
-                sender_token.copy_from_slice(&pkt_data[0..16]);
-                let seq_no = u64::from_be_bytes(pkt_data[16..24].try_into().unwrap());
-                let mut nonce_bytes = [0u8; 24];
-                nonce_bytes.copy_from_slice(&pkt_data[24..48]);
-                let nonce = XNonce::from_slice(&nonce_bytes);
-                let ciphertext = &pkt_data[48..];
-
-                if let Some(session) = self.e2e_sessions.get_mut(&sender_token) {
-                    // Already received — typically a resent copy — so its key
-                    // is used up. Nothing's wrong; don't report it as one.
-                    if seq_no < session.recv_count && !session.skip_dict.contains_key(&seq_no) {
-                        return Ok(None);
-                    }
-                    if let Some(padded) = session.try_decrypt(seq_no, nonce, ciphertext) {
-                        // The ratchet has advanced either way, so persist
-                        // that before deciding whether to keep the message.
-                        self.save();
-                        // Any authenticated chunk shows the peer is online,
-                        // even if its message isn't complete yet.
-                        self.last_seen.insert(sender_token, Instant::now());
-                        let chunk = match padding::unpad(&padded) {
-                            Ok(chunk) => chunk,
-                            Err(e) => {
-                                println!(
-                                    ">> Dropped message from {}: {} (sender on an older client?)",
-                                    hex::encode(&sender_token[0..4]),
-                                    e
-                                );
-                                return Ok(None);
-                            }
-                        };
-                        let pt = match self.reassembler.accept(sender_token, chunk) {
-                            Ok(Some(message)) => message,
-                            // Waiting on the rest of the message's chunks.
-                            Ok(None) => return Ok(None),
-                            Err(e) => {
-                                println!(
-                                    ">> Dropped message chunk from {}: {}",
-                                    hex::encode(&sender_token[0..4]),
-                                    e
-                                );
-                                return Ok(None);
-                            }
-                        };
-                        println!(
-                            ">> [From {}]: {}",
-                            hex::encode(&sender_token[0..4]),
-                            String::from_utf8_lossy(&pt)
-                        );
-                        // Also hand it to any polling consumer (e.g. a GUI) —
-                        // see the `inbox` field doc comment above.
-                        self.record_message(sender_token, false, &pt);
-                        self.inbox.push((sender_token, pt, self.last_recorded_id));
-                    } else {
-                        println!(
-                            ">> Received packet from {} but decryption failed (out of sync?).",
-                            hex::encode(&sender_token[0..4])
-                        );
-                    }
-                } else {
-                    println!(
-                        ">> Received packet from unknown sender {}. No E2E session found.",
-                        hex::encode(&sender_token[0..4])
-                    );
+                if let Some(sender) = self.receive_message(payload, None)? {
+                    self.retry_deferred(sender)?;
                 }
                 Ok(None)
             }
@@ -1159,6 +1150,9 @@ impl Client {
                                         hex::encode(&pqi.routing_token[0..4]),
                                         pqi.applies_at
                                     );
+                                    // Messages held back for this refresh
+                                    // may decrypt now.
+                                    self.retry_deferred(pqi.routing_token)?;
                                 }
                             } else {
                                 println!(
@@ -1196,11 +1190,192 @@ impl Client {
                 }
                 Ok(None)
             }
-            // Relay cover traffic (a "dummy packet"), sized like a chat
-            // message so the two look alike on the wire. Nothing to do.
+            // Relay cover traffic (a "dummy packet"), sized like a forwarded
+            // packet so the two look alike on the wire. Nothing to do.
             0x00 => Ok(None),
+            0x07 => {
+                // FEC symbol: [16-byte sender token | 24-byte nonce | sealed
+                // symbol] — see `transport`. Only the two ends of a session
+                // hold the seal key, so anything else is silently dropped.
+                if pkt_data.len() < 16 {
+                    return Err(anyhow!("FEC symbol payload too small"));
+                }
+                let sender_token: RoutingToken = pkt_data[..16].try_into().unwrap();
+                let Some(session) = self.e2e_sessions.get(&sender_token) else {
+                    return Ok(None);
+                };
+                let root_key = session.root_key;
+                let Some(symbol) = self.fec_rx.open(
+                    &root_key,
+                    &sender_token,
+                    &self.identity.routing_token,
+                    &pkt_data[16..],
+                ) else {
+                    println!(">> [SECURITY ALERT] Dropped FEC symbol that failed authentication.");
+                    return Ok(None);
+                };
+                let object = match self
+                    .fec_rx
+                    .reassemble(sender_token, &symbol, Instant::now())
+                {
+                    Ok(Some(object)) => object,
+                    Ok(None) => return Ok(None),
+                    Err(e) => {
+                        println!(
+                            ">> Dropped FEC symbol from {}: {e}",
+                            hex::encode(&sender_token[0..4])
+                        );
+                        return Ok(None);
+                    }
+                };
+                let Some(parts) = transport::unbundle(&object) else {
+                    println!(">> Dropped malformed FEC object.");
+                    return Ok(None);
+                };
+                let mut delivered = false;
+                for part in parts {
+                    // Only what `create_fec_packets` bundles (a message and
+                    // its PQ inject), and only on the sealing peer's own
+                    // behalf: both carry the sender's token right after the
+                    // type byte.
+                    if part.get(1..17) != Some(&sender_token[..]) {
+                        continue;
+                    }
+                    match part[0] {
+                        // The seal already proved who sent it, so a message
+                        // that can't be decrypted yet may be held back.
+                        0x01 => {
+                            delivered |=
+                                self.receive_message(part, Some(Instant::now()))?.is_some();
+                        }
+                        0x05 => {
+                            self.handle_incoming_packet(part)?;
+                        }
+                        _ => {}
+                    }
+                }
+                // Once the whole bundle is in: its inject (if any) has
+                // already triggered a retry of its own.
+                if delivered {
+                    self.retry_deferred(sender_token)?;
+                }
+                Ok(None)
+            }
             _ => Ok(None),
         }
+    }
+
+    /// Decrypt a 0x01 chat payload: [16-byte sender_token | 8-byte seq_no |
+    /// 24-byte nonce | ciphertext of a `padding::PADDED_LEN`-byte padded
+    /// block]. Each one carries one chunk of a message (see `chunks`).
+    /// Returns the sender if it decrypted (moving their receive chain on),
+    /// whether or not that completed a message.
+    ///
+    /// `park` is `Some(parked_at)` only for a payload whose sender is already
+    /// authenticated (it arrived sealed in an FEC bundle): if it can't be
+    /// decrypted yet — it was encrypted after a PQ inject still in flight —
+    /// it's held for `retry_deferred`, keeping its original `parked_at` so
+    /// retries never extend its lifetime. Anyone can forge a bare 0x01, so
+    /// those are never held.
+    fn receive_message(
+        &mut self,
+        payload: &[u8],
+        park: Option<Instant>,
+    ) -> Result<Option<RoutingToken>> {
+        let pkt_data = &payload[1..];
+        if pkt_data.len() < 16 + 8 + 24 {
+            return Err(anyhow!("Msg payload too small"));
+        }
+        let sender_token: RoutingToken = pkt_data[0..16].try_into().unwrap();
+        let seq_no = u64::from_be_bytes(pkt_data[16..24].try_into().unwrap());
+        let nonce = XNonce::from_slice(&pkt_data[24..48]);
+        let ciphertext = &pkt_data[48..];
+
+        let Some(session) = self.e2e_sessions.get_mut(&sender_token) else {
+            println!(
+                ">> Received packet from unknown sender {}. No E2E session found.",
+                hex::encode(&sender_token[0..4])
+            );
+            return Ok(None);
+        };
+        // Already received — typically a resent copy — so its key is used
+        // up. Nothing's wrong; don't report it as one.
+        if seq_no < session.recv_count && !session.skip_dict.contains_key(&seq_no) {
+            return Ok(None);
+        }
+        let Some(padded) = session.try_decrypt(seq_no, nonce, ciphertext) else {
+            match park {
+                // Older seq numbers can never succeed later, so those aren't kept.
+                Some(parked_at) if seq_no >= session.recv_count => {
+                    println!(
+                        ">> Holding message {seq_no} from {}: not decryptable yet (PQ ratchet update in flight?).",
+                        hex::encode(&sender_token[0..4])
+                    );
+                    self.fec_rx.defer(
+                        sender_token,
+                        seq_no,
+                        payload.to_vec(),
+                        parked_at,
+                        Instant::now(),
+                    );
+                }
+                _ => println!(
+                    ">> Received packet from {} but decryption failed (out of sync?).",
+                    hex::encode(&sender_token[0..4])
+                ),
+            }
+            return Ok(None);
+        };
+        // The ratchet has advanced either way, so persist that before
+        // deciding whether to keep the message.
+        self.save();
+        // Any authenticated chunk shows the peer is online, even if its
+        // message isn't complete yet.
+        self.last_seen.insert(sender_token, Instant::now());
+        let chunk = match padding::unpad(&padded) {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                println!(
+                    ">> Dropped message from {}: {} (sender on an older client?)",
+                    hex::encode(&sender_token[0..4]),
+                    e
+                );
+                return Ok(Some(sender_token));
+            }
+        };
+        let pt = match self.reassembler.accept(sender_token, chunk) {
+            Ok(Some(message)) => message,
+            // Waiting on the rest of the message's chunks.
+            Ok(None) => return Ok(Some(sender_token)),
+            Err(e) => {
+                println!(
+                    ">> Dropped message chunk from {}: {}",
+                    hex::encode(&sender_token[0..4]),
+                    e
+                );
+                return Ok(Some(sender_token));
+            }
+        };
+        println!(
+            ">> [From {}]: {}",
+            hex::encode(&sender_token[0..4]),
+            String::from_utf8_lossy(&pt)
+        );
+        // Also hand it to any polling consumer (e.g. a GUI) — see the
+        // `inbox` field doc comment above.
+        self.record_message(sender_token, false, &pt);
+        self.inbox.push((sender_token, pt, self.last_recorded_id));
+        Ok(Some(sender_token))
+    }
+
+    /// Replay, in seq order, payloads from `sender` held back as not yet
+    /// decryptable, now that a PQ inject or an earlier chunk has moved
+    /// their receive chain on.
+    fn retry_deferred(&mut self, sender: RoutingToken) -> Result<()> {
+        for (parked_at, payload) in self.fec_rx.take_deferred(&sender, Instant::now()) {
+            self.receive_message(&payload, Some(parked_at))?;
+        }
+        Ok(())
     }
 }
 
@@ -1243,17 +1418,8 @@ pub async fn perform_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{connected_pair, strip_link};
     use pqcrypto_traits::kem::PublicKey as _;
-
-    /// Helper: strip link encryption from a packet (simulate server forwarding)
-    fn strip_link(packet: &[u8], link_key: &[u8; 32]) -> Vec<u8> {
-        let mut nonce_bytes = [0u8; 24];
-        nonce_bytes.copy_from_slice(&packet[5..29]);
-        let link_nonce = XNonce::from_slice(&nonce_bytes);
-        let link_cipher = XChaCha20Poly1305::new(Key::from_slice(link_key));
-        let decrypted = link_cipher.decrypt(link_nonce, &packet[29..]).unwrap();
-        decrypted[16..].to_vec() // strip routing token
-    }
 
     #[test]
     fn test_passcode_hash_roundtrip_and_rejection() {
@@ -2653,7 +2819,7 @@ mod tests {
         // A refresh queued at the relay while Bob was offline arrives with a
         // timestamp far in the past. It must still be applied: dropping it
         // would leave every later message undecryptable.
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let msgs = send_messages(&mut alice, &bob, 5);
         let refresh = msgs[4].1.clone().expect("refresh after message 5");
 
@@ -2916,7 +3082,7 @@ mod tests {
 
     #[test]
     fn test_pq_inject_arriving_early_is_held_until_its_position() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let msgs = send_messages(&mut alice, &bob, 6);
         let refresh = msgs[4].1.clone().expect("refresh after message 5");
 
@@ -2934,7 +3100,7 @@ mod tests {
 
     #[test]
     fn test_pq_inject_arriving_late_recovers_when_message_is_resent() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let msgs = send_messages(&mut alice, &bob, 6);
         let refresh = msgs[4].1.clone().expect("refresh after message 5");
 
@@ -2957,7 +3123,7 @@ mod tests {
 
     #[test]
     fn test_resent_pq_inject_and_message_copies_are_ignored() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let msgs = send_messages(&mut alice, &bob, 6);
         let refresh = msgs[4].1.clone().expect("refresh after message 5");
 
@@ -2982,7 +3148,7 @@ mod tests {
 
     #[test]
     fn test_pq_inject_replayed_into_a_new_session_is_rejected() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let alice_token = alice.identity.routing_token;
         let msgs = send_messages(&mut alice, &bob, 5);
         let old_refresh = msgs[4].1.clone().expect("refresh after message 5");
@@ -3005,7 +3171,7 @@ mod tests {
 
     #[test]
     fn test_several_pq_injects_ahead_of_out_of_order_messages() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let msgs = send_messages(&mut alice, &bob, 11);
         let refresh_at_5 = msgs[4].1.clone().expect("refresh after message 5");
         let refresh_at_10 = msgs[9].1.clone().expect("refresh after message 10");
@@ -3030,33 +3196,9 @@ mod tests {
     // Presence Ping Tests
     // ==========================================
 
-    /// Runs the same 3-way handshake as `test_full_3way_handshake` and
-    /// returns the two established clients, to avoid repeating the setup
-    /// in every presence test below.
-    fn established_pair() -> (Client, Client) {
-        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
-        let mut alice = Client::new(server_addr);
-        let mut bob = Client::new(server_addr);
-
-        alice
-            .pending_contacts
-            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
-        let alice_kx =
-            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
-        let mut kx_inner = vec![0x02];
-        kx_inner.extend_from_slice(&alice_kx.to_bytes());
-        let bob_reply = bob.handle_incoming_packet(&kx_inner).unwrap().unwrap();
-        let inner = strip_link(&bob_reply, &bob.link_master_key);
-        let alice_reply = alice.handle_incoming_packet(&inner).unwrap().unwrap();
-        let inner2 = strip_link(&alice_reply, &alice.link_master_key);
-        bob.handle_incoming_packet(&inner2).unwrap();
-
-        (alice, bob)
-    }
-
     #[test]
     fn test_presence_ping_marks_peer_online() {
-        let (alice, mut bob) = established_pair();
+        let (alice, mut bob) = connected_pair();
         let freshness = Duration::from_secs(60);
 
         assert!(
@@ -3080,7 +3222,7 @@ mod tests {
 
     #[test]
     fn test_presence_ping_expires_after_freshness_window() {
-        let (alice, mut bob) = established_pair();
+        let (alice, mut bob) = connected_pair();
         let tiny_freshness = Duration::from_millis(20);
 
         let ping = alice.generate_presence_packet(bob.identity.routing_token);
@@ -3097,7 +3239,7 @@ mod tests {
 
     #[test]
     fn test_chat_message_also_marks_peer_online() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let freshness = Duration::from_secs(60);
 
         let (msg_pkt, _) = alice
@@ -3115,7 +3257,7 @@ mod tests {
 
     #[test]
     fn test_chat_packets_are_fixed_size_and_unpadded_on_receive() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let one_full_chunk = "x".repeat(chunks::CHUNK_DATA_LEN);
         for text in ["", "hi", "héllo 👋", one_full_chunk.as_str()] {
             let (pkts, _) = alice
@@ -3137,7 +3279,7 @@ mod tests {
 
     #[test]
     fn test_long_message_split_and_reassembled_out_of_order() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         // Three chunks, with an emoji straddling the second boundary.
         let text = format!(
             "{}👋{}",
@@ -3169,7 +3311,7 @@ mod tests {
 
     #[test]
     fn test_pq_inject_sent_once_after_last_chunk() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let bob_token = bob.identity.routing_token;
         let alice_token = alice.identity.routing_token;
 
@@ -3211,7 +3353,7 @@ mod tests {
 
     #[test]
     fn test_oversized_message_rejected_without_advancing_ratchet() {
-        let (mut alice, bob) = established_pair();
+        let (mut alice, bob) = connected_pair();
         let bob_token = bob.identity.routing_token;
         let count_before = alice.e2e_sessions[&bob_token].send_count;
         let key_before = alice.e2e_sessions[&bob_token].send_chain_key;
@@ -3229,7 +3371,7 @@ mod tests {
 
     #[test]
     fn test_unpadded_message_from_older_client_is_dropped() {
-        let (mut alice, mut bob) = established_pair();
+        let (mut alice, mut bob) = connected_pair();
         let bob_token = bob.identity.routing_token;
 
         // Encrypt with Alice's real ratchet but skip the padding, as a
@@ -3266,7 +3408,7 @@ mod tests {
 
     #[test]
     fn test_relay_dummy_packet_is_ignored() {
-        let (alice, mut bob) = established_pair();
+        let (alice, mut bob) = connected_pair();
         // What `open_link_packet` hands back for one of the relay's dummy
         // packets: a chat-message-sized inner payload of type 0x00.
         let dummy_inner = [0u8; 1 + 16 + 8 + 24 + padding::PADDED_LEN + 16];
@@ -3280,7 +3422,7 @@ mod tests {
 
     #[test]
     fn test_presence_ping_rejects_wrong_target() {
-        let (alice, mut bob) = established_pair();
+        let (alice, mut bob) = connected_pair();
         let mallory = Client::new("127.0.0.1:4430".parse().unwrap());
 
         // A ping Alice generated for someone else must not mark her online
