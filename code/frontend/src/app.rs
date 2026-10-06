@@ -258,6 +258,20 @@ pub fn App() -> impl IntoView {
     // together with `login` by `log_out`, below.
     let identity = RwSignal::new(None::<api::IdentityDto>);
 
+    // Pick up a session the backend already has before showing anything.
+    // On Android the UI reloads when the app is reopened, while the backend
+    // stays logged in and connected (see `current_session` in commands.rs).
+    let restoring = RwSignal::new(true);
+    leptos::task::spawn_local(async move {
+        if let Ok(Some(session)) = api::current_session().await {
+            login.set(Some(api::LoginDto {
+                pseudonym: session.pseudonym,
+            }));
+            identity.set(session.identity);
+        }
+        restoring.set(false);
+    });
+
     // Tears down the backend session (stops background tasks, releases the
     // identity's session lock — see `logout`'s doc comment in commands.rs)
     // and sends the UI back to the Login screen. Shown whenever `login` is
@@ -295,7 +309,7 @@ pub fn App() -> impl IntoView {
                     </button>
                 </div>
             </div>
-            {move || match (login.get(), identity.get()) {
+            {move || if restoring.get() { ().into_any() } else { match (login.get(), identity.get()) {
                 (None, _) => match auth_screen.get() {
                     AuthScreen::Login => view! {
                         <LoginScreen
@@ -315,7 +329,7 @@ pub fn App() -> impl IntoView {
                 },
                 (Some(_), None) => view! { <ConnectScreen identity=identity /> }.into_any(),
                 (Some(_), Some(id)) => view! { <MainScreen identity=id /> }.into_any(),
-            }}
+            }}}
         </main>
     }
 }

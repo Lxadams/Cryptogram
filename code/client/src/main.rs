@@ -82,10 +82,10 @@ async fn main() -> Result<()> {
         println!("===================");
     }
 
-    // Background task: continuously read inbound UDP packets, strip the
-    // link-layer encryption, and hand the inner E2E payload to the client
-    // state machine. Any protocol reply it produces (e.g. a KeyExchange
-    // response) is sent straight back out.
+    // Background task: continuously read inbound UDP packets and hand them
+    // to the client state machine (see `Client::handle_relay_packet`). Any
+    // protocol reply it produces (e.g. a KeyExchange response) and the ack
+    // the relay waits for are sent straight back out.
     let socket_clone = Arc::clone(&socket);
     let client_clone = Arc::clone(&client);
     tokio::spawn(async move {
@@ -93,10 +93,8 @@ async fn main() -> Result<()> {
         loop {
             if let Ok((len, _)) = socket_clone.recv_from(&mut buf).await {
                 let mut c = client_clone.lock().await;
-                if let Some(e2e_payload) = c.open_link_packet(&buf[..len])
-                    && let Ok(Some(reply)) = c.handle_incoming_packet(&e2e_payload)
-                {
-                    let _ = socket_clone.send_to(&reply, c.server_addr).await;
+                for packet in c.handle_relay_packet(&buf[..len]) {
+                    let _ = socket_clone.send_to(&packet, c.server_addr).await;
                 }
             }
         }

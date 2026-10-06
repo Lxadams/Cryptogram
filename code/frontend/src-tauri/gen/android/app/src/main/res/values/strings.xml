@@ -1,4 +1,11 @@
 <resources>
     <string name="app_name">"e2e-messenger"</string>
     <string name="main_activity_title">"e2e-messenger"</string>
+    <string name="channel_messages">New messages</string>
+    <string name="channel_connection">Background connection</string>
+    <string name="channel_connection_description">Shown while you\'re logged in, so the app keeps receiving messages in the background.</string>
+    <string name="connection_notification_text">Connected. You\'ll be notified of new messages.</string>
+    <string name="message_notification_title_one">New message</string>
+    <string name="message_notification_title_many">%1$d new messages</string>
+    <string name="message_notification_text">From %1$s</string>
 </resources>

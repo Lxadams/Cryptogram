@@ -36,6 +36,24 @@ DEV_PORT=1420
 # two different `identities/` directories, confirmed by testing two peers.
 cd "$FRONTEND_DIR"
 
+# VS Code installed as a snap leaks its sandbox environment into its
+# integrated terminal: GTK_PATH, GIO_MODULE_DIR etc. point at libraries under
+# /snap built against the snap's own glibc, so the WebKitGTK window dies with
+#   symbol lookup error: /snap/core20/current/lib/x86_64-linux-gnu/libpthread.so.0:
+#   undefined symbol: __libc_pthread_init, version GLIBC_PRIVATE
+# It also points XDG_DATA_HOME at ~/snap/code/<rev>/.local/share, which would
+# silently move `app_local_data_dir()` (identity storage) away from the
+# identities saved by peers started from a normal terminal. Undo all of it.
+if [ "${SNAP_NAME:-}" = "code" ] || [[ "${GTK_PATH:-}" == /snap/* ]]; then
+  for var in XDG_DATA_DIRS XDG_CONFIG_DIRS; do
+    orig="${var}_VSCODE_SNAP_ORIG"
+    if [ -n "${!orig:-}" ]; then export "$var=${!orig}"; else unset "$var"; fi
+  done
+  unset GTK_PATH GTK_EXE_PREFIX GTK_IM_MODULE_FILE GIO_MODULE_DIR \
+    GDK_PIXBUF_MODULE_FILE GDK_PIXBUF_MODULEDIR GSETTINGS_SCHEMA_DIR \
+    LOCPATH XDG_DATA_HOME
+fi
+
 # Bash-native "is something listening on this TCP port" check — avoids
 # depending on nc/lsof/curl being installed.
 port_open() {
