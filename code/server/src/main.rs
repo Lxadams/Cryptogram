@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UdpSocket};
 use tracing::{error, info};
 use x25519_dalek::PublicKey as X25519PublicKey;
 mod stores;
@@ -82,15 +82,22 @@ async fn main() -> Result<()> {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4430".to_string());
     let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
     info!("UDP server listening on {}", socket.local_addr()?);
+    let server_pub_hex = hex::encode(server_pub.as_bytes());
+    info!("Server Static Pubkey: {}", server_pub_hex);
+
+    // TCP and UDP have separate port spaces, so the pubkey endpoint can
+    // share the relay's address and clients only need to know one.
+    let http_listener = TcpListener::bind(&bind_addr).await?;
     info!(
-        "Server Static Pubkey: {}",
-        hex::encode(server_pub.as_bytes())
+        "HTTP pubkey endpoint listening on http://{}/pubkey",
+        http_listener.local_addr()?
     );
 
     let tables = Arc::new(Mutex::new(Tables::new()));
 
     spawn_outbound_task(Arc::clone(&tables), Arc::clone(&socket));
     spawn_sweeping_task(Arc::clone(&tables));
+    spawn_pubkey_http_task(http_listener, server_pub_hex);
 
     loop {
         match socket.recv_from(&mut buffer).await {
@@ -240,6 +247,23 @@ fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>) {
                 error!("Error sending outbound messages: {}", e);
             }
             tokio::time::sleep(OUTBOUND_TASK_INTERVAL).await;
+        }
+    });
+}
+
+/// Serve the relay's Ed25519 identity pubkey (hex) at `GET /pubkey`, so
+/// clients can fetch it instead of copying it out of the boot log. This is
+/// plain HTTP, so the response is not authenticated: clients pin the key on
+/// first fetch and refuse a different one later (see `check_relay_pin` in
+/// code/frontend/src-tauri/src/commands.rs).
+fn spawn_pubkey_http_task(listener: TcpListener, server_pub_hex: String) {
+    let app = axum::Router::new().route(
+        "/pubkey",
+        axum::routing::get(move || std::future::ready(server_pub_hex.clone())),
+    );
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            error!("HTTP pubkey endpoint stopped: {}", e);
         }
     });
 }
