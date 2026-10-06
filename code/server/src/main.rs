@@ -14,10 +14,12 @@ use tracing::{debug, error, info, warn};
 use x25519_dalek::PublicKey as X25519PublicKey;
 mod stores;
 
-use crate::stores::{SessionId, Tables};
+use crate::stores::{DeliveryId, SessionId, Tables};
 
 const METADATA_TTL: Duration = Duration::from_secs(1000);
-const MESSAGE_TTL: Duration = Duration::from_secs(1000);
+// How long a packet waits for an offline recipient to come back and
+// acknowledge it. Long enough to cover a phone that's been off for a while.
+const MESSAGE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 // Minimum gap between packets the relay sends one recipient. Half a
 // client's FEC burst spacing (10ms): a live burst passes straight through
 // with the spacing it arrived with — even two peers sending at once keep
@@ -34,6 +36,10 @@ const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
 const TYPE_HANDSHAKE_INIT: u8 = 0;
 const TYPE_DATA: u8 = 1;
 const TYPE_HANDSHAKE_RESP: u8 = 2;
+// Recipient confirming it has forwarded packets, so they can leave its
+// queue. Format: [1 byte type] [4 byte SessionId] [24 byte Nonce]
+// [link-encrypted: 16 byte own routing token | 16 byte delivery ID ...]
+const TYPE_ACK: u8 = 3;
 
 // Relay cover traffic ("dummy packets") is shaped like a forwarded chat
 // packet so the two are the same size on the wire. Clients send chat as FEC
@@ -47,6 +53,10 @@ const CHAT_INNER_PAYLOAD_LEN: usize = 1 + 16 + 24 + 12 + 1024 + 16;
 // Inner type byte of a dummy packet, which the client ignores (the `0x00`
 // arm in `Client::handle_incoming_packet`).
 const INNER_TYPE_DUMMY: u8 = 0x00;
+// Inner type byte of a presence ping (`0x06` in the client). Useless once
+// stale, so it's never held for an offline recipient (see
+// `Tables::enqueue_ephemeral`).
+const INNER_TYPE_PRESENCE: u8 = 0x06;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ServerIdentityDto {
@@ -201,31 +211,7 @@ fn handle_request(
         }
         TYPE_DATA => {
             // Data format: [1 byte type] [4 byte SessionId] [24 byte Nonce] [Ciphertext...]
-            if payload.len() < 1 + 4 + 24 + 16 {
-                // 16 bytes for auth tag. If length is exactly 45, decrypted is 0 bytes (sync)
-                return Err(anyhow!("Data packet too small"));
-            }
-            let mut session_id = [0u8; 4];
-            session_id.copy_from_slice(&payload[1..5]);
-
-            let mut nonce_bytes = [0u8; 24];
-            nonce_bytes.copy_from_slice(&payload[5..29]);
-            let nonce = XNonce::from_slice(&nonce_bytes);
-
-            let ciphertext = &payload[29..];
-
-            let link_key = {
-                let tables = tables.lock().unwrap();
-                match tables.get_link_key(&session_id) {
-                    Some(k) => *k,
-                    None => return Err(anyhow!("Unknown Session ID")),
-                }
-            };
-
-            let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
-            let plaintext = cipher
-                .decrypt(nonce, ciphertext)
-                .map_err(|_| anyhow!("Invalid link encryption MAC"))?;
+            let (session_id, plaintext) = open_link_payload(tables, payload)?;
 
             if plaintext.len() < 16 {
                 return Err(anyhow!("Decrypted payload too small for routing token"));
@@ -240,17 +226,70 @@ fn handle_request(
                 debug!("Sync Request mapped to token {:?}", routing_token);
                 let mut tables = tables.lock().unwrap();
                 tables.update_metadata(routing_token, socket_address, session_id, METADATA_TTL);
+            } else if inner_payload[0] == INNER_TYPE_PRESENCE {
+                let mut tables = tables.lock().unwrap();
+                tables.enqueue_ephemeral(routing_token, inner_payload.to_vec());
             } else {
                 debug!("Forward Request for token {:?}", routing_token);
                 let mut tables = tables.lock().unwrap();
-                if !tables.enqueue_message(routing_token, inner_payload.to_vec(), MESSAGE_TTL) {
+                if tables
+                    .enqueue_message(routing_token, inner_payload.to_vec(), MESSAGE_TTL)
+                    .is_none()
+                {
                     warn!("Queue full for token {:?}; dropped packet", routing_token);
                 }
             }
         }
+        TYPE_ACK => {
+            let (session_id, plaintext) = open_link_payload(tables, payload)?;
+            // Our own routing token, then whole 16-byte delivery IDs.
+            let Some((routing_token, ids)) = plaintext.split_first_chunk::<16>() else {
+                return Err(anyhow!("Malformed ack"));
+            };
+            let (ids, rest) = ids.as_chunks::<16>();
+            if !rest.is_empty() {
+                return Err(anyhow!("Malformed ack"));
+            }
+            let removed = tables
+                .lock()
+                .unwrap()
+                .acknowledge(routing_token, &session_id, ids);
+            debug!("Ack for token {:?}: {} delivered", routing_token, removed);
+        }
         _ => return Err(anyhow!("Unknown packet type")),
     }
     Ok(None)
+}
+
+/// Decrypt a link-encrypted packet (`TYPE_DATA` or `TYPE_ACK`):
+/// [1 byte type] [4 byte SessionId] [24 byte Nonce] [Ciphertext...].
+/// Returns its session ID and plaintext.
+fn open_link_payload(tables: &Arc<Mutex<Tables>>, payload: &[u8]) -> Result<(SessionId, Vec<u8>)> {
+    if payload.len() < 1 + 4 + 24 + 16 {
+        // 16 bytes for auth tag. If length is exactly 45, decrypted is 0 bytes (sync)
+        return Err(anyhow!("Data packet too small"));
+    }
+    let mut session_id = [0u8; 4];
+    session_id.copy_from_slice(&payload[1..5]);
+
+    let nonce = XNonce::from_slice(&payload[5..29]);
+    let ciphertext = &payload[29..];
+
+    let link_key = {
+        let tables = tables.lock().unwrap();
+        match tables.get_link_key(&session_id) {
+            Some(k) => *k,
+            None => return Err(anyhow!("Unknown Session ID")),
+        }
+    };
+
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| anyhow!("Invalid link encryption MAC"))?;
+    // Authentic traffic on this link, so keep it.
+    tables.lock().unwrap().touch_link(&session_id);
+    Ok((session_id, plaintext))
 }
 
 fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>, wake: Arc<Notify>) {
@@ -285,12 +324,14 @@ fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
 }
 
 /// Link-encrypt `inner_payload` for the recipient behind `session_id`,
-/// behind the 16-byte zero routing prefix clients strip off. Real forwarded
-/// messages and dummy packets both go through this, so they're framed
-/// identically on the wire.
+/// behind a 16-byte prefix holding its delivery ID, which the client echoes
+/// back in its ack (all zeros for a dummy packet, which needs no ack). Real
+/// forwarded messages and dummy packets both go through this, so they're
+/// framed identically on the wire.
 fn wrap_for_recipient(
     link_key: &[u8; 32],
     session_id: &SessionId,
+    delivery_id: &DeliveryId,
     inner_payload: &[u8],
 ) -> Vec<u8> {
     use rand_core::{OsRng, RngCore};
@@ -300,7 +341,7 @@ fn wrap_for_recipient(
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
 
-    let mut full_inner = vec![0u8; 16]; // Dummy routing token prefix
+    let mut full_inner = delivery_id.to_vec();
     full_inner.extend_from_slice(inner_payload);
 
     let ciphertext = cipher
@@ -322,7 +363,7 @@ fn wrap_for_recipient(
 fn dummy_packet(link_key: &[u8; 32], session_id: &SessionId) -> Vec<u8> {
     let mut inner = vec![0u8; CHAT_INNER_PAYLOAD_LEN];
     inner[0] = INNER_TYPE_DUMMY;
-    wrap_for_recipient(link_key, session_id, &inner)
+    wrap_for_recipient(link_key, session_id, &[0u8; 16], &inner)
 }
 
 /// Forward every packet whose recipient's pacing slot is due (see
@@ -339,8 +380,9 @@ async fn send_due_packets(tables: &Mutex<Tables>, socket: &UdpSocket) -> Option<
         (due, next_due)
     };
     for (link_key, due) in due {
-        let packet = wrap_for_recipient(&link_key, &due.session_id, &due.payload);
-        // Already taken off the queue: on failure, skip just this one.
+        let packet = wrap_for_recipient(&link_key, &due.session_id, &due.id, &due.payload);
+        // Stays queued until acknowledged, so a failed send is resent like
+        // a lost one.
         match socket.send_to(&packet, due.addr).await {
             Ok(_) => debug!("Sent {} bytes (re-encrypted) to {}", packet.len(), due.addr),
             Err(e) => error!(
@@ -465,13 +507,18 @@ mod tests {
         let session_id = [7u8; 4];
 
         let dummy = dummy_packet(&link_key, &session_id);
-        let chat = wrap_for_recipient(&link_key, &session_id, &[0x07; CHAT_INNER_PAYLOAD_LEN]);
+        let chat = wrap_for_recipient(
+            &link_key,
+            &session_id,
+            &[0x42; 16],
+            &[0x07; CHAT_INNER_PAYLOAD_LEN],
+        );
         assert_eq!(dummy.len(), 1154, "same size as a client's FEC chat packet");
         assert_eq!(dummy.len(), chat.len());
         assert_eq!(dummy[..5], chat[..5], "same packet type and session id");
 
-        // Framed as the client expects: the zero routing prefix it strips,
-        // then an inner payload starting with the type byte it ignores.
+        // Framed as the client expects: an all-zero delivery ID (nothing to
+        // ack), then an inner payload starting with the type byte it ignores.
         let plaintext = XChaCha20Poly1305::new(Key::from_slice(&link_key))
             .decrypt(XNonce::from_slice(&dummy[5..29]), &dummy[29..])
             .unwrap();
@@ -601,9 +648,78 @@ mod tests {
                 "Queued message should be flushed to outbound"
             );
             assert_eq!(msgs[0].payload, b"QueuedMsg");
-            // Queue should be empty/removed now
-            assert!(tables_lock.get_queued_packets(&receiver_token).is_none());
+            // Still queued until the receiver acknowledges it.
+            assert_eq!(
+                tables_lock
+                    .get_queued_packets(&receiver_token)
+                    .unwrap()
+                    .len(),
+                1
+            );
         }
+
+        // 6. Receiver acks it, which removes it from the queue
+        let delivered_id = tables
+            .lock()
+            .unwrap()
+            .get_queued_packets(&receiver_token)
+            .unwrap()[0]
+            .id;
+        let mut ack_pkt = create_data_packet(
+            receiver_link_key,
+            receiver_session,
+            receiver_token,
+            &delivered_id,
+        );
+        ack_pkt[0] = TYPE_ACK;
+        handle_request(&tables, &server_identity, receiver_addr, &ack_pkt).unwrap();
+        assert!(
+            tables
+                .lock()
+                .unwrap()
+                .get_queued_packets(&receiver_token)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_presence_ping_not_queued_for_offline_recipient() {
+        let tables = Arc::new(Mutex::new(Tables::new()));
+        let mut identity_bytes = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
+        let server_identity = SigningKey::from_bytes(&identity_bytes);
+        let sender_addr = SocketAddr::from(([127, 0, 0, 1], 50001));
+        let sender_secret = EphemeralSecret::random_from_rng(OsRng);
+        let sender_session = [0xAA; 4];
+        let receiver_token = [0xCC; 16];
+
+        let hs_pkt = create_handshake_packet(&sender_secret, sender_session);
+        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt)
+            .unwrap()
+            .unwrap();
+        let mut server_eph_pub_bytes = [0u8; 32];
+        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
+        let shared_secret =
+            sender_secret.diffie_hellman(&X25519PublicKey::from(server_eph_pub_bytes));
+        let mut sender_link_key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
+            .expand(b"wireguard-lite-link", &mut sender_link_key)
+            .unwrap();
+
+        let ping = create_data_packet(
+            sender_link_key,
+            sender_session,
+            receiver_token,
+            &[INNER_TYPE_PRESENCE, 1, 2, 3],
+        );
+        handle_request(&tables, &server_identity, sender_addr, &ping).unwrap();
+        assert!(
+            tables
+                .lock()
+                .unwrap()
+                .get_queued_packets(&receiver_token)
+                .is_none()
+        );
     }
 
     #[test]
@@ -664,7 +780,8 @@ mod tests {
     }
 
     /// A backlog for an online recipient comes out whole, in order, and one
-    /// packet per pacing slot — never all at once.
+    /// packet per pacing slot — never all at once. Then nothing more until
+    /// the first unacknowledged packet is due a resend.
     #[test]
     fn test_backlog_is_paced_out_whole_and_in_order() {
         let mut tables = Tables::new();
@@ -674,7 +791,8 @@ mod tests {
         for i in 0..300u32 {
             tables.enqueue_message(token, i.to_be_bytes().to_vec(), MESSAGE_TTL);
         }
-        let mut now = Instant::now();
+        let start = Instant::now();
+        let mut now = start;
         for i in 0..300u32 {
             let (due, next_due) = tables.take_due(now, RELAY_PACKET_SPACING);
             assert_eq!(due.len(), 1, "one packet per slot");
@@ -684,7 +802,11 @@ mod tests {
             if i < 299 {
                 assert_eq!(next_due, Some(now + RELAY_PACKET_SPACING));
             } else {
-                assert_eq!(next_due, None, "drained");
+                assert_eq!(
+                    next_due,
+                    Some(start + crate::stores::FIRST_RESEND_DELAY),
+                    "all sent; next is the first resend"
+                );
             }
             now += RELAY_PACKET_SPACING;
         }
@@ -719,9 +841,9 @@ mod tests {
     }
 
     /// The whole forwarding path: packets queued for an online recipient are
-    /// re-encrypted under *their* link key, prefixed with the dummy routing
-    /// token, and sent over UDP — all of them, in order, paced, as soon as
-    /// the outbound task is woken.
+    /// re-encrypted under *their* link key, prefixed with their delivery ID,
+    /// and sent over UDP — all of them, in order, paced, as soon as the
+    /// outbound task is woken. They stay queued until acked.
     #[tokio::test]
     async fn test_outbound_forwarding_reencrypts_and_paces_every_packet() {
         let tables = Arc::new(Mutex::new(Tables::new()));
@@ -748,6 +870,7 @@ mod tests {
 
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
         let mut buf = [0u8; 2048];
+        let mut ids = Vec::new();
         for i in 0..60u8 {
             let (len, _) = recipient.recv_from(&mut buf).await.unwrap();
             let packet = &buf[..len];
@@ -756,11 +879,22 @@ mod tests {
             let inner = cipher
                 .decrypt(XNonce::from_slice(&packet[5..29]), &packet[29..])
                 .unwrap();
-            assert_eq!(inner[..16], [0u8; 16]);
+            ids.push(DeliveryId::try_from(&inner[..16]).unwrap());
             assert_eq!(inner[16..], [i; 40]);
         }
         assert!(started.elapsed() >= RELAY_PACKET_SPACING * 59, "paced");
-        assert!(tables.lock().unwrap().get_queued_packets(&token).is_none());
+        let mut t = tables.lock().unwrap();
+        assert_eq!(
+            t.get_queued_packets(&token).unwrap().len(),
+            60,
+            "awaiting acks"
+        );
+        assert_eq!(
+            t.acknowledge(&token, &session, &ids),
+            60,
+            "IDs match the queue"
+        );
+        assert!(t.get_queued_packets(&token).is_none());
     }
 
     #[test]

@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 pub mod packets;
 use packets::*;
 mod chunks;
+mod deliveries;
 mod history;
 mod padding;
 mod storage;
@@ -36,6 +37,10 @@ mod test_support;
 type HmacSha256 = Hmac<Sha256>;
 pub type SessionId = [u8; 4];
 pub type RoutingToken = [u8; 16];
+/// The relay's ID for one packet it forwards to us, which we echo back in
+/// an ack so it stops resending it (see `Client::handle_relay_packet`). All
+/// zeros on a packet that needs no ack, like a relay dummy packet.
+pub type DeliveryId = [u8; 16];
 /// What `Client::create_encrypted_packets` returns: a message's chunk
 /// packets, then an optional PQ inject packet to send after them. Every one
 /// is safe to deliver more than once, in any order, so a resend should
@@ -229,6 +234,7 @@ pub fn derive_vault_key(passcode: &str, stored: &str) -> Option<Zeroizing<[u8; 3
 const TYPE_HANDSHAKE_INIT: u8 = 0;
 pub const TYPE_DATA: u8 = 1;
 const TYPE_HANDSHAKE_RESP: u8 = 2;
+const TYPE_ACK: u8 = 3;
 
 pub struct UserIdentity {
     pub routing_token: RoutingToken,
@@ -531,6 +537,9 @@ pub struct Client {
     /// parked until the PQ inject they depend on arrives — see
     /// `transport`. Transient, like `inbox`: never persisted.
     pub(crate) fec_rx: transport::FecReceiver,
+    /// Relay deliveries already handled, so a resend is only acked again.
+    /// Live local state, not persisted, like `inbox`.
+    recent_deliveries: deliveries::RecentDeliveries,
 }
 
 impl Client {
@@ -557,6 +566,7 @@ impl Client {
             last_recorded_id: None,
             reassembler: chunks::Reassembler::default(),
             fec_rx: Default::default(),
+            recent_deliveries: Default::default(),
         }
     }
 
@@ -718,7 +728,23 @@ impl Client {
         self.wrap_link_encryption(self.identity.routing_token, &[])
     }
 
+    /// Tells the relay we have the packets it forwarded with delivery IDs
+    /// `ids`, so it stops resending them. Only the link session we last
+    /// synced from can ack our routing token's packets.
+    pub fn generate_ack_packet(&self, ids: &[DeliveryId]) -> Vec<u8> {
+        self.wrap_link(TYPE_ACK, self.identity.routing_token, ids.as_flattened())
+    }
+
     fn wrap_link_encryption(&self, target_token: RoutingToken, inner_payload: &[u8]) -> Vec<u8> {
+        self.wrap_link(TYPE_DATA, target_token, inner_payload)
+    }
+
+    fn wrap_link(
+        &self,
+        packet_type: u8,
+        target_token: RoutingToken,
+        inner_payload: &[u8],
+    ) -> Vec<u8> {
         let mut raw_udp_payload = Vec::new();
         raw_udp_payload.extend_from_slice(&target_token);
         raw_udp_payload.extend_from_slice(inner_payload);
@@ -731,7 +757,7 @@ impl Client {
             .encrypt(link_nonce, raw_udp_payload.as_ref())
             .unwrap();
 
-        let mut final_packet = vec![TYPE_DATA];
+        let mut final_packet = vec![packet_type];
         final_packet.extend_from_slice(&self.session_id);
         final_packet.extend_from_slice(&link_nonce_bytes);
         final_packet.extend_from_slice(&link_ciphertext);
@@ -985,10 +1011,16 @@ impl Client {
 
     /// Strip the relay's link layer off a received UDP packet: checks it's a
     /// data packet for our link session, decrypts it with the link key, and
-    /// drops the leading routing token. Returns the inner E2E payload (ready
-    /// for `handle_incoming_packet`), or `None` for anything else — shared by
-    /// every front end's receive loop so none of them re-implement it.
+    /// drops the leading delivery ID. Returns the inner E2E payload (ready
+    /// for `handle_incoming_packet`), or `None` for anything else. Receive
+    /// loops should use `handle_relay_packet` instead, which also acks.
     pub fn open_link_packet(&self, packet: &[u8]) -> Option<Vec<u8>> {
+        self.open_relay_packet(packet).map(|(_, payload)| payload)
+    }
+
+    /// `open_link_packet`, plus the delivery ID from the packet's 16-byte
+    /// prefix.
+    pub fn open_relay_packet(&self, packet: &[u8]) -> Option<(DeliveryId, Vec<u8>)> {
         if packet.len() < 1 + 4 + 24 + 16
             || packet[0] != TYPE_DATA
             || packet[1..5] != self.session_id
@@ -1002,7 +1034,36 @@ impl Client {
         if inner.len() < 16 {
             return None;
         }
-        Some(inner.split_off(16))
+        let payload = inner.split_off(16);
+        Some((inner.try_into().unwrap(), payload))
+    }
+
+    /// Everything a receive loop does with one UDP packet from the relay:
+    /// open it, handle it unless it's a resend we've already handled, and
+    /// acknowledge it so the relay stops resending it. Returns the packets
+    /// to send back to the relay, in order: any protocol reply (e.g. a
+    /// KeyExchange response), then the ack. Packets that aren't for us
+    /// return nothing.
+    ///
+    /// The ack goes out after the packet is handled (and its effects
+    /// saved), so a crash in between means a resend rather than a lost
+    /// message. A packet that fails to handle is acked anyway: resending it
+    /// wouldn't change the outcome.
+    pub fn handle_relay_packet(&mut self, packet: &[u8]) -> Vec<Vec<u8>> {
+        let Some((delivery_id, payload)) = self.open_relay_packet(packet) else {
+            return Vec::new();
+        };
+        let needs_ack = delivery_id != [0u8; 16];
+        let mut out = Vec::new();
+        if (!needs_ack || self.recent_deliveries.first_time(delivery_id))
+            && let Ok(Some(reply)) = self.handle_incoming_packet(&payload)
+        {
+            out.push(reply);
+        }
+        if needs_ack {
+            out.push(self.generate_ack_packet(&[delivery_id]));
+        }
+        out
     }
 
     pub fn handle_incoming_packet(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -3418,6 +3479,59 @@ mod tests {
             !bob.is_online(&alice.identity.routing_token, Duration::from_secs(60)),
             "a dummy packet must not count as hearing from anyone"
         );
+    }
+
+    /// Helper: wrap an inner E2E payload the way the relay forwards it to
+    /// `to`, behind `delivery_id`.
+    fn relay_forward(to: &Client, delivery_id: DeliveryId, inner: &[u8]) -> Vec<u8> {
+        let mut plaintext = delivery_id.to_vec();
+        plaintext.extend_from_slice(inner);
+        let mut nonce = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = XChaCha20Poly1305::new(Key::from_slice(&to.link_master_key))
+            .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
+            .unwrap();
+        let mut packet = vec![TYPE_DATA];
+        packet.extend_from_slice(&to.session_id);
+        packet.extend_from_slice(&nonce);
+        packet.extend_from_slice(&ciphertext);
+        packet
+    }
+
+    #[test]
+    fn test_relay_packet_is_acked_and_resend_handled_once() {
+        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
+        let alice = Client::new(server_addr);
+        let mut bob = Client::new(server_addr);
+        bob.link_master_key = [7u8; 32];
+
+        let kx = KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "");
+        let mut kx_inner = vec![0x02];
+        kx_inner.extend_from_slice(&kx.to_bytes());
+        let delivery_id = [0x11; 16];
+        let packet = relay_forward(&bob, delivery_id, &kx_inner);
+
+        let first = bob.handle_relay_packet(&packet);
+        assert_eq!(first.len(), 2, "KeyExchange reply, then the ack");
+        let resend = bob.handle_relay_packet(&packet);
+        assert_eq!(resend.len(), 1, "a resend is only acked again");
+
+        let ack = &resend[0];
+        assert_eq!(ack[0], TYPE_ACK);
+        assert_eq!(ack[1..5], bob.session_id);
+        let plaintext = XChaCha20Poly1305::new(Key::from_slice(&bob.link_master_key))
+            .decrypt(XNonce::from_slice(&ack[5..29]), &ack[29..])
+            .unwrap();
+        assert_eq!(plaintext[..16], bob.identity.routing_token);
+        assert_eq!(plaintext[16..], delivery_id);
+    }
+
+    #[test]
+    fn test_relay_dummy_packet_is_not_acked() {
+        let (_alice, mut bob) = connected_pair();
+        let dummy_inner = [0u8; 1 + 16 + 8 + 24 + padding::PADDED_LEN + 16];
+        let packet = relay_forward(&bob, [0u8; 16], &dummy_inner);
+        assert!(bob.handle_relay_packet(&packet).is_empty());
     }
 
     #[test]

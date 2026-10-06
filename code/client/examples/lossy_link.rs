@@ -142,10 +142,8 @@ impl Peer {
             let mut buf = [0u8; 4096];
             while let Ok((len, _)) = rx_socket.recv_from(&mut buf).await {
                 let mut c = rx_client.lock().await;
-                if let Some(payload) = c.open_link_packet(&buf[..len])
-                    && let Ok(Some(reply)) = c.handle_incoming_packet(&payload)
-                {
-                    let _ = rx_socket.send_to(&reply, c.server_addr).await;
+                for packet in c.handle_relay_packet(&buf[..len]) {
+                    let _ = rx_socket.send_to(&packet, c.server_addr).await;
                 }
             }
         });

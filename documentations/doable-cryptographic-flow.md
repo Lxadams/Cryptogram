@@ -7,7 +7,7 @@ This document describes the cryptographic architecture of the E2E Messenger MVP 
 ## 1. Architectural Role Summary
 
 *   **Clients (Alice & Bob)**: Generate all keys locally in memory. Trust is established strictly in person via Micro-QR codes (48 bytes). The clients handle all asymmetric/symmetric cryptography and the Deferred Key Exchange protocol.
-*   **Server Relay**: A blind RAM-only router. It has zero knowledge of User IDs or E2E keys. It uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID to identify the link key, decrypts the outer shell, reads the 16-byte Routing Token, re-encrypts the inner payload with the recipient's link key, and forwards it to their active IP. If the recipient is offline, the packet is securely queued in RAM (bounded to 50 messages) until the client connects and syncs.
+*   **Server Relay**: A blind RAM-only router. It has zero knowledge of User IDs or E2E keys. It uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID to identify the link key, decrypts the outer shell, reads the 16-byte Routing Token, re-encrypts the inner payload with the recipient's link key, and forwards it to their active IP. Every forwarded packet waits in a RAM queue (bounded to 2 MiB per recipient, refusing new packets once full, and kept up to 7 days) until the recipient acknowledges it, and is resent until then, so a recipient that's offline, asleep or behind a changed NAT mapping still gets it once it syncs again. Presence pings are the exception: they're sent once, and only to a recipient that's online.
 
 ---
 
@@ -32,7 +32,8 @@ Before any E2E communication can occur, each client must establish a link-layer 
 1.  **Client Boot**: The client generates an ephemeral X25519 keypair, signs the ephemeral public key with its Ed25519 identity, and sends a Handshake packet `[TYPE_HANDSHAKE | SessionID | EphX25519Pub | Ed25519Pub | Ed25519Signature]` to the server.
 2.  **Server Processing**: The server verifies the client's Ed25519 signature over the ephemeral key (Mutual Auth). It performs `DH(ServerEphPriv, ClientEphPub)` and derives a Link Master Key via `HKDF-SHA256` with salt `"e2e-messenger-v1"` and info string `"wireguard-lite-link"`. It returns `[TYPE_HANDSHAKE_RESP | SessionID | ServerEphPub | ServerEd25519Sig]`.
 3.  **Client Completion**: The client verifies the server's signature using the server's static identity, performs DH with the server's ephemeral public key, and derives the identical Link Master Key using the same HKDF parameters.
-4.  **Sync Packet**: The client sends its Routing Token (link-encrypted) so the server can map `RoutingToken → (SocketAddr, SessionID)` for routing.
+4.  **Sync Packet**: The client sends its Routing Token (link-encrypted) so the server can map `RoutingToken → (SocketAddr, SessionID)` for routing. Clients resend it every 15 seconds to keep their NAT mapping (and the server's record) alive.
+5.  **Delivery & Acks**: The server gives each queued packet a random 16-byte Delivery ID and sends it to the recipient in the 16-byte prefix of the forwarded envelope (all zeros on a dummy packet). The recipient handles the packet, then replies with an Ack `[TYPE_ACK (3) | SessionID | Nonce | link-encrypted: own RoutingToken | DeliveryID...]`, and the server drops the packet from its queue. Only the link session the token last synced from can ack it. Until then the server resends it after 2s, 4s, 8s… (at most 60s apart), and straight away when the recipient syncs from a new address or after more than 30 seconds of silence (it was asleep). Resends are safe: the client remembers recent Delivery IDs, so a repeat is only acked again, never handled twice.
 
 All subsequent packets are wrapped in `XChaCha20-Poly1305` link encryption using this key.
 
@@ -116,13 +117,14 @@ sequenceDiagram
 
 ```
 Raw UDP Datagram
-├── [1 byte]  Packet Type (0=Handshake, 1=Data)
+├── [1 byte]  Packet Type (0=Handshake, 1=Data, 2=Handshake response, 3=Ack)
 ├── [4 bytes] Link Session ID (unencrypted, identifies link key)
 ├── [24 bytes] XChaCha20 Nonce
 └── XChaCha20-Poly1305 Link-Encrypted Envelope
-    ├── [16 bytes] Routing Token (read by server for forwarding)
+    ├── [16 bytes] Routing Token (read by server for forwarding);
+    │              on packets the server forwards, the Delivery ID instead
     └── Inner E2E Payload
-        ├── [1 byte] Inner Type (0x01=Msg, 0x02=KeyExchange, 0x04=SessionEstablish, 0x05=PQInject)
+        ├── [1 byte] Inner Type (0x00=Relay dummy, 0x01=Msg, 0x02=KeyExchange, 0x04=SessionEstablish, 0x05=PQInject, 0x06=Presence)
         └── Type-specific payload (E2E encrypted or signed)
             ├── Msg (0x01): [16 bytes SenderToken] + [8 bytes SeqNo] + [24 bytes Nonce] + [Ciphertext]
             │   └── Ciphertext decrypts to a 1024-byte padded block:
@@ -174,8 +176,11 @@ Raw UDP Datagram
 #### Edge Case: Server Offline Routing & Queuing
 | Test | Description |
 |---|---|
-| `test_edge_case_offline_queuing_and_sync` | Asserts that messages sent to an offline receiver are securely queued in RAM, and natively flushed via the background sweeper as soon as the receiver boots, handshakes, and sends a Sync packet. |
-| `test_edge_case_offline_queue_dos_bounds` | Spams 55 messages to an offline routing token. Asserts the server strictly bounds the queue to 50 messages, popping the oldest to prevent RAM exhaustion (DoS protection). |
+| `test_edge_case_offline_queuing_and_sync` | Asserts that messages sent to an offline receiver are securely queued in RAM, sent as soon as the receiver boots, handshakes, and sends a Sync packet, and only leave the queue once the receiver acks them. |
+| `test_edge_case_offline_queue_dos_bounds` | Spams more packets than fit to an offline routing token. Asserts the server strictly bounds the queue to 2 MiB, refusing new packets and keeping the oldest, to prevent RAM exhaustion (DoS protection). |
+| `test_presence_ping_not_queued_for_offline_recipient` | Asserts a presence ping to an offline receiver is dropped rather than queued, so pings can't push real messages out of the queue. |
+| `stores::tests::*` | Unacknowledged packets are resent with backoff; acks only count from the recipient's own link session; a sync from a new address or after silence resends at once; resend delays double up to 60s; a link in use isn't swept. |
+| `test_relay_packet_is_acked_and_resend_handled_once` (client) | A forwarded packet is handled and acked; the same packet resent is only acked again. |
 | `test_edge_case_offline_queue_ttl_expiry` | Enqueues a message with an expired TTL. Asserts the background sweeper safely destroys the expired message and cleans up the empty queue HashMap entry. |
 
 #### Edge Case: Replay & Misbinding

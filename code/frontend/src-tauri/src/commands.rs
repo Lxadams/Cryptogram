@@ -4,6 +4,7 @@
 //! `invoke("command_name", args)` on the JS/WASM side) and gets plain,
 //! serializable DTOs back.
 
+use crate::background;
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use client::{
     derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
@@ -13,6 +14,7 @@ use serde::Serialize;
 use std::{
     collections::HashSet,
     fs::{self, File, TryLockError},
+    io,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -94,6 +96,13 @@ fn identity_paths(root: &Path, pseudonym: &str) -> (PathBuf, PathBuf, PathBuf) {
 /// descriptor closes — including on a crash or `kill -9` — never left
 /// dangling the way a "lock file that just means 'someone wrote this'"
 /// would be.
+///
+/// Where the platform has no file locking (`try_lock` reports
+/// `Unsupported`, as on Android), this still returns the file, unlocked.
+/// That's safe on Android because only one copy of the app can run there,
+/// and within one process `login` ends any existing session first and
+/// `delete_identity` refuses the logged-in identity, without relying on
+/// the lock.
 fn try_acquire_session_lock(lock_path: &Path) -> Result<File, String> {
     // `truncate(true)`: this file's content is never read, it's purely a
     // lock target — nothing meaningful to preserve across opens.
@@ -108,6 +117,7 @@ fn try_acquire_session_lock(lock_path: &Path) -> Result<File, String> {
         Err(TryLockError::WouldBlock) => {
             Err("This identity is already logged in elsewhere on this machine.".to_string())
         }
+        Err(TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => Ok(file),
         Err(TryLockError::Error(e)) => Err(e.to_string()),
     }
 }
@@ -122,8 +132,14 @@ fn parse_token(token_hex: &str) -> Result<RoutingToken, String> {
 /// local-dev default (`127.0.0.1:4430`, see runserver.sh); override with
 /// the `SERVER_ADDR` env var (e.g. a deployed EC2 host's `<ip>:443`) —
 /// mirrors the same override on the CLI (see code/client/src/main.rs).
+/// `SERVER_ADDR` set at launch wins; failing that, the value it had at
+/// build time is baked in, since a mobile app can't be launched with env
+/// vars (see code/frontend/ANDROID.md).
 fn server_addr_raw() -> String {
-    std::env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:4430".to_string())
+    std::env::var("SERVER_ADDR")
+        .ok()
+        .or_else(|| option_env!("SERVER_ADDR").map(str::to_string))
+        .unwrap_or_else(|| "127.0.0.1:4430".to_string())
 }
 
 /// How often we send a presence ping to each established contact.
@@ -227,7 +243,8 @@ pub async fn list_pseudonyms(app: AppHandle) -> Result<Vec<String>, String> {
 /// `LoginResolution::UnknownUsername`, not an `Err` — see its doc comment.
 /// A correct passcode still fails if another process already holds this
 /// identity's session lock (see `try_acquire_session_lock`) — logging into
-/// the same identity twice at once isn't allowed.
+/// the same identity twice at once isn't allowed. (Where there's no file
+/// locking, i.e. Android, there's also only ever one process.)
 fn resolve_login(root: &Path, pseudonym: &str, passcode: &str) -> Result<LoginResolution, String> {
     let pseudonym = sanitize_pseudonym(pseudonym)?;
     if passcode.is_empty() {
@@ -281,7 +298,9 @@ fn resolve_create_identity(root: &Path, pseudonym: &str, passcode: &str) -> Resu
 /// forgotten passcode (there is no password reset), so requiring the
 /// passcode to delete would defeat the point. It does refuse to delete an
 /// identity another process currently holds the session lock for, so you
-/// can't delete out from under a live login elsewhere.
+/// can't delete out from under a live login elsewhere. (This process's own
+/// login is checked by the `delete_identity` command, since the lock can't
+/// be relied on for that everywhere — see `try_acquire_session_lock`.)
 fn resolve_delete_identity(root: &Path, pseudonym: &str) -> Result<(), String> {
     let pseudonym = sanitize_pseudonym(pseudonym)?;
     let (state_path, passcode_path, lock_path) = identity_paths(root, &pseudonym);
@@ -370,6 +389,10 @@ pub async fn login(
     pseudonym: String,
     mut passcode: String,
 ) -> Result<LoginOutcome, String> {
+    // Normally already logged out (the Login screen only shows then), but
+    // never run two sessions side by side: their background loops would
+    // share one `AppState`.
+    end_session(&state).await;
     let root = identities_root(&app)?;
     let result = resolve_login(&root, &pseudonym, &passcode);
     passcode.zeroize();
@@ -411,10 +434,59 @@ pub async fn create_identity(
 
 /// Permanently delete a saved identity. Does not require its passcode — see
 /// `resolve_delete_identity`'s doc comment for why — and refuses if that
-/// identity is currently logged in on another process.
+/// identity is currently logged in, here or in another process.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn delete_identity(app: AppHandle, pseudonym: String) -> Result<(), String> {
+pub async fn delete_identity(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    pseudonym: String,
+) -> Result<(), String> {
+    let logged_in = state
+        .pending_identity
+        .lock()
+        .await
+        .as_ref()
+        .map(|p| p.pseudonym.clone());
+    if logged_in.is_some() && sanitize_pseudonym(&pseudonym).ok() == logged_in {
+        return Err("That identity is logged in right now. Log out first.".to_string());
+    }
     resolve_delete_identity(&identities_root(&app)?, &pseudonym)
+}
+
+/// What `current_session` reports: who's logged in, and their identity once
+/// `bootstrap` has connected them to the relay.
+#[derive(Serialize)]
+pub struct SessionDto {
+    pub pseudonym: String,
+    pub identity: Option<IdentityDto>,
+}
+
+/// The session this process already has, if any, so a frontend that has
+/// just loaded can pick up where it left off instead of showing Login. On
+/// Android the UI reloads whenever the app's activity is recreated (e.g.
+/// reopening it after swiping it away), while this backend and its relay
+/// connection keep running.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn current_session(state: State<'_, AppState>) -> Result<Option<SessionDto>, String> {
+    let pseudonym = state
+        .pending_identity
+        .lock()
+        .await
+        .as_ref()
+        .map(|p| p.pseudonym.clone());
+    let Some(pseudonym) = pseudonym else {
+        return Ok(None);
+    };
+    let identity = state
+        .runtime
+        .lock()
+        .await
+        .as_ref()
+        .map(|rt| identity_dto(&rt.client));
+    Ok(Some(SessionDto {
+        pseudonym,
+        identity,
+    }))
 }
 
 #[cfg(test)]
@@ -793,12 +865,20 @@ pub async fn bootstrap(
     ];
 
     let bursts = BurstSender::spawn(socket.clone(), client.server_addr);
-    *state.runtime.lock().await = Some(ClientRuntime {
+    let previous = state.runtime.lock().await.replace(ClientRuntime {
         client,
         socket,
         bursts,
         tasks,
     });
+    // A second Connect without logging out in between: stop the old loops
+    // rather than leave them running on an abandoned socket.
+    if let Some(previous) = previous {
+        for task in previous.tasks {
+            task.abort();
+        }
+    }
+    background::session_started();
 
     Ok(identity)
 }
@@ -811,14 +891,22 @@ pub async fn bootstrap(
 /// `bootstrap` ever ran (e.g. abandoning the Connect screen).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
+    end_session(&state).await;
+    Ok(())
+}
+
+/// `logout`'s work, shared with `login`.
+async fn end_session(state: &AppState) {
     if let Some(rt) = state.runtime.lock().await.take() {
         for task in rt.tasks {
             task.abort();
         }
     }
-    state.pending_identity.lock().await.take();
+    let was_logged_in = state.pending_identity.lock().await.take().is_some();
     state.identity_lock.lock().await.take();
-    Ok(())
+    if was_logged_in {
+        background::session_ended();
+    }
 }
 
 /// Background task: periodically resend an empty `sync` packet to the relay
@@ -845,7 +933,12 @@ fn spawn_keepalive_loop(
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
         ticker.tick().await; // first tick fires immediately; skip it, bootstrap just synced
         loop {
-            ticker.tick().await;
+            // Also sync early on request, e.g. when Android brings the app
+            // back to the foreground (see `background::RESYNC`).
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = background::RESYNC.notified() => {}
+            }
             let guard = state.runtime.lock().await;
             let Some(rt) = guard.as_ref() else {
                 continue;
@@ -860,7 +953,9 @@ fn spawn_keepalive_loop(
 
 /// Background task: send a signed presence ping (see `PresencePayload`) to
 /// every established contact on a fixed interval, so peers can show an
-/// online/offline marker. Separate from `spawn_keepalive_loop` on purpose
+/// online/offline marker. Paused while the app is off screen (see
+/// `background::on_screen`), so contacts then show us offline; the
+/// keepalive loop keeps us reachable for messages regardless. Separate from `spawn_keepalive_loop` on purpose
 /// — that one sends a single fixed packet to the relay and touches no
 /// protocol state, this one fans out to N contacts and advances no ratchet
 /// state either (pings are signed, not E2E-encrypted), so the two loops
@@ -873,7 +968,13 @@ fn spawn_presence_loop(
         let state = app.state::<AppState>();
         let mut ticker = tokio::time::interval(PRESENCE_PING_INTERVAL);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = background::BACK_ON_SCREEN.notified() => {}
+            }
+            if !background::on_screen() {
+                continue;
+            }
             let guard = state.runtime.lock().await;
             let Some(rt) = guard.as_ref() else {
                 continue;
@@ -893,11 +994,13 @@ fn spawn_presence_loop(
     })
 }
 
-/// Background task: read inbound UDP packets for as long as the app runs,
-/// strip the link-layer encryption, and hand the inner payload to the
-/// client state machine — exactly what the CLI's spawned task does, just
-/// living here instead. Decrypted messages land in `Client::inbox`, which
-/// the frontend collects by polling `poll_inbox`.
+/// Background task: read inbound UDP packets for as long as the app runs
+/// and hand them to the client state machine (`Client::handle_relay_packet`,
+/// which also produces the ack the relay waits for) — exactly what the
+/// CLI's spawned task does, just living here instead. Decrypted messages
+/// land in `Client::inbox`, which the frontend collects by polling
+/// `poll_inbox`, and are reported to `background` so Android can show a
+/// notification while the app isn't on screen.
 fn spawn_receive_loop(
     app: AppHandle,
     socket: Arc<UdpSocket>,
@@ -921,14 +1024,26 @@ fn spawn_receive_loop(
             let Some(rt) = guard.as_mut() else {
                 continue;
             };
-            let Some(e2e_payload) = rt.client.open_link_packet(&buf[..len]) else {
-                continue;
-            };
-            if let Ok(Some(reply)) = rt.client.handle_incoming_packet(&e2e_payload) {
-                let _ = socket.send_to(&reply, rt.client.server_addr).await;
+            let inbox_before = rt.client.inbox.len();
+            let replies = rt.client.handle_relay_packet(&buf[..len]);
+            for (from, _, _) in &rt.client.inbox[inbox_before..] {
+                background::message_received(&contact_label(&rt.client, from));
+            }
+            for packet in replies {
+                let _ = socket.send_to(&packet, rt.client.server_addr).await;
             }
         }
     })
+}
+
+/// How a notification names a contact: their chosen name, or failing that
+/// the start of their routing token.
+fn contact_label(client: &Client, token: &RoutingToken) -> String {
+    client
+        .contact_names
+        .get(token)
+        .cloned()
+        .unwrap_or_else(|| hex::encode(&token[..4]))
 }
 
 /// Union of `pending_contacts` (KeyExchange in flight) and `e2e_sessions`

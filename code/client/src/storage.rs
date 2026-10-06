@@ -300,6 +300,7 @@ impl ClientStateDto {
             identity_store: None, // attached separately once a vault key is available
             reassembler: Default::default(), // live state, not persisted — see Client::reassembler
             fec_rx: Default::default(), // in-flight FEC state, not persisted
+            recent_deliveries: Default::default(), // live state, not persisted
         })
     }
 }

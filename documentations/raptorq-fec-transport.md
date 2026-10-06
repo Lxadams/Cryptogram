@@ -54,7 +54,8 @@ SEND (Client A)
 
 RELAY (unchanged logic)
   link-decrypt -> read recipient token -> queue -> re-encrypt for recipient
-  (forwarded on arrival, backlogs paced 5 ms/packet, queue cap 2 MiB per recipient)
+  (forwarded on arrival, backlogs paced 5 ms/packet, queue cap 2 MiB per recipient,
+   each packet kept until the recipient acks it)
 
 RECEIVE (Client B)
   link-decrypt (unchanged) -> inner type 0x07
@@ -180,6 +181,9 @@ The relay previously flushed its queues once per second, which collapsed any pac
 | Per-recipient queue cap | 50 packets, oldest evicted | **2 MiB** (`MAX_QUEUED_BYTES_PER_TOKEN`), new packets refused once full | Evicting the oldest cut the front off queued bursts, and losing an older PQ-carrying message makes every later one undecryptable |
 | Send error during a flush | Aborted the rest of the already-drained batch (lost) | Logged, skipped, continues | Each forwarded symbol counts |
 | Per-packet logging | `info!` × 3 per packet | `debug!` | A message is tens to hundreds of packets; blocking stdout slowed the receive loop |
+| Delivery (PR #36) | Sent once to the recipient's last known address, then dropped | **Kept until acked**: each packet carries a delivery ID the recipient echoes in an ack (type 3). Resent 2 s, 4 s… up to 60 s apart within the same 5 ms pacing, and at once when the recipient syncs from a new address or after 30 s of silence. Kept up to 7 days | A phone that's asleep, frozen or just restarted otherwise loses everything sent to it. The client skips resends it has already handled |
+| Presence pings (PR #36) | Queued like messages | Sent once, only to an online recipient | They're useless late, and would fill an offline recipient's queue |
+| Link lifetime (PR #36) | 1 h from the handshake | 7 days from its **last use** | Clients never redo the handshake, so a link must outlast a phone asleep overnight (R-3 in implementation-review.md) |
 
 The relay learned nothing about FEC or crypto. It still forwards opaque inner payloads by recipient token.
 
