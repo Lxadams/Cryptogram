@@ -242,19 +242,18 @@ fn handle_request(
         }
         TYPE_ACK => {
             let (session_id, plaintext) = open_link_payload(tables, payload)?;
-            if plaintext.len() < 16 || (plaintext.len() - 16) % 16 != 0 {
+            // Our own routing token, then whole 16-byte delivery IDs.
+            let Some((routing_token, ids)) = plaintext.split_first_chunk::<16>() else {
+                return Err(anyhow!("Malformed ack"));
+            };
+            let (ids, rest) = ids.as_chunks::<16>();
+            if !rest.is_empty() {
                 return Err(anyhow!("Malformed ack"));
             }
-            let mut routing_token = [0u8; 16];
-            routing_token.copy_from_slice(&plaintext[..16]);
-            let ids: Vec<DeliveryId> = plaintext[16..]
-                .chunks_exact(16)
-                .map(|id| id.try_into().unwrap())
-                .collect();
             let removed = tables
                 .lock()
                 .unwrap()
-                .acknowledge(&routing_token, &session_id, &ids);
+                .acknowledge(routing_token, &session_id, ids);
             debug!("Ack for token {:?}: {} delivered", routing_token, removed);
         }
         _ => return Err(anyhow!("Unknown packet type")),
