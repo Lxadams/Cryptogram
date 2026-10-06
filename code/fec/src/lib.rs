@@ -167,38 +167,115 @@ pub fn packets_for(object_len: usize, loss: f64, max_failure: f64) -> u32 {
         .unwrap_or(MAX_PACKETS_PER_OBJECT)
 }
 
+/// Symbols beyond `K` a receiver needs so the object fails to decode with
+/// probability at most `max_failure` (see `failure_probability`): 1 for
+/// 1e-4, 2 for 1e-6.
+pub fn overhead_for(max_failure: f64) -> u32 {
+    (0..16)
+        .find(|&h| 10f64.powi(-2 * (h + 1)) <= max_failure * (1.0 + 1e-9))
+        .unwrap_or(16) as u32
+}
+
+/// How many distinct symbols of an `object_len`-byte object the receiver
+/// must get for it to decode with probability at least `1 - max_failure`.
+pub fn symbols_needed(object_len: usize, max_failure: f64) -> u32 {
+    source_symbols_for(object_len.max(1)) + overhead_for(max_failure)
+}
+
+/// How many packets to send so that at least `wanted` of them arrive with
+/// probability at least `1 - max_shortfall`, when each is lost independently
+/// with probability `loss`. A sender that learns what arrived can top up the
+/// shortfall afterwards, so this sizes one round, not the whole delivery.
+/// Never more than `MAX_PACKETS_PER_OBJECT`.
+pub fn sends_for(wanted: u32, loss: f64, max_shortfall: f64) -> u32 {
+    if wanted == 0 {
+        return 0;
+    }
+    let survive = 1.0 - loss.clamp(0.0, 0.999);
+    (wanted..=MAX_PACKETS_PER_OBJECT)
+        .find(|&n| shortfall_probability(wanted, n, survive) <= max_shortfall)
+        .unwrap_or(MAX_PACKETS_PER_OBJECT)
+}
+
+/// P(fewer than `wanted` of `n` packets arrive), each arriving with
+/// probability `survive`. Log space, like `failure_probability`.
+fn shortfall_probability(wanted: u32, n: u32, survive: f64) -> f64 {
+    if survive >= 1.0 {
+        return if n >= wanted { 0.0 } else { 1.0 };
+    }
+    let (ln_survive, ln_lost) = (survive.ln(), (1.0 - survive).ln());
+    let mut ln_pmf = n as f64 * ln_lost;
+    let mut shortfall = 0.0;
+    for r in 0..wanted.min(n + 1) {
+        shortfall += ln_pmf.exp();
+        ln_pmf += ((n - r) as f64 / (r + 1) as f64).ln() + ln_survive - ln_lost;
+    }
+    shortfall.min(1.0)
+}
+
+/// Encodes one object and hands out its FEC packets one at a time, by
+/// index: the `K` source symbols first, then as many repair symbols as the
+/// caller keeps asking for. A sender keeps one per object in flight so it
+/// can send more of it later if too few got through.
+pub struct ObjectEncoder {
+    header_prefix: [u8; 8],
+    source_symbols: u32,
+    encoder: Encoder,
+}
+
+impl ObjectEncoder {
+    /// `object_id` must be unique among the sender's recent objects to the
+    /// same receiver.
+    pub fn new(object_id: u32, object: &[u8]) -> Result<Self, FecError> {
+        check_object_len(object.len())?;
+        let mut header_prefix = [0u8; 8];
+        header_prefix[..4].copy_from_slice(&object_id.to_be_bytes());
+        header_prefix[4..].copy_from_slice(&(object.len() as u32).to_be_bytes());
+        Ok(Self {
+            header_prefix,
+            source_symbols: source_symbols_for(object.len()),
+            encoder: Encoder::new(object, transmission_info(object.len())),
+        })
+    }
+
+    /// `K`: the fewest packets the object could decode from.
+    pub fn source_symbols(&self) -> u32 {
+        self.source_symbols
+    }
+
+    /// The packet at `index` (source symbols are `0..K`, repair symbols
+    /// follow). Every index gives a different symbol, so sending each index
+    /// once never wastes a packet on a duplicate.
+    pub fn packet(&self, index: u32) -> Result<Vec<u8>, FecError> {
+        if index >= MAX_PACKETS_PER_OBJECT {
+            return Err(FecError::TooManyPackets);
+        }
+        let block = &self.encoder.get_block_encoders()[0];
+        let symbol = match index.checked_sub(self.source_symbols) {
+            None => block.source_packets().swap_remove(index as usize),
+            Some(repair) => block.repair_packets(repair, 1).remove(0),
+        };
+        let (payload_id, data) = symbol.split();
+        let mut packet = Vec::with_capacity(HEADER_LEN + data.len());
+        packet.extend_from_slice(&self.header_prefix);
+        packet.extend_from_slice(&payload_id.encoding_symbol_id().to_be_bytes());
+        packet.extend_from_slice(&data);
+        Ok(packet)
+    }
+}
+
 /// Encode `object` into `packets` FEC packets (or the object's source symbol
 /// count, if that's more): the `K` source symbols first, then repair symbols.
 /// `object_id` must be unique among the sender's recent objects to the same
 /// receiver — callers pick it at random.
 pub fn encode(object_id: u32, object: &[u8], packets: u32) -> Result<Vec<Vec<u8>>, FecError> {
-    check_object_len(object.len())?;
     if packets > MAX_PACKETS_PER_OBJECT {
         return Err(FecError::TooManyPackets);
     }
-    let k = source_symbols_for(object.len());
-    let encoder = Encoder::new(object, transmission_info(object.len()));
-    let block = &encoder.get_block_encoders()[0];
-    let mut symbols = block.source_packets();
-    symbols.extend(block.repair_packets(0, packets.saturating_sub(k)));
-
-    let header_prefix = {
-        let mut prefix = [0u8; 8];
-        prefix[..4].copy_from_slice(&object_id.to_be_bytes());
-        prefix[4..].copy_from_slice(&(object.len() as u32).to_be_bytes());
-        prefix
-    };
-    Ok(symbols
-        .into_iter()
-        .map(|symbol| {
-            let (payload_id, data) = symbol.split();
-            let mut packet = Vec::with_capacity(HEADER_LEN + data.len());
-            packet.extend_from_slice(&header_prefix);
-            packet.extend_from_slice(&payload_id.encoding_symbol_id().to_be_bytes());
-            packet.extend_from_slice(&data);
-            packet
-        })
-        .collect())
+    let encoder = ObjectEncoder::new(object_id, object)?;
+    (0..packets.max(encoder.source_symbols()))
+        .map(|index| encoder.packet(index))
+        .collect()
 }
 
 struct Header {
@@ -921,6 +998,64 @@ mod tests {
         // The model keeps improving past RFC 6330's last quoted bound.
         let deep = failure_probability(1, 80, 0.3);
         assert!(deep > 0.0 && deep < 1e-9, "{deep}");
+    }
+
+    #[test]
+    fn overhead_and_symbols_needed_match_the_failure_model() {
+        assert_eq!(overhead_for(1e-2), 0);
+        assert_eq!(overhead_for(1e-4), 1);
+        assert_eq!(overhead_for(1e-6), 2);
+        assert_eq!(overhead_for(1e-5), 2, "rounds up to the next bound");
+        assert_eq!(
+            symbols_needed(1091, 1e-4),
+            3,
+            "one padded chat chunk: K = 2"
+        );
+        assert_eq!(symbols_needed(2 * 1091 + 1195, 1e-6), 6);
+    }
+
+    #[test]
+    fn sends_for_covers_the_shortfall_and_grows_with_loss() {
+        assert_eq!(sends_for(0, 0.7, 1e-2), 0);
+        assert_eq!(sends_for(3, 0.0, 1e-2), 3, "a clean link needs no spares");
+        let mut last = 0;
+        for loss in [0.05, 0.2, 0.4, 0.6, 0.7, 0.9] {
+            let n = sends_for(3, loss, 1e-2);
+            assert!(n > last, "loss {loss}: {n}");
+            assert!(shortfall_probability(3, n, 1.0 - loss) <= 1e-2);
+            assert!(
+                shortfall_probability(3, n - 1, 1.0 - loss) > 1e-2,
+                "smallest"
+            );
+            last = n;
+        }
+        // 70% loss: about 3 / 0.3 = 10 expected, plus the 99% margin.
+        assert!((15..=25).contains(&sends_for(3, 0.7, 1e-2)));
+    }
+
+    /// Packets handed out one index at a time are the same as `encode`'s,
+    /// and repair indices past whatever was sent first still decode — which
+    /// is what lets a sender top up an object that came up short.
+    #[test]
+    fn object_encoder_tops_up_with_fresh_repair_symbols() {
+        let mut rng = Rng(21);
+        let object = rng.bytes(3000);
+        let encoder = ObjectEncoder::new(9, &object).unwrap();
+        let k = encoder.source_symbols();
+        assert_eq!(k, 3);
+        let batch = encode(9, &object, 8).unwrap();
+        for (i, packet) in batch.iter().enumerate() {
+            assert_eq!(encoder.packet(i as u32).unwrap(), *packet);
+        }
+        // Only repair symbols from well past the first batch: still decodes.
+        let late: Vec<Vec<u8>> = (40..40 + k + 1)
+            .map(|i| encoder.packet(i).unwrap())
+            .collect();
+        assert_eq!(reassemble(&late).unwrap(), object);
+        assert_eq!(
+            encoder.packet(MAX_PACKETS_PER_OBJECT),
+            Err(FecError::TooManyPackets)
+        );
     }
 
     #[test]

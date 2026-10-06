@@ -5,23 +5,20 @@ this `code/` directory.
 
 ## server
 
-Relay server, listens on UDP 443.
+Relay server: QUIC on UDP 443 (see server/README.md).
 
 ```
 docker compose up -d server
-docker compose logs -f server
+docker compose exec server server --print-pubkey
+docker compose exec server server --print-access-key
 ```
 
-The logs print a line like:
-
-```
-Server Static Pubkey: 9900a0fda7a1b91c336362ed794fafb4b5fa27fcae4712ac43440c602b0b9942
-```
-
-Every client needs that hex string to authenticate the relay during its
-handshake. The identity itself is persisted in the `server_identity`
-volume, so it stays the same across restarts (`docker compose restart
-server`) — only removing the volume (`docker compose down -v`) resets it.
+Every client needs both: the relay's key pin (`SERVER_PUBKEY`), so it can
+tell the real relay from anyone else, and the access key
+(`SERVER_ACCESS_KEY`), which it proves it has. The keys persist in the
+`server_identity` volume, so they stay the same across restarts (`docker
+compose restart server`) — only removing the volume (`docker compose down
+-v`) resets them.
 
 ## client
 
@@ -29,8 +26,12 @@ Interactive CLI peer. Run with `docker compose run`, not `up` — it's a
 stdin REPL, not a long-running service.
 
 ```
-SERVER_PUBKEY=<hex from server logs> docker compose run --rm client
+SERVER_PUBKEY=<pin> SERVER_ACCESS_KEY=<key> docker compose run --rm client
 ```
+
+It reaches the relay at its fixed address on the Compose network
+(172.30.0.10): a name would be looked up over DNS-over-HTTPS, which can't
+see Compose's service names.
 
 Once connected it prints your own routing token + Ed25519 pubkey, then
 accepts commands:
@@ -47,8 +48,8 @@ other, like `runpeer.sh` does for the desktop app), give each run its own
 volume instead of the shared one:
 
 ```
-SERVER_PUBKEY=<hex> docker compose run --rm -v alice_state:/data client
-SERVER_PUBKEY=<hex> docker compose run --rm -v bob_state:/data client
+SERVER_PUBKEY=<pin> SERVER_ACCESS_KEY=<key> docker compose run --rm -v alice_state:/data client
+SERVER_PUBKEY=<pin> SERVER_ACCESS_KEY=<key> docker compose run --rm -v bob_state:/data client
 ```
 
 ## frontend-builder

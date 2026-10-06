@@ -2,6 +2,8 @@
 
 Branch `claude/raptorq-e2e-integration-2c36af`, 5 October 2026. Companion document: [implementation-review.md](implementation-review.md), a review of the whole system as it now stands.
 
+> **Partly superseded by Stage 3** ([disguised-crt-transport.md](disguised-crt-transport.md)): messages no longer go out as fixed-size bursts paced 10 ms apart (`BurstSender` is gone) but a cell at a time on a constant-rate QUIC link, with redundancy sized from measured loss and topped up from receipts; the raw-UDP link layer described here is replaced by QUIC; and contact requests now go through FEC too. The FEC objects, the seal, and the PQ-injection handling below are unchanged.
+
 ## 1. Summary
 
 **Goal:** Client A can send and Client B can receive while the jammed side's link loses up to **70% of all packets**. This must work with no ACKs, no retransmission and no change to the trust model.

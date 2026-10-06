@@ -19,12 +19,13 @@
 # reuses it and starts almost instantly. Requires the relay server to
 # already be running (./runserver.sh in another terminal).
 #
-# The app checks the relay against the public key it's given in
-# SERVER_PUBKEY, rather than asking the relay for one (see
-# relay_pubkey_hex() in code/frontend/src-tauri/src/commands.rs). For the
-# local relay this script reads it from the relay's identity file; for any
-# other (SERVER_ADDR set), set SERVER_PUBKEY to the "Server Static Pubkey"
-# that relay prints at startup.
+# The app trusts only the relay whose key pin it's given in SERVER_PUBKEY,
+# and proves it's the app with the access key in SERVER_ACCESS_KEY, rather
+# than asking the relay for either (see relay_config() in
+# code/frontend/src-tauri/src/commands.rs). For the local relay this script
+# reads both from the relay's own files; for any other (SERVER_ADDR set),
+# set them to what that relay's `server --print-pubkey` and
+# `server --print-access-key` print.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,13 +44,15 @@ DEV_PORT=1420
 # two different `identities/` directories, confirmed by testing two peers.
 cd "$FRONTEND_DIR"
 
-if [ -z "${SERVER_PUBKEY:-}" ]; then
+if [ -z "${SERVER_PUBKEY:-}" ] || [ -z "${SERVER_ACCESS_KEY:-}" ]; then
   if [ -n "${SERVER_ADDR:-}" ]; then
-    echo "error: set SERVER_PUBKEY to the \"Server Static Pubkey\" the relay at $SERVER_ADDR prints." >&2
+    echo "error: set SERVER_PUBKEY and SERVER_ACCESS_KEY to what the relay at $SERVER_ADDR" >&2
+    echo "prints with 'server --print-pubkey' and 'server --print-access-key'." >&2
     exit 1
   fi
-  SERVER_PUBKEY="$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-pubkey)"
-  export SERVER_PUBKEY
+  SERVER_PUBKEY="${SERVER_PUBKEY:-$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-pubkey)}"
+  SERVER_ACCESS_KEY="${SERVER_ACCESS_KEY:-$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-access-key)}"
+  export SERVER_PUBKEY SERVER_ACCESS_KEY
 fi
 
 # VS Code installed as a snap leaks its sandbox environment into its

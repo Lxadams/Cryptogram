@@ -10,11 +10,12 @@
 #
 # --mobile bakes the address into the app (see server_addr_raw() in
 # code/frontend/src-tauri/src/commands.rs), so build again if the relay's IP
-# changes. The relay's public key is baked in too (relay_pubkey_hex()): read
-# from the relay's identity file when it runs on this machine, otherwise
-# pass the "Server Static Pubkey" it prints as SERVER_PUBKEY:
+# changes. The relay's key pin and access key are baked in too
+# (relay_config()): read from the relay's own files when it runs on this
+# machine, otherwise pass what it prints with --print-pubkey and
+# --print-access-key:
 #
-#   SERVER_PUBKEY=<hex> ./runpeer-lan.sh --mobile 192.168.1.20
+#   SERVER_PUBKEY=<hex> SERVER_ACCESS_KEY=<hex> ./runpeer-lan.sh --mobile 192.168.1.20
 # It needs the Android toolchain from code/frontend/ANDROID.md
 # steps 1-4, and does the rest of that guide itself.
 set -euo pipefail
@@ -38,14 +39,16 @@ mode="$1"
 server="${2:-}"
 case "$mode" in --pc | --mobile) ;; *) usage ;; esac
 
-if [ -z "${SERVER_PUBKEY:-}" ]; then
+if [ -z "${SERVER_PUBKEY:-}" ] || [ -z "${SERVER_ACCESS_KEY:-}" ]; then
   if [ -n "$server" ]; then
-    echo "error: set SERVER_PUBKEY to the \"Server Static Pubkey\" the relay at $server prints." >&2
+    echo "error: set SERVER_PUBKEY and SERVER_ACCESS_KEY to what the relay at $server" >&2
+    echo "prints with 'server --print-pubkey' and 'server --print-access-key'." >&2
     exit 1
   fi
-  SERVER_PUBKEY="$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-pubkey)"
+  SERVER_PUBKEY="${SERVER_PUBKEY:-$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-pubkey)}"
+  SERVER_ACCESS_KEY="${SERVER_ACCESS_KEY:-$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-access-key)}"
 fi
-export SERVER_PUBKEY
+export SERVER_PUBKEY SERVER_ACCESS_KEY
 
 if [ -z "$server" ]; then
   if command -v wslinfo >/dev/null && [ "$(wslinfo --networking-mode)" != mirrored ]; then
@@ -90,7 +93,7 @@ fi
 
 cargo tauri android build --debug --apk --target aarch64
 apk="$(find src-tauri/gen/android/app/build/outputs/apk -name '*debug*.apk' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)"
-echo "Built $apk (relay $SERVER_ADDR and its public key baked in)."
+echo "Built $apk (relay $SERVER_ADDR and its keys baked in)."
 
 # Install over USB if a phone is connected; otherwise leave the APK where
 # it's easy to get onto the phone (ANDROID.md step 8).

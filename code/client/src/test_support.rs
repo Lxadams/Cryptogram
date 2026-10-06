@@ -1,32 +1,12 @@
-//! Helpers shared by the unit-test modules (`lib.rs`, `transport`).
+//! Helpers shared by the unit-test modules (`lib.rs`, `transport`, `link`).
 
-use crate::{Client, SymmetricSessionState};
-use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-use std::net::SocketAddr;
+use crate::{Client, Outgoing, SymmetricSessionState};
 
 pub(crate) use fec::test_util::Rng;
 
-/// What the relay does to a client's packet before forwarding it: strip
-/// the sender's link layer and the routing token, leaving the inner payload
-/// (the recipient's own link layer is re-added and removed symmetrically,
-/// so tests skip it).
-pub(crate) fn strip_link(packet: &[u8], link_key: &[u8; 32]) -> Vec<u8> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(link_key));
-    let inner = cipher
-        .decrypt(XNonce::from_slice(&packet[5..29]), &packet[29..])
-        .unwrap();
-    inner[16..].to_vec()
-}
-
-/// `strip_link` for a packet `sender` just produced.
-pub(crate) fn relay(packet: &[u8], sender: &Client) -> Vec<u8> {
-    strip_link(packet, &sender.link_master_key)
-}
-
 /// A fresh client whose persistence points at a scratch path.
 pub(crate) fn new_client() -> Client {
-    let addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
-    let mut client = Client::new(addr);
+    let mut client = Client::new();
     client.state_path = std::env::temp_dir()
         .join(format!(
             "e2e-test-{}.json",
@@ -37,18 +17,47 @@ pub(crate) fn new_client() -> Client {
     client
 }
 
-/// Deliver `packet` from `sender` to `receiver` on a clean link, then each
+/// Hand `to` just enough of `out`'s symbols to rebuild it, as the relay
+/// would over a clean link. Returns `to`'s reply, if it has one.
+pub(crate) fn deliver(to: &mut Client, mut out: Outgoing) -> Option<Outgoing> {
+    let mut reply = None;
+    for payload in out.take(out.needed()) {
+        if let Some(r) = to.handle_incoming_packet(&payload).unwrap() {
+            assert!(reply.is_none(), "one reply per object");
+            reply = Some(r);
+        }
+    }
+    reply
+}
+
+/// The bare 0x02/0x04 payload a contact-request object carries: what its
+/// symbols rebuild.
+pub(crate) fn control_payload(mut out: Outgoing) -> Vec<u8> {
+    let mut rx = fec::Reassembler::default();
+    for symbol in out.take(out.needed()) {
+        assert_eq!(symbol[0], crate::transport::CONTROL_SYMBOL);
+        if let Some(object) = rx
+            .ingest(0u8, &symbol[17..], std::time::Instant::now())
+            .unwrap()
+        {
+            return crate::transport::unbundle(&object).unwrap()[0].to_vec();
+        }
+    }
+    panic!("the object didn't rebuild from its own symbols");
+}
+
+/// Deliver `out` from `sender` to `receiver` on a clean link, then each
 /// reply the other way, until one side has nothing to send. Returns the
-/// type byte of every packet delivered, in order.
-pub(crate) fn exchange(sender: &mut Client, receiver: &mut Client, mut packet: Vec<u8>) -> Vec<u8> {
+/// type of every payload delivered (0x02 KeyExchange, 0x04
+/// SessionEstablish), in order.
+pub(crate) fn exchange(sender: &mut Client, receiver: &mut Client, mut out: Outgoing) -> Vec<u8> {
     let mut kinds = Vec::new();
     let (mut from, mut to) = (sender, receiver);
     loop {
-        let inner = relay(&packet, from);
-        kinds.push(inner[0]);
+        kinds.push(out.kind());
         assert!(kinds.len() <= 8, "handshake didn't settle: {kinds:x?}");
-        match to.handle_incoming_packet(&inner).unwrap() {
-            Some(reply) => packet = reply,
+        match deliver(to, out) {
+            Some(reply) => out = reply,
             None => return kinds,
         }
         std::mem::swap(&mut from, &mut to);

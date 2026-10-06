@@ -28,17 +28,19 @@ Once the Master Key is established, ongoing messages are secured using the stand
 Tactical networks (like jammed radios) drop packets constantly. Standard TCP networks rely on "ACKs" (acknowledgments) to trigger retransmissions, which fails completely if loss exceeds 50%.
 Instead, our Rust core uses **RaptorQ**, a Forward Error Correction (FEC) fountain code. The messenger pads the encrypted text, slices it into mathematical symbols, and continuously streams redundant repair symbols. The receiver can perfectly reconstruct the message by collecting *any* subset of those symbols, eliminating the need for ACKs entirely.
 
-### 5. Traffic Obfuscation (The Metronomic Tunnel)
-To prevent a passive observer from knowing *when* you are talking or *how much* you are saying, the app establishes a **Constant-Rate Tunnel (CRT)**.
-- A Rust timer loop runs in an Android Foreground Service, firing exactly one packet every **100ms** (10 pkts/sec).
-- If the user isn't typing, the client generates cryptographically secure random bytes (Dummy Packets) and sends them anyway.
-- For extreme deployment conditions (SATCOM, degraded 2G/3G), these packets are sent as **pure, raw UDP datagrams** (over port 443) wrapped in an outer layer of **XChaCha20-Poly1305** Link Encryption (secured statelessly via an ephemeral X25519 handshake against the server's pinned public key). This provides maximum bandwidth efficiency and reliability by eliminating connection handshakes and congestion control overhead, which would otherwise cripple performance under 95% packet loss.
+### 5. Traffic Obfuscation (The Disguised Constant-Rate Tunnel)
+To prevent a passive observer from knowing *when* you are talking or *how much* you are saying, the app keeps a **Constant-Rate Tunnel (CRT)** to the relay, disguised as ordinary HTTP/3. Details and measurements: [disguised-crt-transport.md](disguised-crt-transport.md).
+- Everything travels as fixed-size **cells**, about **4 per second each way**, at random (Poisson) intervals. If there's nothing to send, the cell is padding; real and idle cells look the same.
+- Cells are **QUIC datagrams** on UDP 443 with ALPN `h3`. Every packet after the handshake is padded to 1,200 bytes, and a fixed-rate congestion controller stops QUIC backing off when a jammer drops packets.
+- TLS 1.3 with the hybrid **X25519 + ML-KEM-768** key exchange protects the link against harvest-now-decrypt-later. The app pins the relay's key and stays anonymous at the TLS level.
+- Anyone who connects without the app's access key, a censor probing the address for instance, gets an ordinary website.
+- An Android foreground service with a partial wake lock keeps the stream going with the screen off.
 
 ### 6. The Blind Relay Server
 The backend is a highly concurrent, RAM-only cloud server. It acts purely as a dumb router.
 - It has zero knowledge of User IDs, passwords, or persistent accounts.
-- Clients calculate ephemeral, 16-byte **Routing Tokens** and attach them to the front of their packets.
-- When the Relay receives a packet, it reads the 16-byte token and immediately routes it to the IP address currently registered to that token, or stores it in a temporary offline RAM queue if the recipient is asleep. It employs strict stateless DoS protection, instantly dropping invalid tokens without memory allocation.
+- Clients calculate 16-byte **Routing Tokens** and prove they own theirs when they connect.
+- When the Relay receives a cell, it reads the recipient's token and queues the payload for that token's connection, or holds it in a RAM queue if the recipient is offline. It delivers on its own constant-rate schedule, resending only what the recipient's receipts show was lost.
 
 ### 7. Stretch Goal: Ephemeral Multicast Group Chats
 While the core architecture focuses on strict 1-on-1 privacy, the project includes a stretch goal to implement Ephemeral Multicast Group Chats. This involves generating "Signal Sender Keys" and securely distributing them over the 1-on-1 channels, allowing the server to dynamically fan-out a single message stream to multiple recipients simultaneously without knowing the group's persistent topology.

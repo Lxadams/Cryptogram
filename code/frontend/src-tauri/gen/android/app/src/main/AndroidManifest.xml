@@ -7,6 +7,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Keeping the relay link's constant-rate cell stream going with the
+         screen off (see MessageService.kt) -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- allowBackup/dataExtractionRules: identities never leave the phone,
          see res/xml/data_extraction_rules.xml. -->
@@ -36,7 +40,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keeps an end-to-end encrypted messenger's relay connection open while the user is logged in, so new messages arrive and can be notified without a push service." />
+                android:value="Keeps an end-to-end encrypted messenger's relay connection open while the user is logged in, sending at a constant rate so its traffic doesn't reveal when the user is messaging, and so new messages arrive and can be notified without a push service." />
         </service>
 
         <provider

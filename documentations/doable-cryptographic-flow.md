@@ -25,17 +25,15 @@ Because ML-KEM-768 public keys are 1184 bytes (far too large for a reliable QR c
 
 ---
 
-## 3. Phase 2: Server Link Handshake
+## 3. Phase 2: Link to the Relay (QUIC)
 
-Before any E2E communication can occur, each client must establish a link-layer encrypted tunnel with the server.
+Before any E2E communication can occur, each client opens a link to the relay: a QUIC connection on UDP 443 that looks like HTTP/3. Details: [disguised-crt-transport.md](disguised-crt-transport.md).
 
-1.  **Client Boot**: The client generates an ephemeral X25519 keypair, signs the ephemeral public key with its Ed25519 identity, and sends a Handshake packet `[TYPE_HANDSHAKE | SessionID | EphX25519Pub | Ed25519Pub | Ed25519Signature]` to the server.
-2.  **Server Processing**: The server verifies the client's Ed25519 signature over the ephemeral key (Mutual Auth). It performs `DH(ServerEphPriv, ClientEphPub)` and derives a Link Master Key via `HKDF-SHA256` with salt `"e2e-messenger-v1"` and info string `"wireguard-lite-link"`. It returns `[TYPE_HANDSHAKE_RESP | SessionID | ServerEphPub | ServerEd25519Sig]`.
-3.  **Client Completion**: The client verifies the server's signature using the server's static identity, performs DH with the server's ephemeral public key, and derives the identical Link Master Key using the same HKDF parameters.
-4.  **Sync Packet**: The client sends its Routing Token (link-encrypted) so the server can map `RoutingToken → (SocketAddr, SessionID)` for routing. Clients resend it every 15 seconds to keep their NAT mapping (and the server's record) alive.
-5.  **Delivery & Acks**: The server gives each queued packet a random 16-byte Delivery ID and sends it to the recipient in the 16-byte prefix of the forwarded envelope (all zeros on a dummy packet). The recipient handles the packet, then replies with an Ack `[TYPE_ACK (3) | SessionID | Nonce | link-encrypted: own RoutingToken | DeliveryID...]`, and the server drops the packet from its queue. Only the link session the token last synced from can ack it. Until then the server resends it after 2s, 4s, 8s… (at most 60s apart), and straight away when the recipient syncs from a new address or after more than 30 seconds of silence (it was asleep). Resends are safe: the client remembers recent Delivery IDs, so a repeat is only acked again, never handled twice.
+1.  **TLS 1.3 handshake**: The client offers only the hybrid `X25519MLKEM768` key exchange and ALPN `h3`, and sends no client certificate. It accepts the relay only if the relay proves it holds the key the app is pinned to (`SERVER_PUBKEY`: SHA-256 of the certificate's public key), whoever signed the certificate.
+2.  **Hello**: Both ends derive a 32-byte value from the TLS session (exporter label `"EXPORTER-e2e-messenger/link/v1"`). The client's first cells carry a hello: an HMAC of that value under the app's access key, its Routing Token, the token key the token is a hash of, and that key's signature over a value derived from the exporter. The relay ignores the connection's datagrams (it's just a visitor to the website) until a hello checks out, then routes the token's packets to this connection.
+3.  **Cells**: From then on each side sends the other a fixed-size cell about 4 times a second (Poisson-spaced), real or padding, as QUIC datagrams. Each cell carries a receipt for the other side's cells, which is how deliveries are acknowledged and how each side measures loss. The relay keeps a queued packet until a receipt shows it arrived, and resends it when a receipt shows it was lost, or on the token's next connection if this one closes first.
 
-All subsequent packets are wrapped in `XChaCha20-Poly1305` link encryption using this key.
+QUIC encrypts every packet; there's no separate link encryption.
 
 ---
 

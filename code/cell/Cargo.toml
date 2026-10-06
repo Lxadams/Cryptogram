@@ -1,0 +1,27 @@
+[package]
+name = "cell"
+version = "0.1.0"
+edition = "2024"
+
+# The link protocol shared by the client and the relay: fixed-size cells,
+# their framing and receipts, constant-rate pacing, the hello that opens a
+# link, and the QUIC settings both ends run it over.
+[dependencies]
+# rustls via quinn's re-export (`quinn::rustls`), with aws-lc-rs: the
+# provider with the hybrid X25519MLKEM768 key exchange.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+# For `RandomConnectionIdGenerator`, which quinn doesn't re-export.
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs"] }
+# Reads the relay certificate's public key, for the key pin.
+rustls-webpki = { version = "0.103", default-features = false, features = ["alloc", "std"] }
+bytes = "1"
+tokio = { version = "1", features = ["time"] }
+sha2 = "0.10.8"
+hmac = "0.12.1"
+hkdf = "0.12.3"
+subtle = "2.6"
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+rand_core = { version = "0.6.4", features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

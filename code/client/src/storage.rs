@@ -8,15 +8,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::net::SocketAddr;
 use std::path::Path;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
+/// Older state files also have `server_addr` and `session_id`, from when
+/// the link layer lived here; serde skips them on load.
 #[derive(Serialize, Deserialize)]
 pub struct ClientStateDto {
     pub identity: UserIdentityDto,
-    pub server_addr: String,
-    pub session_id: String,
     pub e2e_sessions: HashMap<String, SymmetricSessionStateDto>,
     pub pending_contacts: HashMap<String, String>,
     pub peer_kyber_keys: HashMap<String, String>,
@@ -143,8 +142,6 @@ impl ClientStateDto {
 
         Self {
             identity,
-            server_addr: client.server_addr.to_string(),
-            session_id: hex::encode(client.session_id),
             e2e_sessions,
             pending_contacts,
             peer_kyber_keys,
@@ -198,11 +195,6 @@ impl ClientStateDto {
             kyber_public: kyber_pub,
             kyber_secret: kyber_sec,
         };
-
-        let server_addr: SocketAddr = self.server_addr.parse()?;
-
-        let mut session_id = [0u8; 4];
-        hex::decode_to_slice(&self.session_id, &mut session_id)?;
 
         let mut e2e_sessions = HashMap::new();
         for (hex_tok, dto_state) in self.e2e_sessions {
@@ -302,9 +294,6 @@ impl ClientStateDto {
 
         Ok(Client {
             identity,
-            server_addr,
-            link_master_key: [0u8; 32], // re-negotiated on boot
-            session_id,                 // can reuse the stored session id, or generate new
             e2e_sessions,
             pending_contacts,
             peer_kyber_keys,
@@ -318,7 +307,6 @@ impl ClientStateDto {
             identity_store: None, // attached separately once a vault key is available
             reassembler: Default::default(), // live state, not persisted — see Client::reassembler
             fec_rx: Default::default(), // in-flight FEC state, not persisted
-            recent_deliveries: Default::default(), // live state, not persisted
             awaiting_session_est: Default::default(), // live state, not persisted
             connection_requests: Vec::new(), // live state, not persisted
         })
@@ -398,7 +386,6 @@ impl IdentityStateStore {
 mod identity_state_store_tests {
     use super::*;
     use crate::Client;
-    use std::net::SocketAddr;
 
     struct ScratchDb(std::path::PathBuf);
 
@@ -428,17 +415,13 @@ mod identity_state_store_tests {
             .as_nanos() as u64
     }
 
-    fn test_addr() -> SocketAddr {
-        "127.0.0.1:4430".parse().unwrap()
-    }
-
     #[test]
     fn test_save_and_load_roundtrip_preserves_identity() {
         let db = ScratchDb::new("roundtrip");
         let key = [5u8; 32];
         let store = IdentityStateStore::open(&db.0, &key).unwrap();
 
-        let original = Client::new(test_addr());
+        let original = Client::new();
         let original_token = original.identity.routing_token;
         store.save(&original).unwrap();
 
@@ -453,7 +436,7 @@ mod identity_state_store_tests {
         let original_token;
         {
             let store = IdentityStateStore::open(&db.0, &key).unwrap();
-            let client = Client::new(test_addr());
+            let client = Client::new();
             original_token = client.identity.routing_token;
             store.save(&client).unwrap();
         }
@@ -467,7 +450,7 @@ mod identity_state_store_tests {
         let db = ScratchDb::new("wrongkey");
         {
             let store = IdentityStateStore::open(&db.0, &[1u8; 32]).unwrap();
-            store.save(&Client::new(test_addr())).unwrap();
+            store.save(&Client::new()).unwrap();
         }
         assert!(IdentityStateStore::open(&db.0, &[2u8; 32]).is_err());
     }
@@ -484,7 +467,7 @@ mod identity_state_store_tests {
     /// new, provable one (and the rest of the identity unchanged).
     #[test]
     fn test_identity_without_token_key_gets_a_provable_token() {
-        let original = Client::new(test_addr());
+        let original = Client::new();
         let mut dto = ClientStateDto::from_client(&original);
         dto.identity.token_secret.clear();
         let loaded = dto.into_client("unused").unwrap();
@@ -500,6 +483,22 @@ mod identity_state_store_tests {
         assert_eq!(
             loaded.identity.ed25519_public,
             original.identity.ed25519_public
+        );
+    }
+
+    /// State saved before the link layer moved out of `Client` (QUIC) still
+    /// loads: its relay address and session ID are simply ignored.
+    #[test]
+    fn test_state_saved_before_quic_still_loads() {
+        let original = Client::new();
+        let mut json = serde_json::to_value(ClientStateDto::from_client(&original)).unwrap();
+        json["server_addr"] = "127.0.0.1:4430".into();
+        json["session_id"] = "aabbccdd".into();
+        let dto: ClientStateDto = serde_json::from_value(json).unwrap();
+        let loaded = dto.into_client("unused").unwrap();
+        assert_eq!(
+            loaded.identity.routing_token,
+            original.identity.routing_token
         );
     }
 

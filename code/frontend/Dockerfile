@@ -30,6 +30,8 @@ RUN rustup target add wasm32-unknown-unknown \
 WORKDIR /app
 COPY fec/Cargo.toml ./fec/
 COPY fec/src ./fec/src
+COPY cell/Cargo.toml ./cell/
+COPY cell/src ./cell/src
 COPY client/Cargo.toml client/Cargo.lock ./client/
 COPY client/src ./client/src
 COPY frontend/Cargo.toml frontend/Cargo.lock ./frontend/

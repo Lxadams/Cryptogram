@@ -11,6 +11,11 @@ services:
     volumes:
       - server_identity:/data
     restart: unless-stopped
+    # A fixed address, so the client can be given an IP: a name would be
+    # looked up over DNS-over-HTTPS, which can't see Compose's service names.
+    networks:
+      relay:
+        ipv4_address: 172.30.0.10
 
   client:
     build:
@@ -19,20 +24,23 @@ services:
     depends_on:
       - server
     environment:
-      - SERVER_ADDR=server:443
+      - SERVER_ADDR=172.30.0.10:443
+      - SERVER_ACCESS_KEY=${SERVER_ACCESS_KEY:-}
       - RUST_LOG=info
     volumes:
       - client_state:/data
+    networks:
+      - relay
     stdin_open: true
     tty: true
-    # Interactive REPL — run with `docker compose run`, not `up`. The relay
-    # prints "Server Static Pubkey: <hex>" on boot (`docker compose logs
-    # server`); pass it here since the client authenticates the relay's
-    # identity during the handshake. Left blank by default (rather than a
-    # hard Compose-level requirement) so `docker compose up server` etc.
-    # aren't blocked by this var being unset — the binary itself rejects a
-    # missing/short key with a clear "must be 32 bytes" error if you forget:
-    #   SERVER_PUBKEY=<hex> docker compose run --rm client
+    # Interactive REPL — run with `docker compose run`, not `up`. The client
+    # ships with the relay's key pin and access key rather than asking it:
+    #   docker compose exec server server --print-pubkey
+    #   docker compose exec server server --print-access-key
+    # Left blank by default (rather than a hard Compose-level requirement)
+    # so `docker compose up server` etc. aren't blocked by them being unset;
+    # the binary itself says what's missing if you forget:
+    #   SERVER_PUBKEY=<hex> SERVER_ACCESS_KEY=<hex> docker compose run --rm client
     command: ["${SERVER_PUBKEY:-}"]
 
   # Build-only: compiles the Tauri desktop shell into a Linux .deb/AppImage.
@@ -54,3 +62,9 @@ services:
 volumes:
   server_identity:
   client_state:
+
+networks:
+  relay:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

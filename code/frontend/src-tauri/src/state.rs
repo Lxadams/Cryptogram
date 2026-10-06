@@ -2,34 +2,32 @@
 //!
 //! `Client` (from the `client` crate) already IS the full protocol/crypto
 //! state machine that the CLI drives directly — we just need to keep one
-//! alive across GUI events instead of a stdin loop, plus the UDP socket it
-//! sends/receives on.
+//! alive across GUI events instead of a stdin loop, plus the link to the
+//! relay it sends and receives over.
 
-use client::{BurstSender, Client};
-use std::{fs::File, sync::Arc};
-use tokio::{net::UdpSocket, sync::Mutex};
+use client::{link::RelayLink, Client};
+use std::fs::File;
+use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 /// Everything needed to actually talk to the relay: the protocol state
-/// machine plus the socket it was handshaked on. `None` until the
-/// `bootstrap` command successfully completes the link handshake.
+/// machine plus its link to the relay. `None` until the `bootstrap` command
+/// has started the link.
 pub struct ClientRuntime {
     pub client: Client,
-    pub socket: Arc<UdpSocket>,
-    /// Paces message bursts out over `socket`, one at a time and in order.
-    pub bursts: BurstSender,
-    /// Handles to the background tasks `bootstrap` spawned (receive and
-    /// keepalive loops) — aborted by `logout` so they don't keep
-    /// running against an abandoned socket/identity after the user switches
-    /// identities without closing the whole app.
+    /// The QUIC connection and constant-rate cell stream to the relay (see
+    /// `client::link`). Reconnects by itself; dropping it closes it.
+    pub link: RelayLink,
+    /// Handles to the background tasks `bootstrap` spawned — aborted by
+    /// `logout` so they don't keep running against an abandoned identity
+    /// after the user switches identities without closing the whole app.
     pub tasks: Vec<tauri::async_runtime::JoinHandle<()>>,
 }
 
 /// Which identity the `login` command resolved (pseudonym + passcode
 /// checked/created), waiting for `bootstrap` to actually load/create the
-/// `Client` from `state_path` and perform the relay handshake. Split into
-/// its own step because identity resolution (login) doesn't need the relay
-/// address, while `Client::new` for a brand-new identity currently does.
+/// `Client` from `state_path` and connect to the relay. Split into its own
+/// step because identity resolution (login) doesn't need the relay.
 #[derive(Clone)]
 pub struct PendingIdentity {
     pub pseudonym: String,
@@ -45,8 +43,8 @@ pub struct PendingIdentity {
 
 /// Tauri-managed application state (registered via `.manage(...)` in
 /// `lib.rs`). A `tokio::sync::Mutex` (not `std::sync::Mutex`) because
-/// commands hold the lock across `.await` points (e.g. while sending a UDP
-/// packet), which a std mutex guard can't safely do in async code.
+/// commands hold the lock across `.await` points, which a std mutex guard
+/// can't safely do in async code.
 #[derive(Default)]
 pub struct AppState {
     pub runtime: Mutex<Option<ClientRuntime>>,

@@ -68,9 +68,18 @@ rm server.tar
 docker image prune -f
 ```
 
+With a Let's Encrypt certificate (see [`ec2-deployment.md`](ec2-deployment.md#domain-and-certificate)),
+add these before `server:latest`:
+```
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  -e TLS_CERT=/etc/letsencrypt/live/relay.example.com/fullchain.pem \
+  -e TLS_KEY=/etc/letsencrypt/live/relay.example.com/privkey.pem \
+```
+
 The `-v server_identity:/data` matters even for a one-off manual deploy —
-without it, the container regenerates a fresh Ed25519 identity on every
-`docker rm`+`run`, and every client would need the new pubkey each time.
+without it, the container makes a new access key (and self-signed
+certificate) on every `docker rm`+`run`, and every app would need
+rebuilding with the new ones each time.
 
 ## 5. Verify it's up
 
@@ -79,16 +88,19 @@ Still on the instance (or from WSL via `ssh ... "..."`):
 docker logs server --tail 20
 ```
 
-You should see the same three lines the container prints on a fresh boot:
+You should see the lines the container prints on a fresh boot:
 ```
-No existing server identity found. Generating new Ed25519 keypair...
-UDP server listening on 0.0.0.0:443
+No TLS certificate configured; making a self-signed one for ["localhost"]
+Generated a new access key (relay_access_key)
+QUIC relay listening on UDP 0.0.0.0:443
 Server Static Pubkey: <hex>
 ```
 
-On a *re*-deploy against an existing `server_identity` volume, the first
-line won't appear (identity already exists) and the pubkey should be
-identical to last time — that's the persistence working.
+The first two only appear on the first boot without a certificate
+configured. On a *re*-deploy against an existing `server_identity` volume
+(or with the same Let's Encrypt key) the pubkey should be identical to last
+time — that's the persistence working. `docker exec server server
+--print-access-key` prints the access key the app needs too.
 
 ## Doing steps 3+4 in one shot
 

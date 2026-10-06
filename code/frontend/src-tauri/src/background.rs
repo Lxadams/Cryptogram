@@ -4,8 +4,11 @@
 //! `NativeBridge.kt` and `MessageService.kt` under `gen/android/app/src/main/java/`).
 //! A Kotlin thread blocks in `nextEvent` and reacts to the events sent from
 //! here:
-//! - While someone is logged in, it runs a foreground service, so Android
-//!   doesn't freeze the process and the UDP socket keeps receiving.
+//! - While someone is logged in, it runs a foreground service holding a
+//!   partial wake lock, so Android neither freezes the process nor lets the
+//!   CPU sleep: the link to the relay sends and receives cells a few times
+//!   a second all the time, which is what keeps its timing from giving
+//!   anything away (see `client::link`).
 //! - It posts a notification for each message that arrives while the app
 //!   is in the background.
 //!
@@ -21,9 +24,9 @@
 use tauri::{AppHandle, RunEvent};
 use tokio::sync::Notify;
 
-/// Wakes `spawn_keepalive_loop` to sync with the relay right away. Android
-/// signals it when the app comes back to the foreground, so messages the
-/// relay is holding arrive at once instead of on the next 15s tick.
+/// Asks the relay link to reconnect right away if it's down, rather than
+/// wait out its backoff (see `spawn_resume_watcher` in commands.rs).
+/// Android signals it when the app comes back to the foreground.
 pub static RESYNC: Notify = Notify::const_new();
 
 /// Someone logged in and connected to the relay.

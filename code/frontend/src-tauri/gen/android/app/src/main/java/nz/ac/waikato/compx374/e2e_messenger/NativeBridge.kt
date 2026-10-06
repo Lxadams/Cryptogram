@@ -12,7 +12,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * in [nextEvent] for what the Rust backend reports, and keeps the app
  * receiving messages while it isn't on screen:
  * - while someone is logged in, [MessageService] runs as a foreground
- *   service, so Android doesn't freeze the process and its UDP socket;
+ *   service holding a partial wake lock, so Android neither freezes the
+ *   process nor lets the CPU sleep (and the user is asked, once, to exempt
+ *   the app from battery optimisation, which Doze otherwise overrides);
  * - a message that arrives while the app is in the background gets a
  *   notification.
  */
@@ -50,7 +52,10 @@ object NativeBridge {
 
     private fun handle(context: Context, event: String) {
         when {
-            event == "session_started" -> MessageService.start(context)
+            event == "session_started" -> {
+                MessageService.start(context)
+                MessageService.requestBatteryExemptionOnce(context)
+            }
             event == "session_ended" -> MessageService.stop(context)
             event.startsWith("message\t") -> {
                 val onScreen = ProcessLifecycleOwner.get().lifecycle.currentState

@@ -4,16 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# The link protocol shared with the client: cells, receipts, pacing, the
+# hello, and the QUIC settings (see code/cell).
+cell = { path = "../cell" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+# The website anyone without the app's access key sees (see src/site.rs).
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+bytes = "1"
+# Self-signed certificate for local testing (see src/tls.rs).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 anyhow = "1"
-x25519-dalek = { version = "2.0.0", features = ["static_secrets"] }
-chacha20poly1305 = "0.10.1"
-hkdf = "0.12.3"
-sha2 = "0.10.8"
 rand_core = { version = "0.6.4", features = ["std"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
 hex = "0.4.3"
+
+[dev-dependencies]
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }

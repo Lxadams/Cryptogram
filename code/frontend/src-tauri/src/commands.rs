@@ -7,21 +7,25 @@
 use crate::background;
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use client::{
-    derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
-    BurstSender, ChatHistory, Client, ClientStateDto, IdentityStateStore, RoutingToken,
+    derive_vault_key, hash_passcode,
+    link::{Handler, RelayConfig, RelayLink},
+    parse_routing_token, parse_verifying_key, ChatHistory, Client, ClientStateDto,
+    IdentityStateStore, RoutingToken,
 };
 use serde::Serialize;
 use std::{
     collections::HashSet,
     fs::{self, File, TryLockError},
     io,
-    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tauri::{AppHandle, Manager, State};
-use tokio::net::UdpSocket;
 use zeroize::Zeroize;
+
+/// How long Connect waits for the relay to accept us.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Root directory identities are stored under: the OS-standard per-app data
 /// directory (e.g. `~/.local/share/<bundle-id>/identities` on Linux —
@@ -130,33 +134,58 @@ fn parse_token(token_hex: &str) -> Result<RoutingToken, String> {
 
 /// The relay (server) this prototype talks to. Defaults to the CLI's own
 /// local-dev default (`127.0.0.1:4430`, see runserver.sh); override with
-/// the `SERVER_ADDR` env var (e.g. a deployed EC2 host's `<ip>:443`) —
-/// mirrors the same override on the CLI (see code/client/src/main.rs).
-/// `SERVER_ADDR` set at launch wins; failing that, the value it had at
-/// build time is baked in, since a mobile app can't be launched with env
-/// vars (see code/frontend/ANDROID.md).
+/// the `SERVER_ADDR` env var (e.g. a deployed host's `<ip>:443`) — mirrors
+/// the same override on the CLI (see code/client/src/main.rs). An IP
+/// address is used as is, so nothing is looked up; a name is resolved over
+/// DNS-over-HTTPS (see `client::link`). `SERVER_ADDR` set at launch wins;
+/// failing that, the value it had at build time is baked in, since a
+/// mobile app can't be launched with env vars (see code/frontend/ANDROID.md).
 fn server_addr_raw() -> String {
-    std::env::var("SERVER_ADDR")
-        .ok()
-        .or_else(|| option_env!("SERVER_ADDR").map(str::to_string))
-        .unwrap_or_else(|| "127.0.0.1:4430".to_string())
+    build_setting("SERVER_ADDR").unwrap_or_else(|| "127.0.0.1:4430".to_string())
 }
 
-/// The relay's Ed25519 identity pubkey (hex), which authenticates its side of
-/// the link handshake. It ships with the app rather than being asked of the
-/// relay, which anyone on the network path could answer with their own key.
-/// `SERVER_PUBKEY` set at launch wins; failing that, the value it had at
-/// build time is baked in, as for `server_addr_raw`. The relay prints it at
-/// startup ("Server Static Pubkey"), or with `--print-pubkey`.
-fn relay_pubkey_hex() -> Result<String, String> {
-    std::env::var("SERVER_PUBKEY")
+/// A relay setting: from the environment at launch, or failing that as it
+/// was at build time.
+fn build_setting(name: &str) -> Option<String> {
+    let baked = match name {
+        "SERVER_ADDR" => option_env!("SERVER_ADDR"),
+        "SERVER_NAME" => option_env!("SERVER_NAME"),
+        "SERVER_PUBKEY" => option_env!("SERVER_PUBKEY"),
+        "SERVER_ACCESS_KEY" => option_env!("SERVER_ACCESS_KEY"),
+        _ => None,
+    };
+    std::env::var(name)
         .ok()
-        .or_else(|| option_env!("SERVER_PUBKEY").map(str::to_string))
-        .ok_or_else(|| {
-            "This build doesn't know the relay's public key. Set SERVER_PUBKEY to the \
-             \"Server Static Pubkey\" the relay prints, when building or launching the app."
-                .to_string()
-        })
+        .or_else(|| baked.map(str::to_string))
+        .filter(|value| !value.is_empty())
+}
+
+/// The relay's key pin (hex): the app trusts the relay only if it proves it
+/// holds that key (see `client::link`). It ships with the app rather than
+/// being asked of the relay, which anyone on the network path could answer
+/// with their own key. The relay prints it at startup ("Server Static
+/// Pubkey"), or with `--print-pubkey`. With the access key (`--print-access-key`),
+/// what the app proves to the relay, and `SERVER_NAME`, the name on the
+/// relay's certificate when `SERVER_ADDR` is an IP address.
+async fn relay_config() -> Result<RelayConfig, String> {
+    let missing = |name: &str, flag: &str| {
+        format!(
+            "This build doesn't know the relay's {name}. Set {} to what `server {flag}` \
+             prints, when building or launching the app.",
+            if flag == "--print-pubkey" {
+                "SERVER_PUBKEY"
+            } else {
+                "SERVER_ACCESS_KEY"
+            }
+        )
+    };
+    let key_pin = build_setting("SERVER_PUBKEY").ok_or_else(|| missing("key", "--print-pubkey"))?;
+    let access_key = build_setting("SERVER_ACCESS_KEY")
+        .ok_or_else(|| missing("access key", "--print-access-key"))?;
+    let name = build_setting("SERVER_NAME");
+    RelayConfig::from_settings(&server_addr_raw(), name.as_deref(), &key_pin, &access_key)
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[derive(Serialize, Clone)]
@@ -339,7 +368,6 @@ fn resolve_delete_identity(root: &Path, pseudonym: &str) -> Result<(), String> {
 fn load_or_migrate_identity_state(
     state_path: &Path,
     vault_key: &[u8; 32],
-    server_addr: SocketAddr,
 ) -> Result<Client, String> {
     let store = IdentityStateStore::open(state_path, vault_key).map_err(|e| e.to_string())?;
 
@@ -351,11 +379,6 @@ fn load_or_migrate_identity_state(
         .load(&state_path.to_string_lossy())
         .map_err(|e| format!("Couldn't load this identity's saved state: {e:#}"))?;
     if let Some(mut client) = loaded {
-        // The relay address comes from this launch (`SERVER_ADDR`), not
-        // from whatever was saved when the identity was created —
-        // otherwise an identity first used against a local relay could
-        // never be pointed at a deployed one.
-        client.server_addr = server_addr;
         client.identity_store = Some(store);
         return Ok(client);
     }
@@ -368,9 +391,8 @@ fn load_or_migrate_identity_state(
         let _ = fs::remove_file(&legacy_path);
         legacy_client
     } else {
-        Client::new(server_addr)
+        Client::new()
     };
-    client.server_addr = server_addr;
     client.state_path = state_path.to_string_lossy().into_owned();
     client.identity_store = Some(store);
     Ok(client)
@@ -644,10 +666,6 @@ mod tests {
         assert!(resolve_login(&root, "dave", "").is_err());
     }
 
-    fn test_addr() -> SocketAddr {
-        "127.0.0.1:4430".parse().unwrap()
-    }
-
     #[test]
     fn test_load_or_migrate_creates_fresh_identity_when_nothing_exists() {
         let root = scratch_dir("fresh_identity");
@@ -661,7 +679,7 @@ mod tests {
             panic!("expected a successful login");
         };
 
-        let client = load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        let client = load_or_migrate_identity_state(&state_path, &vault_key).unwrap();
         assert_eq!(client.state_path, state_path.to_string_lossy());
         assert!(state_path.is_file());
     }
@@ -679,35 +697,12 @@ mod tests {
             panic!("expected a successful login");
         };
 
-        let first = load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        let first = load_or_migrate_identity_state(&state_path, &vault_key).unwrap();
         let original_token = first.identity.routing_token;
         first.save();
 
-        let second = load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        let second = load_or_migrate_identity_state(&state_path, &vault_key).unwrap();
         assert_eq!(second.identity.routing_token, original_token);
-    }
-
-    #[test]
-    fn test_load_or_migrate_uses_this_launchs_relay_address_not_the_saved_one() {
-        let root = scratch_dir("relay_address_override");
-        resolve_create_identity(&root, "alice", "hunter2").unwrap();
-        let LoginResolution::Success {
-            state_path,
-            vault_key,
-            ..
-        } = resolve_login(&root, "alice", "hunter2").unwrap()
-        else {
-            panic!("expected a successful login");
-        };
-
-        // Created (and saved) against a local relay...
-        let first = load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
-        first.save();
-
-        // ...then relaunched pointing at a deployed one.
-        let deployed: SocketAddr = "3.25.64.73:443".parse().unwrap();
-        let second = load_or_migrate_identity_state(&state_path, &vault_key, deployed).unwrap();
-        assert_eq!(second.server_addr, deployed);
     }
 
     #[test]
@@ -726,13 +721,12 @@ mod tests {
         // Simulate a pre-migration identity: a plaintext client_state.json
         // sibling, no client_state.sqlite yet.
         let legacy_path = state_path.with_file_name("client_state.json");
-        let legacy_client = Client::new(test_addr());
+        let legacy_client = Client::new();
         let legacy_token = legacy_client.identity.routing_token;
         ClientStateDto::save(&legacy_client, &legacy_path.to_string_lossy()).unwrap();
         assert!(!state_path.is_file());
 
-        let migrated =
-            load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        let migrated = load_or_migrate_identity_state(&state_path, &vault_key).unwrap();
         assert_eq!(migrated.identity.routing_token, legacy_token);
         assert!(state_path.is_file());
         assert!(
@@ -742,8 +736,7 @@ mod tests {
 
         // And the migrated identity is now readable from the encrypted
         // store alone, without the plaintext file.
-        let reloaded =
-            load_or_migrate_identity_state(&state_path, &vault_key, test_addr()).unwrap();
+        let reloaded = load_or_migrate_identity_state(&state_path, &vault_key).unwrap();
         assert_eq!(reloaded.identity.routing_token, legacy_token);
     }
 
@@ -797,22 +790,16 @@ fn identity_dto(client: &Client) -> IdentityDto {
     }
 }
 
-/// Perform the link-layer handshake with the relay and start listening for
-/// inbound packets. Must be called once before any other command will work.
-/// Mirrors what the CLI's `main()` does at startup, just triggered by a UI
-/// button instead of running unconditionally on process start — except the
-/// relay's pubkey comes with the app (see `relay_pubkey_hex`) instead of being
-/// passed in by hand.
+/// Connect to the relay and start the link (see `client::link`): a QUIC
+/// connection carrying a constant-rate stream of cells, which reconnects by
+/// itself whenever it drops. Must be called once before any other command
+/// will work. Mirrors what the CLI's `main()` does at startup, just
+/// triggered by a UI button instead of running unconditionally on process
+/// start — except the relay's keys come with the app (see `relay_config`)
+/// instead of being passed in by hand.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<IdentityDto, String> {
-    let server_pub =
-        parse_verifying_key(&relay_pubkey_hex()?).map_err(|e| format!("SERVER_PUBKEY: {e}"))?;
-    let server_addr_raw = server_addr_raw();
-    let server_addr: SocketAddr = tokio::net::lookup_host(&server_addr_raw)
-        .await
-        .map_err(|e| e.to_string())?
-        .next()
-        .ok_or_else(|| format!("Could not resolve SERVER_ADDR: {server_addr_raw}"))?;
+    let config = relay_config().await?;
 
     // Which identity to load/create was already decided by the `login`
     // command (pseudonym + passcode check), before this screen ever runs.
@@ -825,11 +812,8 @@ pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Ide
 
     // Resume a previous identity if one was saved (migrating it out of the
     // legacy plaintext file if needed), otherwise mint a new one.
-    let mut client = load_or_migrate_identity_state(
-        Path::new(&pending.state_path),
-        &pending.vault_key,
-        server_addr,
-    )?;
+    let mut client =
+        load_or_migrate_identity_state(Path::new(&pending.state_path), &pending.vault_key)?;
     client.local_name = pending.pseudonym;
 
     // Chat history lives right next to client_state.sqlite under the same
@@ -841,49 +825,35 @@ pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Ide
         .join("chat_history.sqlite");
     client.history =
         Some(ChatHistory::open(&history_path, &pending.vault_key).map_err(|e| e.to_string())?);
-
-    let socket = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| e.to_string())?,
-    );
-
-    perform_handshake(&mut client, &socket, &server_pub)
-        .await
-        .map_err(|e| e.to_string())?;
     client.save();
 
     let identity = identity_dto(&client);
-
-    // Spawned before being stored: each loop looks up `state.runtime` fresh
-    // on every tick (tolerating it being briefly `None`), so spawn order
-    // relative to the `state.runtime` write below doesn't matter.
-    let tasks = vec![
-        spawn_receive_loop(app.clone(), socket.clone()),
-        spawn_keepalive_loop(app, socket.clone()),
-    ];
-
-    let bursts = BurstSender::spawn(socket.clone(), client.server_addr);
+    let token_secret = client.identity.token_secret.clone();
+    let link = RelayLink::start(config, token_secret, delivery_handler(app.clone()))
+        .map_err(|e| format!("{e:#}"))?;
+    let link_status = link.watch();
     let previous = state.runtime.lock().await.replace(ClientRuntime {
         client,
-        socket,
-        bursts,
-        tasks,
+        link,
+        tasks: vec![spawn_resume_watcher(app)],
     });
-    // A second Connect without logging out in between: stop the old loops
-    // rather than leave them running on an abandoned socket.
-    if let Some(previous) = previous {
-        for task in previous.tasks {
-            task.abort();
-        }
+    // A second Connect without logging out in between: stop the old link
+    // and its tasks rather than leave them running.
+    drop_runtime(previous);
+
+    // Wait for the relay without holding the runtime lock: deliveries that
+    // arrive meanwhile need it.
+    if let Err(e) = link_status.until_up(CONNECT_TIMEOUT).await {
+        drop_runtime(state.runtime.lock().await.take());
+        return Err(e.to_string());
     }
     background::session_started();
 
     Ok(identity)
 }
 
-/// Log out of the current identity: stop its background tasks, drop the
-/// `Client`/socket, and release its session lock (see
+/// Log out of the current identity: stop its link and background tasks,
+/// drop the `Client`, and release its session lock (see
 /// `AppState::identity_lock`) so it can be logged into again — by this
 /// process or another one. Lets the user switch identities without closing
 /// the whole app. Safe to call at any point after `login`, even before
@@ -896,11 +866,7 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
 
 /// `logout`'s work, shared with `login`.
 async fn end_session(state: &AppState) {
-    if let Some(rt) = state.runtime.lock().await.take() {
-        for task in rt.tasks {
-            task.abort();
-        }
-    }
+    drop_runtime(state.runtime.lock().await.take());
     let was_logged_in = state.pending_identity.lock().await.take().is_some();
     state.identity_lock.lock().await.take();
     if was_logged_in {
@@ -908,85 +874,50 @@ async fn end_session(state: &AppState) {
     }
 }
 
-/// Background task: periodically resend a (signed) `sync` packet to the relay
-/// (the same packet type `perform_handshake` sends once at bootstrap).
-///
-/// This only matters once the relay and client are on different machines.
-/// The relay learns/refreshes our real `ip:port` purely from the source
-/// address of our packets, and its own record has a long TTL (see
-/// `METADATA_TTL` in `code/server/src/stores.rs`) — but that's irrelevant if
-/// our *own* NAT/router UDP mapping expires first, which home/campus
-/// routers typically do within 30-60s of silence. Without this, bootstrap
-/// (an immediate round trip on a fresh mapping) succeeds, but any peer
-/// packet routed to us minutes later gets silently dropped by our own
-/// router before it ever reaches this process. Resending well under that
-/// window keeps the mapping (and the relay's record) alive for as long as
-/// the app runs. Purely client-side — the relay already handles a resent
-/// sync packet identically to the first one.
-fn spawn_keepalive_loop(
-    app: AppHandle,
-    socket: Arc<UdpSocket>,
-) -> tauri::async_runtime::JoinHandle<()> {
-    tauri::async_runtime::spawn(async move {
-        let state = app.state::<AppState>();
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
-        ticker.tick().await; // first tick fires immediately; skip it, bootstrap just synced
-        loop {
-            // Also sync early on request, e.g. when Android brings the app
-            // back to the foreground (see `background::RESYNC`).
-            tokio::select! {
-                _ = ticker.tick() => {}
-                _ = background::RESYNC.notified() => {}
-            }
-            let guard = state.runtime.lock().await;
-            let Some(rt) = guard.as_ref() else {
-                continue;
-            };
-            let sync_packet = rt.client.generate_sync_packet();
-            let server_addr = rt.client.server_addr;
-            drop(guard);
-            let _ = socket.send_to(&sync_packet, server_addr).await;
+/// Stop a runtime's tasks; dropping it closes its link.
+fn drop_runtime(runtime: Option<ClientRuntime>) {
+    if let Some(rt) = runtime {
+        for task in rt.tasks {
+            task.abort();
         }
-    })
+    }
 }
 
-/// Background task: read inbound UDP packets for as long as the app runs
-/// and hand them to the client state machine (`Client::handle_relay_packet`,
-/// which also produces the ack the relay waits for) — exactly what the
-/// CLI's spawned task does, just living here instead. Decrypted messages
-/// land in `Client::inbox`, which the frontend collects by polling
-/// `poll_inbox`, and are reported to `background` so Android can show a
-/// notification while the app isn't on screen.
-fn spawn_receive_loop(
-    app: AppHandle,
-    socket: Arc<UdpSocket>,
-) -> tauri::async_runtime::JoinHandle<()> {
-    tauri::async_runtime::spawn(async move {
-        let state = app.state::<AppState>();
-        let mut buf = [0u8; 4096];
-        loop {
-            let len = match socket.recv_from(&mut buf).await {
-                Ok((len, _addr)) => len,
-                // Back off briefly rather than spinning a core if the
-                // socket keeps erroring (e.g. repeated ICMP "port
-                // unreachable" resets on some platforms).
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-
+/// What the link does with each payload the relay delivers: hand it to the
+/// client state machine (`Client::handle_incoming_packet`), report new
+/// messages to `background` so Android can notify while the app isn't on
+/// screen, and return any reply (e.g. a KeyExchange response) for the link
+/// to send. Decrypted messages land in `Client::inbox`, which the frontend
+/// collects by polling `poll_inbox`. With nobody logged in it returns
+/// `None`, so the relay delivers the payload again later.
+fn delivery_handler(app: AppHandle) -> Handler {
+    Arc::new(move |payload| {
+        let app = app.clone();
+        Box::pin(async move {
+            let state = app.state::<AppState>();
             let mut guard = state.runtime.lock().await;
-            let Some(rt) = guard.as_mut() else {
-                continue;
-            };
+            let rt = guard.as_mut()?;
             let inbox_before = rt.client.inbox.len();
-            let replies = rt.client.handle_relay_packet(&buf[..len]);
+            let reply = rt.client.handle_incoming_packet(&payload).ok().flatten();
             for (from, _, _) in &rt.client.inbox[inbox_before..] {
                 background::message_received(&contact_label(&rt.client, from));
             }
-            for packet in replies {
-                let _ = socket.send_to(&packet, rt.client.server_addr).await;
+            Some(reply.into_iter().collect())
+        })
+    })
+}
+
+/// Background task: when Android brings the app back to the foreground
+/// (see `background::RESYNC`), retry a dropped link at once instead of
+/// waiting out its backoff. A link that's up just carries on: its cell
+/// stream never stops, so nothing needs refreshing.
+fn spawn_resume_watcher(app: AppHandle) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        loop {
+            background::RESYNC.notified().await;
+            if let Some(rt) = state.runtime.lock().await.as_ref() {
+                rt.link.reconnect_now();
             }
         }
     })
@@ -1058,12 +989,8 @@ pub async fn connect_to_peer(
 
     let peer_ed25519 = parse_verifying_key(&ed25519_hex).map_err(|e| e.to_string())?;
 
-    let req_packet = rt.client.add_contact(token, peer_ed25519);
-    rt.socket
-        .send_to(&req_packet, rt.client.server_addr)
-        .await
-        .map_err(|e| e.to_string())?;
-
+    let request = rt.client.add_contact(token, peer_ed25519);
+    rt.link.send(request);
     Ok(())
 }
 
@@ -1113,13 +1040,14 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
     Ok(())
 }
 
-/// Encrypt and send an E2E message to an already-established session, as a
-/// burst of FEC packets sized to survive heavy loss (see `client`'s
-/// `create_fec_packets`/`BurstSender`). A long message's chunks, and the PQ
+/// Encrypt an E2E message to an already-established session and queue it on
+/// the link, as an FEC object that goes out a cell at a time on the link's
+/// constant-rate clock, with as much redundancy as the measured loss calls
+/// for (see `client::link`). A long message's chunks, and the PQ
 /// ratchet-injection whenever one is due (roughly every 5th chunk), ride
-/// inside the same burst, transparently. Errors if the message is over the
-/// client's length limit, or if the burst couldn't leave this machine at all
-/// (e.g. the network is down).
+/// inside the same object, transparently. Errors if the message is over the
+/// client's length limit. If the link is down it waits, queued, for the
+/// next connection.
 ///
 /// Returns the message's local chat-history row id (`None` if no history is
 /// attached), so the frontend can label its own optimistic display of this
@@ -1137,23 +1065,12 @@ pub async fn send_message(
 
     let token = parse_token(&token_hex)?;
 
-    let packets = rt
+    let message = rt
         .client
-        .create_fec_packets(token, text.as_bytes())
+        .create_message(token, text.as_bytes())
         .map_err(|e| e.to_string())?;
-    let history_id = rt.client.last_recorded_id;
-
-    // The burst is paced out over a few hundred ms behind any earlier ones,
-    // so wait for it without holding the runtime lock (the receive loop
-    // needs it). Resolves once its first packet is out.
-    let bursts = rt.bursts.clone();
-    drop(guard);
-    bursts
-        .send(packets)
-        .await
-        .map_err(|e| format!("Message not sent: {e}"))?;
-
-    Ok(history_id)
+    rt.link.send(message);
+    Ok(rt.client.last_recorded_id)
 }
 
 /// Collect any messages decrypted since the last poll. The frontend calls

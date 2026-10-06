@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Rebuilds the Android APK for LAN testing against the relay on this
-# computer: bakes in this machine's network IP as the relay address and the
-# local relay's public key (see server_addr_raw() and relay_pubkey_hex() in
-# code/frontend/src-tauri/src/commands.rs). Builds only; install the result
-# with ./install-apk.sh.
+# computer: bakes in this machine's network IP as the relay address, and the
+# local relay's key pin and access key (see server_addr_raw() and
+# relay_config() in code/frontend/src-tauri/src/commands.rs). Builds only;
+# install the result with ./install-apk.sh.
 #
 #   ./build-apk.sh
 #   ./build-apk.sh --emulator        # also runs on the Android emulator
@@ -45,10 +45,11 @@ if [ -z "$ip" ]; then
   exit 1
 fi
 export SERVER_ADDR="$ip:$RELAY_PORT"
-# Always the local relay's key, never one left in the environment for
+# Always the local relay's keys, never ones left in the environment for
 # another relay: the app refuses any relay but the one it was built for.
 SERVER_PUBKEY="$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-pubkey)"
-export SERVER_PUBKEY
+SERVER_ACCESS_KEY="$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-access-key)"
+export SERVER_PUBKEY SERVER_ACCESS_KEY
 echo "Relay: $SERVER_ADDR"
 echo "Key:   $SERVER_PUBKEY"
 
@@ -94,5 +95,5 @@ cargo tauri android build --debug --apk "${target_args[@]}"
 apk="$(find src-tauri/gen/android/app/build/outputs/apk -name '*debug*.apk' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)"
 echo
 echo "Built $FRONTEND_DIR/$apk"
-echo "  relay $SERVER_ADDR and its key baked in"
+echo "  relay $SERVER_ADDR and its keys baked in"
 echo "Install it with ./install-apk.sh, and run the relay with ./runserver-lan.sh."

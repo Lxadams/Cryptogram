@@ -1,70 +1,85 @@
-## Tables
-- Metadata: (routing_token, incoming IP, incoming port, expiry_timestamp)
-- Message Queue: (routing_token, delivery_id, payload, expiry_timestamp, next resend)
+# Relay
 
-Storage-engine agnostic: for now using in-memory hashmaps; Redis can be considered for later if needed.
+A QUIC server on UDP 443 that forwards fixed-size cells between clients.
+Design and measurements: [documentations/disguised-crt-transport.md](../../documentations/disguised-crt-transport.md).
 
-## Server Identity
-The server persists its Ed25519 identity to `server_identity.json` on first run. On subsequent boots, the same key is loaded automatically — clients do not need to update their server pubkey after restarts.
+To anyone on the network it's an HTTP/3 website with a real certificate. A
+client running the app opens a link by proving it has the app's access key
+and owns its routing token; from then on the relay sends it a cell about
+4 times a second, real or padding, and forwards what it sends to whoever owns
+the routing token it names.
+
+## Keys
+
+All kept in the working directory (`/data` in Docker), made on first run:
+
+| File | What | Clients get it from |
+|---|---|---|
+| `relay_cert.pem`, `relay_key.pem` | Self-signed TLS certificate and its key, for testing. Ignored when `TLS_CERT` and `TLS_KEY` point at a real certificate (production). | — |
+| (the key above, or `TLS_KEY`) | What clients pin: SHA-256 of the certificate's public key | `server --print-pubkey`, and logged at startup as "Server Static Pubkey" → `SERVER_PUBKEY` |
+| `relay_access_key` | Every copy of the app proves it has this. Or set `SERVER_ACCESS_KEY`. | `server --print-access-key` → `SERVER_ACCESS_KEY` |
+
+The app ships with both rather than asking the relay. Renewing a real
+certificate must keep its key (certbot's `--reuse-key`), or every app stops
+trusting the relay.
+
+## Settings
+
+| Variable | Default | |
+|---|---|---|
+| `BIND_ADDR` | `127.0.0.1:4430` | `0.0.0.0:443` in Docker |
+| `TLS_CERT`, `TLS_KEY` | (self-signed) | PEM files: certificate chain, private key |
+| `SERVER_NAME` | `localhost` | Names on the self-signed certificate (comma-separated) |
+| `SERVER_ACCESS_KEY` | (`relay_access_key`) | 64 hex characters |
+| `SITE_DIR` | (built-in page) | Static files for the website |
+
+## Tables (RAM only)
+- Link owners: routing token → the link (connection) that proved it owns it.
+- Queues: per routing token, packets waiting for its owner, each either
+  waiting to be sent or in flight on a link. At most `MAX_QUEUED_BYTES_PER_TOKEN`
+  (2 MiB) per token; once full, new packets are refused (older ones kept).
+  Kept until delivered, or 7 days.
 
 ## Protocol
 ```
-on_request(request):
-    If a 'Handshake' request is received:
-        Verify client's Ed25519 signature over ephemeral X25519 key (mutual auth).
-        Perform DH(ServerEph, ClientEph), derive link key via HKDF-SHA256.
-        Sign (ClientPub || ServerPub) with server Ed25519 identity.
-        Return handshake response.
-    Any link-encrypted request ('Sync', 'Forward', 'Ack') refreshes its link's expiry.
-    If a 'Sync' request is received (type 4: routing token + token public key + signature):
-        Reject it unless the token is the hash of the public key and the signature, by
-        that key, covers a value derived from this link's key (so only the token's
-        owner can sync it, and only on its own link).
-        Update the 'Metadata' table with (routing_token, incoming IP, incoming port, expiry_timestamp).
-        If the address changed, or this token was silent for over 30 s (asleep), make
-        everything still queued for it due now, so it's resent straight away.
-        Wake the outbound task.
-    If a 'Forward' request is received (type 1, with a non-empty inner payload):
-        Add it to the message queue with a random 16-byte delivery ID,
-        kept until acknowledged or expired (7 days).
-        Queue is bounded to MAX_QUEUED_BYTES_PER_TOKEN (2 MiB) per token; once full, new packets are refused (older ones kept) — clients send each message as a burst of FEC packets.
-        Wake the outbound task.
-    If an 'Ack' request is received (type 3: own routing token + delivery IDs):
-        If it comes from the token's current link session, drop those packets from its queue.
-    Otherwise, discard the request.
+on_connection(conn):
+    Serve HTTP/3 on its streams, for as long as it's open (the website).
+    Read its datagrams; ignore every one until a cell carries a hello that
+    checks out (see code/cell/src/proof.rs):
+        an HMAC under the access key, and
+        a routing token that's the hash of a key whose signature covers a
+        value exported from this connection's TLS session.
+    A connection without one never gets a datagram back.
+    Then: bind the token to this link (a previous link for it is closed and
+    its unconfirmed packets go to this one), and run the link.
 
-send_due_packets():
-    For each routing token with queued packets AND active metadata, whose pacing slot is due:
-        Take the oldest ONE packet that's due (new, or its resend backoff passed);
-        next slot for this token is RELAY_PACKET_SPACING (5 ms) later.
-        It stays queued until acked; its next resend is 2 s later, doubling to at most 60 s.
-        Re-encrypt payload with recipient's link key (XChaCha20-Poly1305).
-        Prepend the 16-byte delivery ID, which the client echoes back in its ack.
-        Send UDP packet to recipient's IP + port.
-    Return when the next slot or resend falls due (if anything is still queued for an online token).
-    (Cover traffic: dummy_packet() builds a packet the same size and framing as a
-    forwarded FEC chat packet (1154 bytes), inner type 0x00, which clients ignore.
-    Currently disabled: nothing sends them.)
+link sender, forever, on a Poisson clock averaging 4 cells/s:
+    Build a cell: our next sequence number, a receipt for the client's cells,
+    and the oldest packet for this token that isn't in flight, if any.
+    Remember which packet the cell carried. Send it as a QUIC datagram.
 
-sweep_expired_messages():
-    For all entries in the message queue that have expired:
-        Delete the entry
+link receiver, for each cell from the client:
+    Record its sequence number (for our receipts).
+    Settle our cells its receipt covers: a packet whose cell arrived leaves
+    the queue; one whose cell was lost is due to be sent again.
+    Queue each forwarded payload for the routing token it names.
 
-sweep_metadata():
-    For all entries in the Metadata table that have expired:
-        Delete the entry
+link closed:
+    Unbind the token; anything sent on this link that no receipt settled
+    is due again, for the token's next link.
 
-sweep_active_links():
-    For all link keys that have expired (7 days since last use):
-        Delete the entry
-
-main():
-    Load or generate server Ed25519 identity.
-    Launch a task that calls send_due_packets(), then sleeps until the next slot or until woken by a new packet/sync (so live FEC bursts pass straight through and backlogs are paced).
-    Launch a thread that calls sweep tasks every 120 seconds.
+sweep (every 120 s): drop expired packets.
 ```
 
+QUIC settings (both ends, see `code/cell/src/quic.rs`): every packet after the
+handshake padded to 1,200 bytes, a congestion controller that never slows down
+under loss, connection IDs rotated every 10 minutes, ALPN `h3`, TLS 1.3 with
+X25519MLKEM768 preferred (the app offers nothing else; browsers can still use
+X25519).
+
 ## Other implementation details
-- Listens on `127.0.0.1:4430` by default (localhost, for development without `sudo`). Override with the `BIND_ADDR` env var — the Docker image sets `BIND_ADDR=0.0.0.0:443`.
-- Server has zero knowledge of user IDs or E2E keys
-- All message payloads are stored encrypted in RAM only
+- Knows nothing of user IDs or E2E keys, and sees only opaque payloads.
+- Logs no client addresses or routing tokens.
+- `cargo test` runs the relay in-process over real QUIC: the website a
+  visitor without the access key sees, forwarding, resending lost cells,
+  queues for offline recipients, and the constant output rate.

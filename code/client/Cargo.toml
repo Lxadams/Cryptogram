@@ -26,6 +26,16 @@ zeroize = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 # RaptorQ forward error correction for lossy links — see src/transport.rs.
 fec = { path = "../fec" }
+# The link to the relay: cells over QUIC, shared with the relay (see
+# src/link.rs and code/cell).
+cell = { path = "../cell" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+# Looks up the relay's name over DNS-over-HTTPS, never plaintext DNS.
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "https-aws-lc-rs", "webpki-roots"] }
 
 [dev-dependencies]
 fec = { path = "../fec", features = ["test-util"] }
+# The real relay logic, run in-process over lossy in-memory links by the
+# link tests (src/link/tests.rs).
+server = { path = "../server" }
+tokio = { version = "1", features = ["full", "test-util"] }

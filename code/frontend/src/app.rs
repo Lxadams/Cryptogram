@@ -2,12 +2,12 @@
 //! `client` crate through Tauri commands (see src/api.rs) — no mock data,
 //! no simulated crypto. It won't do anything meaningful outside a Tauri
 //! window (see api.rs's doc comment), but the logic itself talks to a real
-//! relay server over a real UDP socket.
+//! relay server over a real QUIC connection.
 //!
 //! Screens:
 //! 1. Login    — choose a username + passcode, resolving which saved
 //!    identity (if any) to use. See `LoginScreen`'s doc comment.
-//! 2. Connect  — perform the link handshake with the relay.
+//! 2. Connect  — open the link to the relay.
 //! 3. Main     — show our own identity, manage contacts, chat with one peer.
 //!
 //! State lives in a handful of top-level signals passed down as props,
@@ -654,9 +654,9 @@ fn CreateIdentityScreen(
     }
 }
 
-/// Screen 1: perform the link handshake with the relay. The relay's Ed25519
-/// pubkey is built into the app (see `relay_pubkey_hex` in
-/// src-tauri/src/commands.rs), so there's nothing to paste.
+/// Screen 1: open the link to the relay. The relay's key pin and access key
+/// are built into the app (see `relay_config` in src-tauri/src/commands.rs),
+/// so there's nothing to paste.
 #[component]
 fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
@@ -679,7 +679,7 @@ fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView 
             <p>"Connect to the relay server to generate/load your identity."</p>
             <p class="hint">
                 "Run the server (runserver.sh) first. The app checks it against "
-                "the public key it was built with."
+                "the key it was built with."
             </p>
             <button
                 disabled=move || connecting.get()
@@ -692,7 +692,7 @@ fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView 
     }
 }
 
-/// Screen 2: everything after a successful handshake — our identity (to
+/// Screen 2: everything after connecting — our identity (to
 /// share with peers), the contact list, and a chat panel for whichever
 /// contact is selected.
 #[component]

@@ -1,286 +1,184 @@
-use rand_core::{OsRng, RngCore};
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
     time::{Duration, Instant},
 };
 
-pub type SessionId = [u8; 4];
-pub type RoutingToken = [u8; 16];
-/// Random ID the relay gives each queued packet. Sent to the recipient in
-/// the 16-byte prefix of the forwarded packet, and echoed back in its ack.
-pub type DeliveryId = [u8; 16];
+pub type RoutingToken = cell::RoutingToken;
+/// Identifies one client connection (a "link") for as long as it lasts.
+pub type LinkId = u64;
+/// The relay's own number for a queued packet, never sent anywhere: cell
+/// receipts say which cells arrived, and each cell carried at most one
+/// packet.
+pub type PacketId = u64;
 
 /// Payload bytes held per recipient token. Clients send each message as a
-/// burst of FEC packets (~7 KB for a short one, up to ~330 KB for the
-/// longest), so this holds a few hundred short messages for an offline
-/// recipient. Bounded so one token can't eat the relay's RAM.
+/// handful of FEC packets (about 1 KB each), so this holds a couple of
+/// thousand of them for an offline recipient. Bounded so one token can't
+/// eat the relay's RAM.
 pub const MAX_QUEUED_BYTES_PER_TOKEN: usize = 2 * 1024 * 1024;
 
-/// A packet stays queued until its recipient acknowledges it (see
-/// `Tables::acknowledge`). The first resend comes this long after the first
-/// send, and each later one waits twice as long, up to `MAX_RESEND_DELAY`.
-pub const FIRST_RESEND_DELAY: Duration = Duration::from_secs(2);
-const MAX_RESEND_DELAY: Duration = Duration::from_secs(60);
-
-/// A sync after this much silence means the recipient was asleep or frozen
-/// (clients sync every 15s while running), so anything still unacknowledged
-/// is resent straight away instead of waiting out its backoff.
-const SILENCE_BEFORE_RESEND: Duration = Duration::from_secs(30);
-
-/// How long a link key lives after its last use (see `touch_link`). Clients
-/// don't redo the handshake, so this must outlast a phone asleep overnight,
-/// or it wakes to a link the relay has forgotten; it matches how long
-/// packets wait for an offline recipient (`MESSAGE_TTL` in main.rs).
-const LINK_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-
 #[derive(Debug, Clone)]
-pub struct MetadataEntry {
-    pub incoming_addr: SocketAddr,
-    pub session_id: SessionId,
-    pub expiry: Instant,
-    last_sync: Instant,
-}
-
-#[derive(Debug, Clone)]
-pub struct OutboundMessage {
-    pub id: DeliveryId,
+pub struct QueuedPacket {
+    pub id: PacketId,
     pub payload: Vec<u8>,
     pub expiry: Instant,
-    /// When it's next due to be sent: straight away when queued, then
-    /// after each send, the resend backoff.
-    next_attempt: Instant,
-    attempts: u32,
+    /// The link it's been sent on and not yet settled by a receipt from.
+    /// `None` means it's due to be sent (again).
+    sent_on: Option<LinkId>,
 }
 
-/// A recipient's queued packets, and when the relay may send them the next
-/// one (see `Tables::take_due`).
 #[derive(Default)]
 struct TokenQueue {
-    packets: VecDeque<OutboundMessage>,
+    packets: VecDeque<QueuedPacket>,
     bytes: usize,
-    next_send: Option<Instant>,
 }
 
-/// A packet `take_due` released for sending: where to, on which link, and
-/// the delivery ID the recipient acks it with.
-pub struct DuePacket {
-    pub addr: SocketAddr,
-    pub session_id: SessionId,
-    pub id: DeliveryId,
-    pub payload: Vec<u8>,
-}
-
+/// Packets waiting for each recipient, and which link (if any) each
+/// recipient is on right now.
+///
+/// A packet stays queued until a receipt from its recipient shows the cell
+/// carrying it arrived. A receipt showing it was lost puts it back in line,
+/// and so does its link closing before any receipt said either way: the
+/// relay's half of each link is plain selective-repeat retransmission,
+/// while the client end-to-end FEC covers its own uplink.
+#[derive(Default)]
 pub struct Tables {
-    pub active_links: HashMap<SessionId, ([u8; 32], Instant)>,
-    metadata: HashMap<RoutingToken, MetadataEntry>,
-    message_queues: HashMap<RoutingToken, TokenQueue>,
+    owners: HashMap<RoutingToken, LinkId>,
+    queues: HashMap<RoutingToken, TokenQueue>,
+    next_packet_id: PacketId,
 }
 
 impl Tables {
     pub fn new() -> Self {
-        Self {
-            active_links: HashMap::new(),
-            metadata: HashMap::new(),
-            message_queues: HashMap::new(),
+        Self::default()
+    }
+
+    /// `link` proved it owns `token`, so the token's packets go there from
+    /// now on. Returns the link that had it before, if a different one: its
+    /// unsettled packets are back in line for the new link.
+    pub fn bind(&mut self, token: RoutingToken, link: LinkId) -> Option<LinkId> {
+        let previous = self.owners.insert(token, link).filter(|&old| old != link);
+        if let Some(old) = previous {
+            self.requeue_link(&token, old);
         }
+        previous
     }
 
-    pub fn register_link(&mut self, session_id: SessionId, link_key: [u8; 32]) {
-        self.active_links
-            .insert(session_id, (link_key, Instant::now() + LINK_TTL));
-    }
-
-    /// Push a link's expiry back, because its client just used it. A client
-    /// that keeps syncing keeps its link for as long as it runs.
-    pub fn touch_link(&mut self, session_id: &SessionId) {
-        if let Some((_, expiry)) = self.active_links.get_mut(session_id) {
-            *expiry = Instant::now() + LINK_TTL;
+    /// `link` closed. If it still served `token`, nobody does now; anything
+    /// it was sent and never settled goes back in line for the next link.
+    pub fn unbind(&mut self, token: &RoutingToken, link: LinkId) {
+        if self.owners.get(token) == Some(&link) {
+            self.owners.remove(token);
         }
+        self.requeue_link(token, link);
     }
 
-    pub fn get_link_key(&self, session_id: &SessionId) -> Option<&[u8; 32]> {
-        self.active_links.get(session_id).map(|(k, _)| k)
-    }
-
-    pub fn update_metadata(
-        &mut self,
-        token: RoutingToken,
-        addr: SocketAddr,
-        session_id: SessionId,
-        ttl: Duration,
-    ) {
-        let now = Instant::now();
-        let woke_up = match self.metadata.get(&token) {
-            Some(prev) => {
-                prev.incoming_addr != addr
-                    || prev.session_id != session_id
-                    || now.duration_since(prev.last_sync) > SILENCE_BEFORE_RESEND
-            }
-            None => true,
-        };
-        self.metadata.insert(
-            token,
-            MetadataEntry {
-                incoming_addr: addr,
-                session_id,
-                expiry: now + ttl,
-                last_sync: now,
-            },
-        );
-        // Whatever we sent to its old address (or while it was asleep)
-        // probably never arrived, so send it again now.
-        if woke_up && let Some(queue) = self.message_queues.get_mut(&token) {
+    fn requeue_link(&mut self, token: &RoutingToken, link: LinkId) {
+        if let Some(queue) = self.queues.get_mut(token) {
             for packet in &mut queue.packets {
-                packet.next_attempt = now;
+                if packet.sent_on == Some(link) {
+                    packet.sent_on = None;
+                }
             }
         }
     }
 
-    /// Queue a packet for `receiver_token`, to be sent (and resent) until
-    /// the recipient acknowledges it or `ttl` runs out. Once the token's
-    /// queue is full (`MAX_QUEUED_BYTES_PER_TOKEN`), new packets are refused
-    /// rather than old ones evicted: evicting would keep cutting the front
-    /// off whole queued messages, and losing an older one that carries a PQ
-    /// ratchet update leaves every later one undecryptable anyway. Returns
-    /// its delivery ID, or `None` if it was refused.
-    pub fn enqueue_message(
+    /// Queue `payload` for whoever owns `receiver_token`, now or later.
+    /// Once the token's queue is full, new packets are refused rather than
+    /// old ones evicted: evicting would keep cutting the front off queued
+    /// messages, and losing an older one that carries a PQ ratchet update
+    /// leaves later ones undecryptable anyway. Returns its id, or `None` if
+    /// it was refused.
+    pub fn enqueue(
         &mut self,
         receiver_token: RoutingToken,
         payload: Vec<u8>,
         ttl: Duration,
-    ) -> Option<DeliveryId> {
-        let queue = self.message_queues.entry(receiver_token).or_default();
+    ) -> Option<PacketId> {
+        let queue = self.queues.entry(receiver_token).or_default();
         if queue.bytes + payload.len() > MAX_QUEUED_BYTES_PER_TOKEN {
             return None;
         }
-        let mut id = [0u8; 16];
-        OsRng.fill_bytes(&mut id);
-        let now = Instant::now();
+        let id = self.next_packet_id;
+        self.next_packet_id += 1;
         queue.bytes += payload.len();
-        queue.packets.push_back(OutboundMessage {
+        queue.packets.push_back(QueuedPacket {
             id,
             payload,
-            expiry: now + ttl,
-            next_attempt: now,
-            attempts: 0,
+            expiry: Instant::now() + ttl,
+            sent_on: None,
         });
         Some(id)
     }
 
-    /// Drop the packets `ids` from `token`'s queue, now that its recipient
-    /// has them. Only that token's current link session may do this, so
-    /// nobody else can delete someone's messages. Returns how many it
-    /// dropped.
-    pub fn acknowledge(
-        &mut self,
-        token: &RoutingToken,
-        session_id: &SessionId,
-        ids: &[DeliveryId],
-    ) -> usize {
-        match self.metadata.get(token) {
-            Some(entry) if entry.session_id == *session_id => {}
-            _ => return 0,
+    /// The next packet for `link` to send `token`, oldest first, if `link`
+    /// is the token's current link and anything is due. It's marked as sent
+    /// on `link` until `delivered` or `lost` settles it.
+    pub fn next_for(&mut self, token: &RoutingToken, link: LinkId) -> Option<(PacketId, Vec<u8>)> {
+        if self.owners.get(token) != Some(&link) {
+            return None;
         }
-        let Some(queue) = self.message_queues.get_mut(token) else {
+        let now = Instant::now();
+        let packet = self
+            .queues
+            .get_mut(token)?
+            .packets
+            .iter_mut()
+            .find(|p| p.sent_on.is_none() && p.expiry > now)?;
+        packet.sent_on = Some(link);
+        Some((packet.id, packet.payload.clone()))
+    }
+
+    /// The recipient got these: they leave the queue.
+    pub fn delivered(&mut self, token: &RoutingToken, ids: &[PacketId]) -> usize {
+        let Some(queue) = self.queues.get_mut(token) else {
             return 0;
         };
         let before = queue.packets.len();
-        queue.packets.retain(|packet| !ids.contains(&packet.id));
+        queue.packets.retain(|p| !ids.contains(&p.id));
         queue.bytes = queue.packets.iter().map(|p| p.payload.len()).sum();
-        before - queue.packets.len()
+        let removed = before - queue.packets.len();
+        if queue.packets.is_empty() {
+            self.queues.remove(token);
+        }
+        removed
     }
 
-    pub fn sweep_active_links(&mut self) {
-        let now = Instant::now();
-        self.active_links.retain(|_, (_, expiry)| *expiry > now);
-    }
-
-    pub fn sweep_metadata(&mut self) {
-        let now = Instant::now();
-        self.metadata.retain(|_, entry| entry.expiry > now);
+    /// The cells carrying these, sent on `link`, were lost: send them again.
+    pub fn lost(&mut self, token: &RoutingToken, link: LinkId, ids: &[PacketId]) {
+        if let Some(queue) = self.queues.get_mut(token) {
+            for packet in &mut queue.packets {
+                if packet.sent_on == Some(link) && ids.contains(&packet.id) {
+                    packet.sent_on = None;
+                }
+            }
+        }
     }
 
     pub fn sweep_expired_messages(&mut self) {
         let now = Instant::now();
-        for queue in self.message_queues.values_mut() {
-            queue.packets.retain(|msg| msg.expiry > now);
-            queue.bytes = queue.packets.iter().map(|msg| msg.payload.len()).sum();
+        for queue in self.queues.values_mut() {
+            queue.packets.retain(|p| p.expiry > now);
+            queue.bytes = queue.packets.iter().map(|p| p.payload.len()).sum();
         }
-        self.message_queues
-            .retain(|_, queue| !queue.packets.is_empty());
+        self.queues.retain(|_, queue| !queue.packets.is_empty());
     }
 
-    #[allow(dead_code)]
-    pub fn get_metadata(&self, token: &RoutingToken) -> Option<&MetadataEntry> {
-        self.metadata.get(token)
+    /// No token is bound to any link.
+    pub fn is_empty_of_links(&self) -> bool {
+        self.owners.is_empty()
     }
 
-    #[allow(dead_code)]
-    pub fn metadata_iter(&self) -> impl Iterator<Item = (&RoutingToken, &MetadataEntry)> {
-        self.metadata.iter()
+    pub fn owner(&self, token: &RoutingToken) -> Option<LinkId> {
+        self.owners.get(token).copied()
     }
 
-    #[allow(dead_code)]
-    pub fn get_queued_packets(&self, token: &RoutingToken) -> Option<&VecDeque<OutboundMessage>> {
-        self.message_queues
+    pub fn get_queued_packets(&self, token: &RoutingToken) -> Option<&VecDeque<QueuedPacket>> {
+        self.queues
             .get(token)
             .map(|queue| &queue.packets)
             .filter(|packets| !packets.is_empty())
     }
-
-    /// Release at most one packet per online recipient whose pacing slot
-    /// has come round, then schedule its next slot `spacing` later — so a
-    /// backlog (a recipient coming back online) is paced out rather than
-    /// blasted at line rate, while a live burst passes straight through.
-    /// The packet released is the oldest one due (new, or its resend
-    /// backoff passed), so a backlog goes out in order. It stays queued
-    /// until acknowledged, with its next resend pushed back. Also returns
-    /// when this next needs calling, if anything is still waiting for an online recipient.
-    pub fn take_due(
-        &mut self,
-        now: Instant,
-        spacing: Duration,
-    ) -> (Vec<DuePacket>, Option<Instant>) {
-        let mut due = Vec::new();
-        let mut next_due: Option<Instant> = None;
-        for (token, queue) in &mut self.message_queues {
-            let Some(metadata) = self.metadata.get(token) else {
-                continue; // offline: keep it queued
-            };
-            if queue.next_send.is_none_or(|at| at <= now)
-                && let Some(i) = queue.packets.iter().position(|p| p.next_attempt <= now)
-            {
-                let packet = &mut queue.packets[i];
-                due.push(DuePacket {
-                    addr: metadata.incoming_addr,
-                    session_id: metadata.session_id,
-                    id: packet.id,
-                    payload: packet.payload.clone(),
-                });
-                packet.attempts += 1;
-                packet.next_attempt = now + resend_delay(packet.attempts);
-                queue.next_send = Some(now + spacing);
-            }
-            // This recipient's next send: its earliest packet due, but not
-            // before its next pacing slot.
-            if let Some(earliest) = queue.packets.iter().map(|p| p.next_attempt).min() {
-                let at = queue.next_send.map_or(earliest, |slot| slot.max(earliest));
-                next_due = Some(next_due.map_or(at, |n| n.min(at)));
-            }
-        }
-        self.message_queues.retain(|_, queue| {
-            !queue.packets.is_empty() || queue.next_send.is_some_and(|at| at > now)
-        });
-        (due, next_due)
-    }
-}
-
-/// Wait before the next resend of a packet already sent `attempts` times.
-fn resend_delay(attempts: u32) -> Duration {
-    FIRST_RESEND_DELAY
-        .saturating_mul(1 << attempts.saturating_sub(1).min(16))
-        .min(MAX_RESEND_DELAY)
 }
 
 #[cfg(test)]
@@ -288,110 +186,110 @@ mod tests {
     use super::*;
 
     const TOKEN: RoutingToken = [0xCC; 16];
-    const SESSION: SessionId = [0xBB; 4];
-    const SPACING: Duration = Duration::from_millis(5);
+    const TTL: Duration = Duration::from_secs(60);
 
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], port))
+    fn queued(tables: &Tables) -> usize {
+        tables.get_queued_packets(&TOKEN).map_or(0, |q| q.len())
     }
 
-    fn online_tables() -> Tables {
+    #[test]
+    fn packets_go_out_oldest_first_and_once_until_settled() {
         let mut tables = Tables::new();
-        tables.update_metadata(TOKEN, addr(50000), SESSION, Duration::from_secs(60));
-        tables
-    }
+        let a = tables.enqueue(TOKEN, b"a".to_vec(), TTL).unwrap();
+        let b = tables.enqueue(TOKEN, b"b".to_vec(), TTL).unwrap();
+        assert!(tables.next_for(&TOKEN, 1).is_none(), "nobody's link yet");
 
-    #[test]
-    fn unacknowledged_packet_is_resent_after_backoff() {
-        let mut tables = online_tables();
-        let id = tables
-            .enqueue_message(TOKEN, b"hi".to_vec(), Duration::from_secs(60))
-            .unwrap();
-        let now = Instant::now();
-
-        let (first, next_due) = tables.take_due(now, SPACING);
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].id, id);
-        assert_eq!(next_due, Some(now + FIRST_RESEND_DELAY));
+        tables.bind(TOKEN, 1);
+        assert_eq!(tables.next_for(&TOKEN, 1), Some((a, b"a".to_vec())));
+        assert_eq!(tables.next_for(&TOKEN, 1), Some((b, b"b".to_vec())));
+        assert!(tables.next_for(&TOKEN, 1).is_none(), "both in flight");
         assert!(
-            tables.take_due(now + SPACING, SPACING).0.is_empty(),
-            "not resent before its backoff"
+            tables.next_for(&TOKEN, 2).is_none(),
+            "not this token's link"
         );
-        assert_eq!(tables.get_queued_packets(&TOKEN).unwrap().len(), 1);
-
-        let (resent, _) = tables.take_due(now + FIRST_RESEND_DELAY, SPACING);
-        assert_eq!(resent[0].id, id);
+        assert_eq!(queued(&tables), 2, "kept until a receipt settles them");
     }
 
     #[test]
-    fn ack_from_recipient_session_removes_packet() {
-        let mut tables = online_tables();
-        let id = tables
-            .enqueue_message(TOKEN, b"hi".to_vec(), Duration::from_secs(60))
-            .unwrap();
-        tables.take_due(Instant::now(), SPACING);
-
-        assert_eq!(
-            tables.acknowledge(&TOKEN, &[0x99; 4], &[id]),
-            0,
-            "wrong session"
-        );
-        assert_eq!(
-            tables.acknowledge(&TOKEN, &SESSION, &[[0u8; 16]]),
-            0,
-            "unknown id"
-        );
-        assert_eq!(tables.acknowledge(&TOKEN, &SESSION, &[id]), 1);
-        assert!(tables.get_queued_packets(&TOKEN).is_none());
-        assert_eq!(tables.message_queues[&TOKEN].bytes, 0);
-    }
-
-    #[test]
-    fn sync_after_silence_or_from_new_address_resends_immediately() {
-        let mut tables = online_tables();
-        tables.enqueue_message(TOKEN, b"hi".to_vec(), Duration::from_secs(60));
-        tables.take_due(Instant::now(), SPACING);
-        let later = Instant::now() + SPACING;
-
-        // A routine keepalive from the same address doesn't skip the backoff.
-        tables.update_metadata(TOKEN, addr(50000), SESSION, Duration::from_secs(60));
-        assert!(tables.take_due(later, SPACING).0.is_empty());
-
-        // A new address (e.g. the phone's NAT mapping changed) does.
-        tables.update_metadata(TOKEN, addr(50001), SESSION, Duration::from_secs(60));
-        assert_eq!(tables.take_due(later + SPACING, SPACING).0.len(), 1);
-
-        // So does a sync after a long silence.
-        tables.metadata.get_mut(&TOKEN).unwrap().last_sync =
-            Instant::now() - SILENCE_BEFORE_RESEND - Duration::from_secs(1);
-        tables.update_metadata(TOKEN, addr(50001), SESSION, Duration::from_secs(60));
-        let now = Instant::now() + SPACING * 3;
-        assert_eq!(tables.take_due(now, SPACING).0.len(), 1);
-    }
-
-    #[test]
-    fn using_a_link_keeps_it_alive() {
+    fn receipts_remove_delivered_packets_and_resend_lost_ones() {
         let mut tables = Tables::new();
-        tables.register_link(SESSION, [1; 32]);
-        tables.active_links.get_mut(&SESSION).unwrap().1 = Instant::now();
-        tables.touch_link(&SESSION);
-        tables.sweep_active_links();
-        assert!(
-            tables.get_link_key(&SESSION).is_some(),
-            "touched, so not swept"
-        );
+        tables.bind(TOKEN, 1);
+        let a = tables.enqueue(TOKEN, b"a".to_vec(), TTL).unwrap();
+        let b = tables.enqueue(TOKEN, b"b".to_vec(), TTL).unwrap();
+        tables.next_for(&TOKEN, 1);
+        tables.next_for(&TOKEN, 1);
 
-        tables.active_links.get_mut(&SESSION).unwrap().1 = Instant::now();
-        tables.sweep_active_links();
-        assert!(tables.get_link_key(&SESSION).is_none(), "unused, so swept");
+        assert_eq!(tables.delivered(&TOKEN, &[b]), 1);
+        tables.lost(&TOKEN, 1, &[a]);
+        assert_eq!(
+            tables.next_for(&TOKEN, 1),
+            Some((a, b"a".to_vec())),
+            "resent"
+        );
+        assert_eq!(tables.delivered(&TOKEN, &[a]), 1);
+        assert_eq!(queued(&tables), 0);
+        assert!(tables.queues.is_empty(), "empty queues are dropped");
+    }
+
+    /// A phone that drops off mid-delivery gets everything that wasn't
+    /// confirmed on its next link, and a lost-receipt report from the old
+    /// link can't disturb the new one.
+    #[test]
+    fn a_closed_link_hands_its_unsettled_packets_to_the_next() {
+        let mut tables = Tables::new();
+        tables.bind(TOKEN, 1);
+        let a = tables.enqueue(TOKEN, b"a".to_vec(), TTL).unwrap();
+        tables.next_for(&TOKEN, 1);
+        tables.unbind(&TOKEN, 1);
+        assert_eq!(tables.owner(&TOKEN), None);
+        assert!(tables.next_for(&TOKEN, 1).is_none());
+
+        tables.bind(TOKEN, 2);
+        assert_eq!(tables.next_for(&TOKEN, 2), Some((a, b"a".to_vec())));
+        tables.lost(&TOKEN, 1, &[a]);
+        assert!(tables.next_for(&TOKEN, 2).is_none(), "still in flight on 2");
     }
 
     #[test]
-    fn resend_delay_doubles_up_to_cap() {
-        assert_eq!(resend_delay(1), Duration::from_secs(2));
-        assert_eq!(resend_delay(2), Duration::from_secs(4));
-        assert_eq!(resend_delay(5), Duration::from_secs(32));
-        assert_eq!(resend_delay(6), MAX_RESEND_DELAY);
-        assert_eq!(resend_delay(u32::MAX), MAX_RESEND_DELAY);
+    fn a_newer_link_takes_the_token_over() {
+        let mut tables = Tables::new();
+        tables.bind(TOKEN, 1);
+        let a = tables.enqueue(TOKEN, b"a".to_vec(), TTL).unwrap();
+        tables.next_for(&TOKEN, 1);
+        assert_eq!(tables.bind(TOKEN, 2), Some(1));
+        assert_eq!(tables.bind(TOKEN, 2), None, "rebinding the same link");
+        assert_eq!(tables.next_for(&TOKEN, 2), Some((a, b"a".to_vec())));
+        // The old link closing later doesn't unbind the new one.
+        tables.unbind(&TOKEN, 1);
+        assert_eq!(tables.owner(&TOKEN), Some(2));
+    }
+
+    #[test]
+    fn queues_are_bounded_by_bytes_and_keep_the_oldest() {
+        let mut tables = Tables::new();
+        let packet = vec![0xAB; 1000];
+        let fits = MAX_QUEUED_BYTES_PER_TOKEN / packet.len();
+        for _ in 0..fits {
+            assert!(tables.enqueue(TOKEN, packet.clone(), TTL).is_some());
+        }
+        assert!(tables.enqueue(TOKEN, packet.clone(), TTL).is_none(), "full");
+        assert_eq!(queued(&tables), fits);
+        assert_eq!(tables.get_queued_packets(&TOKEN).unwrap()[0].id, 0);
+        assert!(
+            tables.enqueue([0xDD; 16], packet, TTL).is_some(),
+            "per token"
+        );
+    }
+
+    #[test]
+    fn expired_packets_are_neither_sent_nor_kept() {
+        let mut tables = Tables::new();
+        tables.bind(TOKEN, 1);
+        tables.enqueue(TOKEN, b"old".to_vec(), Duration::ZERO);
+        let fresh = tables.enqueue(TOKEN, b"new".to_vec(), TTL).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        assert_eq!(tables.next_for(&TOKEN, 1), Some((fresh, b"new".to_vec())));
+        tables.sweep_expired_messages();
+        assert_eq!(queued(&tables), 1);
     }
 }

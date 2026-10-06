@@ -1,5 +1,9 @@
 */target
 client_state.json
 server_identity.json
+# The relay's keys (see code/server/src/tls.rs), made on first run.
+relay_cert.pem
+relay_key.pem
+relay_access_key
 test_roundtrip_state.json
 dist

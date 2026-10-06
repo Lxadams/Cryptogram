@@ -53,14 +53,25 @@ jobs:
             # server_identity is a named volume, not a bind mount: it's
             # created once on first run and then persists across every
             # `docker rm`+`run` this script does on later deploys, so the
-            # server's Ed25519 identity (and the pubkey clients trust)
-            # doesn't change every time you push to production.
+            # relay's keys (the access key, and the self-signed certificate
+            # if there's no real one), which every app is built with, don't
+            # change every time you push to production.
+            # With a domain and its Let's Encrypt certificate (see
+            # documentations/ec2-deployment.md), the relay serves that
+            # instead of a self-signed one.
+            tls_args=""
+            domain="${{ secrets.RELAY_DOMAIN }}"
+            if [ -n "$domain" ]; then
+              live="/etc/letsencrypt/live/$domain"
+              tls_args="-v /etc/letsencrypt:/etc/letsencrypt:ro -e TLS_CERT=$live/fullchain.pem -e TLS_KEY=$live/privkey.pem"
+            fi
             docker run -d \
               --name server \
               --restart unless-stopped \
               -p 443:443/udp \
               -v server_identity:/data \
               -e RUST_LOG=info \
+              $tls_args \
               server:latest
             rm /home/ubuntu/server.tar
             docker image prune -f

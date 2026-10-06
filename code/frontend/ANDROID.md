@@ -115,31 +115,39 @@ from git afterwards. They're all under
 
 The folder's own `.gitignore` already excludes build output.
 
-## 6. Set the relay address and key
+## 6. Set the relay address and keys
 
 An Android app can't be launched with environment variables. Instead, the
-relay address and its public key are read when you **build** the app and
-baked into it (see `server_addr_raw()` and `relay_pubkey_hex()` in
+relay's address and keys are read when you **build** the app and baked into
+it (see `server_addr_raw()` and `relay_config()` in
 `src-tauri/src/commands.rs`):
 
 ```bash
-export SERVER_ADDR=relay.example.com:443   # TODO: replace with the production relay
-export SERVER_PUBKEY=<hex>                 # the relay's "Server Static Pubkey"
+export SERVER_ADDR=203.0.113.10:443        # TODO: the production relay's IP
+export SERVER_NAME=relay.example.com       # TODO: the name on its certificate
+export SERVER_PUBKEY=<hex>                 # server --print-pubkey
+export SERVER_ACCESS_KEY=<hex>             # server --print-access-key
 ```
 
-The app only connects to a relay with that key; it never asks the relay
-for it. `./runpeer-lan.sh --mobile` sets `SERVER_PUBKEY` itself when the
-relay runs on the same machine.
+The app only connects to a relay holding the key `SERVER_PUBKEY` pins, and
+proves to it that it's the app with `SERVER_ACCESS_KEY`; it never asks the
+relay for either. `./runpeer-lan.sh --mobile` and `./build-apk.sh` set both
+themselves when the relay runs on the same machine.
 
-- The format is `host:port`, using a hostname or an IP. Don't include
-  `https://`: the app talks to the relay over a raw UDP socket.
-- If you change it, build again. Cargo notices the new value and recompiles.
-- If it isn't set, the app falls back to `127.0.0.1:4430`. On a phone that
-  address is the phone itself, so the app won't connect.
+- `SERVER_ADDR` is `ip:port` or `host:port`. Don't include `https://`. An IP
+  address is best: nothing is looked up, so nothing on the network sees the
+  app ask for the relay. A hostname is looked up over DNS-over-HTTPS
+  (Cloudflare, then Quad9), never in a plaintext DNS query.
+- `SERVER_NAME` is the name the relay's certificate is for. The app sends it
+  in the TLS handshake, as any HTTPS client would. Leave it out for a local
+  relay with an IP address.
+- If you change any of them, build again. Cargo notices the new value and
+  recompiles.
+- If `SERVER_ADDR` isn't set, the app falls back to `127.0.0.1:4430`. On a
+  phone that address is the phone itself, so the app won't connect.
 - The phone must be able to reach that host on that UDP port.
-- The relay must run the same version of `code/server` as the app. Older
-  relays send each message only once, without waiting for the phone to
-  confirm it, so messages sent while the phone is asleep get lost.
+- The relay must run the same version of `code/server` as the app: since
+  the move to QUIC, older relays and apps can't talk to newer ones at all.
 
 ## 7. Build the APK
 
@@ -210,6 +218,16 @@ While you're logged in and connected, the app runs a foreground service
 that keeps it connected to the relay when it's not on screen. Android
 shows this as an ongoing "Connected" notification.
 
+The connection never goes quiet: the app and the relay each send the other a
+few small packets a second, whether or not there's a message in them, so
+nobody watching the network can tell when you're messaging (see
+[disguised-crt-transport.md](../../documentations/disguised-crt-transport.md)).
+To keep that going with the screen off, the service holds a partial wake lock
+(the CPU stays awake; the screen doesn't), and the first time you log in the
+app asks to be exempted from battery optimisation. Allow it: without it,
+Doze stops the app's network access while the phone is idle, wake lock or
+not. That costs battery; `./measure-battery.sh` measures how much.
+
 - A message that arrives while the app is in the background shows a "New
   message" notification. It names the sender but never shows the text.
   Opening the app clears it.
@@ -220,11 +238,29 @@ shows this as an ongoing "Connected" notification.
   received until you open the app and log in again. Logging in needs your
   passcode, so this can't happen automatically. The relay holds messages
   for up to 7 days, and they arrive once you're back.
-- In deep sleep (screen off and phone still for a while), Android may pause
-  the app's network access until the phone next wakes. Messages then arrive
-  late but aren't lost. Some phone makers also stop background apps more
-  aggressively. If messages only arrive when you open the app, set
-  Settings → Apps → e2e-messenger → Battery to **Unrestricted**.
+- If you declined the battery optimisation exemption, Android may pause the
+  app's network access in deep sleep (screen off and phone still for a
+  while) until the phone next wakes. Messages then arrive late but aren't
+  lost, but the gaps show on the network. Some phone makers also stop
+  background apps more aggressively. Set Settings → Apps → e2e-messenger →
+  Battery to **Unrestricted** to fix both.
+
+### Measuring battery use
+
+With the app installed, logged in and connected, on a phone over USB or the
+emulator, run from the repo root:
+
+```bash
+./measure-battery.sh 60     # minutes
+```
+
+It resets Android's battery statistics, tells it the device is unplugged
+(USB power would otherwise stop the accounting), waits, and prints the app's
+estimated drain, CPU time, wake lock time and traffic, per hour and per day.
+`./measure-battery.sh --baseline 60` with nobody logged in gives something to
+compare against. The emulator's mAh figures come from a generic power
+profile, so only a phone gives a real number; there, the radio (which the
+constant packet stream never lets go idle) is most of the cost.
 
 ## How it differs from desktop
 
@@ -286,7 +322,9 @@ must be on the same Wi-Fi.
 | `android init`/`build` can't find the SDK or NDK | Run `echo $ANDROID_HOME $NDK_HOME` in the same terminal. `NDK_HOME` must point at the versioned folder inside `ndk/`. |
 | `aarch64-linux-android-ranlib: not found` while building `openssl-sys` | `RANLIB_aarch64_linux_android` isn't set (step 4). |
 | Gradle complains about the Java version | `JAVA_HOME` must point at JDK 17 or newer. |
-| The app opens but Connect fails or times out | `SERVER_ADDR` wasn't exported when you built (export it and build again), or the phone can't reach that host over UDP. |
+| The app opens but Connect fails or times out | `SERVER_ADDR` wasn't exported when you built (export it and build again), or the phone can't reach that host over UDP. The error says which. |
+| Connect says the QUIC handshake failed | `SERVER_PUBKEY` isn't this relay's key pin (or the relay's key changed: a certificate renewed without `--reuse-key`). |
+| Connect says the relay didn't answer our hello | `SERVER_ACCESS_KEY` isn't this relay's access key. |
 | "App not installed" | See [Updating the app](#updating-the-app). |
 | No notifications for new messages | Notifications were denied. Allow them in Settings → Apps → e2e-messenger → Notifications. |
 | Messages only arrive when you open the app | The relay is an older version (see step 6), or the phone is stopping the app in the background (see [Receiving in the background](#receiving-in-the-background)). |

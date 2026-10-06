@@ -4,8 +4,8 @@ A working prototype UI wired to the real `code/client` crypto/networking
 engine via a Tauri desktop shell (see `documentations/tech-decision-leptos-client.md`,
 Option B). No mock data — every screen calls real Tauri commands
 (`src-tauri/src/commands.rs`) that drive the actual `Client` from
-`code/client`, including a real UDP socket and a real link handshake
-against `code/server`.
+`code/client`, including the real QUIC link to `code/server` (see
+`code/client/src/link.rs`).
 
 ## Layout
 
@@ -15,10 +15,10 @@ code/frontend/
     app.rs        Screens: Login -> Connect -> Identity/Contacts/Chat
     api.rs        Bridge to Tauri's invoke() — see its doc comment for why
     main.rs       WASM entry point
-  src-tauri/      Native shell — the only thing with a real UDP socket
+  src-tauri/      Native shell — the only thing with a network connection
     src/
       commands.rs #[tauri::command] functions the UI calls
-      state.rs    Shared AppState (the live Client + its socket)
+      state.rs    Shared AppState (the live Client + its relay link)
       lib.rs      Registers commands, plugins
     tauri.conf.json
   index.html      Trunk build entry point
@@ -48,9 +48,9 @@ From the repo root:
 ```
 ./runserver.sh
 ```
-`runpeer.sh` reads the relay's `Server Static Pubkey` from its identity
-file and builds it into the app, which checks the relay against it on
-Connect (see `relay_pubkey_hex` in `src-tauri/src/commands.rs`).
+`runpeer.sh` reads the relay's key pin and access key from its files and
+builds them into the app, which trusts only that relay and proves to it that
+it's the app on Connect (see `relay_config` in `src-tauri/src/commands.rs`).
 
 ### Terminal 2+ — launch a peer, one per terminal
 
@@ -99,9 +99,12 @@ a real encryption key, so `client_state.json` is still plaintext on disk
 (same as the old `client_state.json`/`.peers/` files were).
 
 After logging in, press Connect on the Connect screen. The app checks the
-relay against the pubkey it was given in `SERVER_PUBKEY` (set at launch, or
-baked in at build time; `runpeer.sh` sets it for the local relay) and
-refuses to connect to anything else. Once connected, your identity (name + routing token + Ed25519
+relay against the key pin it was given in `SERVER_PUBKEY` and proves itself
+with `SERVER_ACCESS_KEY` (both set at launch, or baked in at build time;
+`runpeer.sh` sets them for the local relay), and refuses to connect to
+anything else. From then on it keeps a QUIC connection to the relay,
+reconnecting by itself if it drops, and sends and receives a few cells a
+second on it whatever you're doing. Once connected, your identity (name + routing token + Ed25519
 key) is shown — the routing token + Ed25519 key are what a peer needs to add you as a
 contact (stand-in for scanning a QR code, per the Micro-QR design in
 `doable-cryptographic-flow.md`). The name is whatever username you logged
@@ -142,7 +145,7 @@ Android, set up the toolchain first; see [ANDROID.md](ANDROID.md).
 
 ## What's real vs. what's still a prototype shortcut
 
-- **Real**: identity generation, the link handshake, the PQXDH session
+- **Real**: identity generation, the QUIC link, the PQXDH session
   establishment, the symmetric ratchet, PQ injection, message
   encrypt/decrypt — all the same code path the CLI (`code/client/src/main.rs`)
   uses, unmodified.
@@ -156,8 +159,8 @@ Android, set up the toolchain first; see [ANDROID.md](ANDROID.md).
   screen's passcode is likewise a UI-layer gate, not at-rest encryption
   yet — see `hash_passcode`'s doc comment in
   `code/client/src/lib.rs`.
-- **Known limitation**: the receive-loop and `bootstrap` talk to a single
-  relay, defaulting to `127.0.0.1:4430` — override with the `SERVER_ADDR`
-  env var (e.g. `SERVER_ADDR=<ec2-host>:443`), same as the CLI. No server
+- **Known limitation**: the link talks to a single relay, defaulting to
+  `127.0.0.1:4430` — override with the `SERVER_ADDR` env var (e.g.
+  `SERVER_ADDR=<relay-ip>:443`, plus `SERVER_NAME`), same as the CLI. No server
   address field in the UI yet, so it's still env-var-only, not something
   end users configure at runtime.
