@@ -1,0 +1,11 @@
+[package]
+name = "fec"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+raptorq = "2.0.1"
+
+[features]
+# Exposes `test_util` (a seeded PRNG) to other crates' tests.
+test-util = []

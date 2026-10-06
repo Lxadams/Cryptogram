@@ -20,18 +20,20 @@ on_request(request):
         Flush any queued offline messages for this token to the outbound queue.
     If a 'Forward' request is received:
         Add (routing_token, payload, expiry_timestamp) to the message queue.
-        Queue is bounded to 50 messages per token (oldest evicted).
+        Queue is bounded to MAX_QUEUED_BYTES_PER_TOKEN (2 MiB) per token; once full, new packets are refused (older ones kept) — clients send each message as a burst of FEC packets.
+        Wake the outbound task.
     Otherwise, discard the request.
 
-send_outbound_messages():
-    For all routing tokens with active metadata AND queued messages:
+send_due_packets():
+    For each routing token with queued packets AND active metadata, whose pacing slot is due:
+        Take ONE packet; next slot for this token is RELAY_PACKET_SPACING (5 ms) later.
         Re-encrypt payload with recipient's link key (XChaCha20-Poly1305).
         Prepend a 16-byte dummy routing token prefix so client can strip uniformly.
         Send UDP packet to recipient's IP + port.
-    For all active metadata entries NOT sent real messages:
-        Send a dummy UDP packet the same size and framing as a forwarded chat
-        message (1150 bytes), inner type 0x00, which clients ignore.
-        (Currently disabled: prepare_outbound_messages selects no dummy targets.)
+    Return when the next slot falls due (if anything is still queued for an online token).
+    (Cover traffic: dummy_packet() builds a packet the same size and framing as a
+    forwarded FEC chat packet (1154 bytes), inner type 0x00, which clients ignore.
+    Currently disabled: nothing sends them.)
 
 sweep_expired_messages():
     For all entries in the message queue that have expired:
@@ -47,7 +49,7 @@ sweep_active_links():
 
 main():
     Load or generate server Ed25519 identity.
-    Launch a thread that calls send_outbound_messages() every 1 second.
+    Launch a task that calls send_due_packets(), then sleeps until the next slot or until woken by a new packet/sync (so live FEC bursts pass straight through and backlogs are paced).
     Launch a thread that calls sweep tasks every 120 seconds.
 ```
 

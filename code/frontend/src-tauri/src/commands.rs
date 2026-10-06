@@ -7,7 +7,7 @@
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use client::{
     derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
-    ChatHistory, Client, ClientStateDto, IdentityStateStore, RoutingToken,
+    BurstSender, ChatHistory, Client, ClientStateDto, IdentityStateStore, RoutingToken,
 };
 use serde::Serialize;
 use std::{
@@ -907,9 +907,11 @@ pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Ide
         spawn_presence_loop(app, socket.clone()),
     ];
 
+    let bursts = BurstSender::spawn(socket.clone(), client.server_addr);
     *state.runtime.lock().await = Some(ClientRuntime {
         client,
         socket,
+        bursts,
         tasks,
     });
 
@@ -1126,10 +1128,13 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
     Ok(())
 }
 
-/// Encrypt and send an E2E message to an already-established session — as
-/// several chunk packets if it's long — followed by a PQ ratchet-injection
-/// packet whenever `create_encrypted_packets` produces one (roughly every 5th
-/// packet). Messages over the client's length limit come back as an error.
+/// Encrypt and send an E2E message to an already-established session, as a
+/// burst of FEC packets sized to survive heavy loss (see `client`'s
+/// `create_fec_packets`/`BurstSender`). A long message's chunks, and the PQ
+/// ratchet-injection whenever one is due (roughly every 5th chunk), ride
+/// inside the same burst, transparently. Errors if the message is over the
+/// client's length limit, or if the burst couldn't leave this machine at all
+/// (e.g. the network is down).
 ///
 /// Returns the message's local chat-history row id (`None` if no history is
 /// attached), so the frontend can label its own optimistic display of this
@@ -1147,19 +1152,21 @@ pub async fn send_message(
 
     let token = parse_token(&token_hex)?;
 
-    let (msg_packets, pq_inject_packet) = rt
+    let packets = rt
         .client
-        .create_encrypted_packets(token, text.as_bytes())
+        .create_fec_packets(token, text.as_bytes())
         .map_err(|e| e.to_string())?;
     let history_id = rt.client.last_recorded_id;
 
-    // In this order: the PQ inject must follow the message's last chunk.
-    for packet in msg_packets.iter().chain(&pq_inject_packet) {
-        rt.socket
-            .send_to(packet, rt.client.server_addr)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    // The burst is paced out over a few hundred ms behind any earlier ones,
+    // so wait for it without holding the runtime lock (the receive loop
+    // needs it). Resolves once its first packet is out.
+    let bursts = rt.bursts.clone();
+    drop(guard);
+    bursts
+        .send(packets)
+        .await
+        .map_err(|e| format!("Message not sent: {e}"))?;
 
     Ok(history_id)
 }

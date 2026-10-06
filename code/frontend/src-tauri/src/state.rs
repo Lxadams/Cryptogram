@@ -5,7 +5,7 @@
 //! alive across GUI events instead of a stdin loop, plus the UDP socket it
 //! sends/receives on.
 
-use client::Client;
+use client::{BurstSender, Client};
 use std::{fs::File, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 use zeroize::Zeroizing;
@@ -16,6 +16,8 @@ use zeroize::Zeroizing;
 pub struct ClientRuntime {
     pub client: Client,
     pub socket: Arc<UdpSocket>,
+    /// Paces message bursts out over `socket`, one at a time and in order.
+    pub bursts: BurstSender,
     /// Handles to the background tasks `bootstrap` spawned (receive,
     /// keepalive, presence loops) — aborted by `logout` so they don't keep
     /// running against an abandoned socket/identity after the user switches
