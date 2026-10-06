@@ -7,7 +7,7 @@
 //! Screens:
 //! 1. Login    — choose a username + passcode, resolving which saved
 //!    identity (if any) to use. See `LoginScreen`'s doc comment.
-//! 2. Connect  — enter the relay's Ed25519 pubkey, perform the link handshake.
+//! 2. Connect  — fetch the relay's Ed25519 pubkey, perform the link handshake.
 //! 3. Main     — show our own identity, manage contacts, chat with one peer.
 //!
 //! State lives in a handful of top-level signals passed down as props,
@@ -654,25 +654,19 @@ fn CreateIdentityScreen(
     }
 }
 
-/// Screen 1: paste the relay's printed Ed25519 pubkey and perform the link
-/// handshake. Mirrors the CLI's required command-line argument — same
-/// trust model, just entered through a text field instead of argv.
+/// Screen 1: perform the link handshake with the relay. The relay's Ed25519
+/// pubkey is fetched from the relay itself and pinned on first connect (see
+/// `bootstrap` in src-tauri/src/commands.rs), so there's nothing to paste.
 #[component]
 fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView {
-    let server_key_input = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let connecting = RwSignal::new(false);
 
     let on_connect = move |_| {
-        let key = server_key_input.get();
-        if key.trim().is_empty() {
-            error.set(Some("Paste the server's Ed25519 pubkey first.".into()));
-            return;
-        }
         error.set(None);
         connecting.set(true);
         leptos::task::spawn_local(async move {
-            match api::bootstrap(&key).await {
+            match api::bootstrap().await {
                 Ok(id) => identity.set(Some(id)),
                 Err(e) => error.set(Some(e)),
             }
@@ -684,16 +678,9 @@ fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView 
         <section class="connect-screen">
             <p>"Connect to the relay server to generate/load your identity."</p>
             <p class="hint">
-                "Run the server (runserver.sh) and paste the "
-                <code>"Server Static Pubkey"</code>
-                " it prints on boot."
+                "Run the server (runserver.sh) first. Its public key is fetched "
+                "automatically and remembered after the first connect."
             </p>
-            <input
-                type="text"
-                placeholder="server ed25519 pubkey (hex)"
-                prop:value=move || server_key_input.get()
-                on:input=move |ev| server_key_input.set(event_target_value(&ev))
-            />
             <button
                 disabled=move || connecting.get()
                 on:click=on_connect

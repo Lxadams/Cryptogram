@@ -10,7 +10,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         // AppState starts empty (`ClientRuntime` is None) — populated once the
-        // frontend calls the `bootstrap` command with the relay's pubkey.
+        // frontend calls the `bootstrap` command.
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::login,

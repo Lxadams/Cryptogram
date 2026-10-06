@@ -48,8 +48,8 @@ From the repo root:
 ```
 ./runserver.sh
 ```
-Note the `Server Static Pubkey: <hex>` it prints on boot — every peer
-instance needs to paste this into its Connect screen.
+It also serves its `Server Static Pubkey` at `GET /pubkey` (TCP, same
+address as the UDP relay), which each peer fetches on its Connect screen.
 
 ### Terminal 2+ — launch a peer, one per terminal
 
@@ -97,9 +97,12 @@ today this passcode only gates *which* identity file loads — it is not yet
 a real encryption key, so `client_state.json` is still plaintext on disk
 (same as the old `client_state.json`/`.peers/` files were).
 
-After logging in, paste the server's pubkey into the Connect screen. Once
-connected, your identity (name + routing token + Ed25519 key) is shown —
-the routing token + Ed25519 key are what a peer needs to add you as a
+After logging in, press Connect on the Connect screen. The app fetches the
+relay's pubkey from the relay and pins it per `SERVER_ADDR` in
+`known_relays.json` (in the app data directory, next to `identities/`); if
+the relay later presents a different key, Connect refuses until you remove
+that entry. Once connected, your identity (name + routing token + Ed25519
+key) is shown — the routing token + Ed25519 key are what a peer needs to add you as a
 contact (stand-in for scanning a QR code, per the Micro-QR design in
 `doable-cryptographic-flow.md`). The name is whatever username you logged
 in with — it rides along automatically as part of the KeyExchange the

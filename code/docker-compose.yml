@@ -6,6 +6,8 @@ services:
     container_name: server
     ports:
       - "443:443/udp"
+      # GET /pubkey (see spawn_pubkey_http_task in server/src/main.rs)
+      - "443:443/tcp"
     environment:
       - RUST_LOG=info
     volumes:

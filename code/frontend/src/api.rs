@@ -155,13 +155,8 @@ pub async fn delete_identity(pseudonym: &str) -> Result<(), String> {
     call("delete_identity", &DeleteIdentityArgs { pseudonym }).await
 }
 
-#[derive(Serialize)]
-struct BootstrapArgs<'a> {
-    server_pubkey_hex: &'a str,
-}
-
-pub async fn bootstrap(server_pubkey_hex: &str) -> Result<IdentityDto, String> {
-    call("bootstrap", &BootstrapArgs { server_pubkey_hex }).await
+pub async fn bootstrap() -> Result<IdentityDto, String> {
+    call("bootstrap", &()).await
 }
 
 pub async fn list_contacts() -> Result<Vec<ContactDto>, String> {

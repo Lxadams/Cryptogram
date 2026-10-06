@@ -12,7 +12,7 @@ use client::{
 };
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::{self, File, TryLockError},
     io,
     net::SocketAddr,
@@ -140,6 +140,86 @@ fn server_addr_raw() -> String {
         .ok()
         .or_else(|| option_env!("SERVER_ADDR").map(str::to_string))
         .unwrap_or_else(|| "127.0.0.1:4430".to_string())
+}
+
+/// Ask the relay for its Ed25519 identity pubkey over its `GET /pubkey`
+/// HTTP endpoint, served over TCP on the same `host:port` as its UDP relay
+/// socket (see `spawn_pubkey_http_task` in code/server/src/main.rs).
+///
+/// Plain HTTP, so this answer is only as trustworthy as the network path:
+/// `bootstrap` pins it on first use rather than trusting it every time.
+async fn fetch_relay_pubkey(server_addr_raw: &str) -> Result<String, String> {
+    let url = format!("http://{server_addr_raw}/pubkey");
+    // reqwest's own message only says the request failed; the innermost
+    // source is the useful part (e.g. "Connection refused").
+    let unreachable = |e: reqwest::Error| {
+        let mut cause: &dyn std::error::Error = &e;
+        while let Some(next) = cause.source() {
+            cause = next;
+        }
+        format!("Couldn't fetch the relay's public key from {url} ({cause}). Is the relay running?")
+    };
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(&url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(unreachable)?
+        .text()
+        .await
+        .map_err(unreachable)
+}
+
+/// Relay pubkeys this app has already trusted once, keyed by the
+/// `SERVER_ADDR` they were reached at: this app's equivalent of SSH's
+/// `known_hosts`. Shared by every identity, like `identities_root`.
+fn known_relays_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_local_data_dir()
+        .map(|dir| dir.join("known_relays.json"))
+        .map_err(|e| e.to_string())
+}
+
+fn load_known_relays(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    match fs::read_to_string(path) {
+        Ok(json) => serde_json::from_str(&json).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Trust-on-first-use check for a relay pubkey from `fetch_relay_pubkey`.
+/// `Ok(true)` if this exact key is already pinned for `server_addr_raw`,
+/// `Ok(false)` if nothing is pinned for it yet (the caller pins it with
+/// `pin_relay_pubkey` once a handshake has verified against it), and `Err`
+/// if a *different* key is pinned: either the relay's identity was reset,
+/// or something between us and the relay handed us its own key.
+fn check_relay_pin(path: &Path, server_addr_raw: &str, pubkey_hex: &str) -> Result<bool, String> {
+    match load_known_relays(path)?.get(server_addr_raw) {
+        None => Ok(false),
+        Some(pinned) if pinned == pubkey_hex => Ok(true),
+        Some(pinned) => Err(format!(
+            "The relay at {server_addr_raw} sent a different public key ({pubkey_hex}) \
+             than the one trusted on first connect ({pinned}). Refusing to connect. \
+             If the relay's identity was deliberately reset, remove its entry from {}.",
+            path.display()
+        )),
+    }
+}
+
+/// Record `pubkey_hex` as the trusted key for `server_addr_raw`. Re-reads
+/// the file first so a pin another peer process wrote meanwhile isn't lost.
+fn pin_relay_pubkey(path: &Path, server_addr_raw: &str, pubkey_hex: &str) -> Result<(), String> {
+    let mut known = load_known_relays(path)?;
+    known.insert(server_addr_raw.to_string(), pubkey_hex.to_string());
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&known).map_err(|e| e.to_string())?;
+    fs::write(path, json).map_err(|e| e.to_string())
 }
 
 /// How often we send a presence ping to each established contact.
@@ -749,6 +829,34 @@ mod tests {
         let names = list_pseudonyms_sync(&root);
         assert_eq!(names, vec!["dave".to_string(), "erin".to_string()]);
     }
+
+    const RELAY_KEY_A: &str = "aa00000000000000000000000000000000000000000000000000000000000000";
+    const RELAY_KEY_B: &str = "bb00000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn test_relay_pubkey_is_trusted_on_first_use_then_pinned() {
+        let path = scratch_dir("relay_pin_first_use").join("known_relays.json");
+        assert!(!check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap());
+        pin_relay_pubkey(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap();
+        assert!(check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap());
+    }
+
+    #[test]
+    fn test_relay_pubkey_change_is_rejected() {
+        let path = scratch_dir("relay_pin_changed").join("known_relays.json");
+        pin_relay_pubkey(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap();
+        let err = check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_B).unwrap_err();
+        assert!(err.contains("different public key"), "{err}");
+    }
+
+    #[test]
+    fn test_relay_pins_are_per_address() {
+        let path = scratch_dir("relay_pin_per_address").join("known_relays.json");
+        pin_relay_pubkey(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap();
+        pin_relay_pubkey(&path, "3.25.64.73:443", RELAY_KEY_B).unwrap();
+        assert!(check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap());
+        assert!(check_relay_pin(&path, "3.25.64.73:443", RELAY_KEY_B).unwrap());
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -797,17 +905,19 @@ fn identity_dto(client: &Client) -> IdentityDto {
 /// Perform the link-layer handshake with the relay and start listening for
 /// inbound packets. Must be called once before any other command will work.
 /// Mirrors what the CLI's `main()` does at startup, just triggered by a UI
-/// button instead of running unconditionally on process start.
+/// button instead of running unconditionally on process start — except the
+/// relay's pubkey is fetched from the relay and pinned on first use (see
+/// `fetch_relay_pubkey`, `check_relay_pin`) instead of passed in by hand.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn bootstrap(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    server_pubkey_hex: String,
-) -> Result<IdentityDto, String> {
-    let server_pub =
-        parse_verifying_key(&server_pubkey_hex).map_err(|e| format!("Server public key: {e}"))?;
-
+pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<IdentityDto, String> {
     let server_addr_raw = server_addr_raw();
+    let server_pub = parse_verifying_key(&fetch_relay_pubkey(&server_addr_raw).await?)
+        .map_err(|e| format!("Relay public key: {e}"))?;
+    // Canonical lowercase hex, so the pin compares keys rather than spellings.
+    let server_pub_hex = hex::encode(server_pub.as_bytes());
+    let known_relays_path = known_relays_path(&app)?;
+    let already_pinned = check_relay_pin(&known_relays_path, &server_addr_raw, &server_pub_hex)?;
+
     let server_addr: SocketAddr = tokio::net::lookup_host(&server_addr_raw)
         .await
         .map_err(|e| e.to_string())?
@@ -851,6 +961,11 @@ pub async fn bootstrap(
     perform_handshake(&mut client, &socket, &server_pub)
         .await
         .map_err(|e| e.to_string())?;
+    // Pinned only now that a handshake has verified against it, so a bogus
+    // key from something that can't also answer as the relay is never kept.
+    if !already_pinned {
+        pin_relay_pubkey(&known_relays_path, &server_addr_raw, &server_pub_hex)?;
+    }
     client.save();
 
     let identity = identity_dto(&client);
