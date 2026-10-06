@@ -171,9 +171,13 @@ cargo tauri android build --debug --apk --target aarch64
 **Option B: `adb`** (quicker when you reinstall often)
 
 1. On the phone, open Settings → About phone and tap **Build number** seven
-   times. Then go to Developer options and turn on **USB debugging**.
+   times. On Samsung it's under About phone → Software information. Then go
+   to Developer options and turn on **USB debugging**.
 2. Connect the phone by USB and accept the prompt that appears on it.
-3. Run the install:
+3. Run the install. From the repo root, `./install-apk.sh` does it for you:
+   it installs the newest build, waits for the phone and its prompt, and
+   uses Windows' `adb` on WSL. With several phones connected, pick one with
+   `-s <serial>` or use `--all`. To do it by hand instead:
    - **Native Linux:** `adb install -r <apk path>`
    - **WSL:** WSL can't see USB devices without extra setup (usbipd-win), so
      use `adb` on Windows instead. Install Android platform-tools for
