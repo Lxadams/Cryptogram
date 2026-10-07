@@ -805,6 +805,13 @@ mod tests {
                 .create_fec_packets(bob.identity.routing_token, &vec![b'x'; len])
                 .unwrap();
             sizes.extend(burst.iter().map(Vec::len));
+            // What the relay forwards, which its dummy packets copy.
+            for packet in &burst {
+                assert_eq!(
+                    relay(packet, &alice).len(),
+                    relay_link::CHAT_INNER_PAYLOAD_LEN
+                );
+            }
         }
         assert!(sizes.iter().all(|&size| size == sizes[0]), "{sizes:?}");
         assert!(sizes[0] <= 1200, "{}-byte datagrams", sizes[0]);

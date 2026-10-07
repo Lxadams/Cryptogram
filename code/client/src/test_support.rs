@@ -1,21 +1,19 @@
 //! Helpers shared by the unit-test modules (`lib.rs`, `transport`).
 
 use crate::{Client, SymmetricSessionState};
-use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use std::net::SocketAddr;
 
 pub(crate) use fec::test_util::Rng;
 
 /// What the relay does to a client's packet before forwarding it: strip
-/// the sender's link layer and the routing token, leaving the inner payload
-/// (the recipient's own link layer is re-added and removed symmetrically,
-/// so tests skip it).
+/// the sender's link layer, the routing token and any admission tag,
+/// leaving the inner payload (the recipient's own link layer is re-added
+/// and removed symmetrically, so tests skip it).
 pub(crate) fn strip_link(packet: &[u8], link_key: &[u8; 32]) -> Vec<u8> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(link_key));
-    let inner = cipher
-        .decrypt(XNonce::from_slice(&packet[5..29]), &packet[29..])
-        .unwrap();
-    inner[16..].to_vec()
+    let (packet_type, _) = relay_link::header(packet).unwrap();
+    let plaintext = relay_link::open(link_key, packet).unwrap();
+    let (_, _, inner) = relay_link::parse_data(packet_type, &plaintext).unwrap();
+    inner.to_vec()
 }
 
 /// `strip_link` for a packet `sender` just produced.
@@ -79,6 +77,8 @@ pub(crate) fn connect(initiator: &mut Client, responder: &mut Client) {
         session(responder, initiator).root_key,
         "both ends must share one session"
     );
+    assert!(initiator.is_connected(&responder.identity.routing_token));
+    assert!(responder.is_connected(&initiator.identity.routing_token));
 }
 
 /// Two fresh clients, ordered so the first sends the SessionEstablish

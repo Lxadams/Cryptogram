@@ -1,5 +1,9 @@
 FROM rust:1-slim AS builder
 WORKDIR /app
+# Path dependency of the server (the client <-> relay link protocol), resolved
+# as ../relay-link.
+COPY relay-link/Cargo.toml ./relay-link/
+COPY relay-link/src ./relay-link/src
 COPY server/Cargo.toml server/Cargo.lock ./server/
 COPY server/src ./server/src
 WORKDIR /app/server

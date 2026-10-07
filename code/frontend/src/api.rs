@@ -192,10 +192,30 @@ pub async fn remove_contact(token_hex: &str) -> Result<(), String> {
     call("remove_contact", &RemoveContactArgs { token_hex }).await
 }
 
-/// People who tried to connect but aren't contacts yet, newest first
-/// (token hex). Scanning their code is what accepts.
-pub async fn connection_requests() -> Result<Vec<String>, String> {
+/// Mirrors `ConnectionRequestsDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ConnectionRequestsDto {
+    /// People who tried to connect but aren't contacts yet, in the order
+    /// they first tried (token hex). Empty while muted.
+    pub tokens: Vec<String>,
+    pub muted: bool,
+}
+
+/// Who's trying to connect, and whether requests are muted. Scanning their
+/// code is what accepts.
+pub async fn connection_requests() -> Result<ConnectionRequestsDto, String> {
     call("connection_requests", &()).await
+}
+
+#[derive(Serialize)]
+struct MuteRequestsArgs {
+    muted: bool,
+}
+
+/// Stop (or start again) listing connection requests. Saved with the
+/// identity.
+pub async fn set_connection_requests_muted(muted: bool) -> Result<(), String> {
+    call("set_connection_requests_muted", &MuteRequestsArgs { muted }).await
 }
 
 #[derive(Serialize)]
@@ -203,6 +223,8 @@ struct DismissRequestArgs<'a> {
     token_hex: &'a str,
 }
 
+/// "Not now": stop listing their request, and don't list another from them
+/// for a day.
 pub async fn dismiss_connection_request(token_hex: &str) -> Result<(), String> {
     call(
         "dismiss_connection_request",

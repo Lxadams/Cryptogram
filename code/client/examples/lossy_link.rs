@@ -157,11 +157,7 @@ impl Peer {
     }
 
     async fn has_session_with(&self, other: &Peer) -> bool {
-        self.client
-            .lock()
-            .await
-            .e2e_sessions
-            .contains_key(&other.token)
+        self.client.lock().await.is_connected(&other.token)
     }
 }
 

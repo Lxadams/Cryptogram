@@ -25,6 +25,12 @@ const SCAN_INTERVAL: Duration = Duration::from_millis(250);
 /// each decode quick.
 const MAX_SCAN_WIDTH: u32 = 1280;
 
+/// Most of the UI thread `rqrr` may use. A desktop decodes a frame in a few
+/// milliseconds, but a slow phone can take long enough that four a second
+/// would make the app stutter, so after a decode that took `t`, the next
+/// one waits until `t / MAX_DECODE_SHARE` after it started.
+const MAX_DECODE_SHARE: f64 = 0.25;
+
 /// The QR code for `data`, at error correction level L. It's only ever
 /// shown on a screen, where nothing tears or smudges it, and the lowest
 /// level means fewer, bigger modules, which is what a camera further away
@@ -89,6 +95,11 @@ pub fn QrScanner(on_scan: Callback<String, Result<(), String>>) -> impl IntoView
     };
     on_cleanup(stop);
 
+    // Each `await` below is a chance for the dialog to be closed, which
+    // disposes of everything this component owns: after one, check
+    // `stopped` (which reads as `None` once disposed) before touching any
+    // of it, and stop rather than carry on for nobody.
+    let closed = move || stopped.try_get_value() != Some(false);
     leptos::task::spawn_local(async move {
         let media = match start_camera().await {
             Ok(media) => media,
@@ -97,17 +108,19 @@ pub fn QrScanner(on_scan: Callback<String, Result<(), String>>) -> impl IntoView
                 return;
             }
         };
-        // The dialog may have been closed while the permission prompt was
-        // still up; don't leave the camera running for nobody.
-        let Some(video) = video_ref
-            .get_untracked()
-            .filter(|_| stopped.try_get_value() == Some(false))
-        else {
+        // Closed while the permission prompt was still up, or the camera
+        // was starting: don't leave it running.
+        if closed() {
+            stop_tracks(&media);
+            return;
+        }
+        let Some(video) = video_ref.get_untracked() else {
             stop_tracks(&media);
             return;
         };
         video.set_src_object(Some(&media));
         let _ = video.play();
+        // From here on `stop` releases the camera.
         stream.set_value(Some(media));
         camera_ready.set(true);
 
@@ -136,7 +149,13 @@ pub fn QrScanner(on_scan: Callback<String, Result<(), String>>) -> impl IntoView
         // failed). It works asynchronously, so `detecting` keeps one frame
         // in it at a time.
         let native = Rc::new(RefCell::new(native_detector().await));
+        if closed() {
+            return; // `stop` has already released the camera
+        }
         let detecting = Rc::new(Cell::new(false));
+        // When `rqrr` may next decode a frame (see `MAX_DECODE_SHARE`), as
+        // a `Date::now()` timestamp.
+        let next_decode_at = Cell::new(0.0);
 
         let handle = set_interval_with_handle(
             move || {
@@ -162,19 +181,27 @@ pub fn QrScanner(on_scan: Callback<String, Result<(), String>>) -> impl IntoView
                         detecting.set(false);
                     });
                 }
-                // `rqrr` on every frame regardless: a detector can exist and
-                // still never find anything, without saying why (Android's
-                // needs a Google Play services module that may not have
-                // downloaded yet).
-                if let Some(text) = grab_frame_and_decode(&video, &canvas) {
-                    found(text);
+                // `rqrr` too, whenever its share of the UI thread allows: a
+                // detector can exist and still never find anything, without
+                // saying why (Android's needs a Google Play services module
+                // that may not have downloaded yet).
+                let started = js_sys::Date::now();
+                if started >= next_decode_at.get() {
+                    let text = grab_frame_and_decode(&video, &canvas);
+                    let took = js_sys::Date::now() - started;
+                    next_decode_at.set(started + took / MAX_DECODE_SHARE);
+                    if let Some(text) = text {
+                        found(text);
+                    }
                 }
             },
             SCAN_INTERVAL,
         );
         match handle {
             Ok(handle) => interval.set_value(Some(handle)),
-            Err(_) => error.set(Some("Couldn't start scanning.".into())),
+            Err(_) => {
+                error.set(Some("Couldn't start scanning.".into()));
+            }
         }
     });
 

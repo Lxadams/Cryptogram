@@ -698,10 +698,11 @@ fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView 
 #[component]
 fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     let contacts = RwSignal::new(Vec::<api::ContactDto>::new());
-    // Tokens of people who tried to connect but aren't contacts yet (see
-    // `ConnectionRequestNotice`), and whether the QR scanner is open. Both
-    // live here so the notice can open the contact panel's scanner.
-    let requests = RwSignal::new(Vec::<String>::new());
+    // People who tried to connect but aren't contacts yet, and whether
+    // requests are muted (see `ConnectionRequestNotice`), and whether the QR
+    // scanner is open. All live here so the notice can open the contact
+    // panel's scanner, and the panel can unmute.
+    let requests = RwSignal::new(api::ConnectionRequestsDto::default());
     let scanning = RwSignal::new(false);
     let selected = RwSignal::new(None::<String>);
     // token_hex -> transcript. Populated by both outgoing sends (added
@@ -892,36 +893,49 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
 }
 
 /// Pops up when someone who isn't a contact tries to connect (see
-/// `Client::connection_requests`). Their request was ignored, and scanning
-/// their code is how to accept it, so this only offers the scanner. Just
-/// the start of their token is shown: anything else they sent, like a
-/// name, is unverified until that scan. Hidden while the scanner is open.
+/// `Client::connection_requests`): the first one waiting, unless requests
+/// are muted. Their request was ignored, and scanning their code is how to
+/// accept it, so this only offers the scanner. "Not now" keeps that person
+/// from popping up again for a day, and muting stops them all until it's
+/// undone in the contact list; the client also caps how many new ones it
+/// lists, so nobody can keep these coming by making new identities. Just
+/// the start of their token is shown: anything else they sent, like a name,
+/// is unverified until that scan. Hidden while the scanner is open.
 #[component]
 fn ConnectionRequestNotice(
-    requests: RwSignal<Vec<String>>,
+    requests: RwSignal<api::ConnectionRequestsDto>,
     scanning: RwSignal<bool>,
     selected: RwSignal<Option<String>>,
 ) -> impl IntoView {
     move || {
-        let token = requests
-            .get()
-            .first()
-            .cloned()
-            .filter(|_| !scanning.get())?;
+        let (first, waiting) = requests.with(|r| (r.tokens.first().cloned(), r.tokens.len()));
+        let token = first.filter(|_| !scanning.get())?;
         let short = format!("{}...", token.chars().take(8).collect::<String>());
         let dismiss = Callback::new(move |()| {
             let token = token.clone();
-            requests.update(|list| list.retain(|t| *t != token));
+            requests.update(|r| r.tokens.retain(|t| *t != token));
             leptos::task::spawn_local(async move {
                 let _ = api::dismiss_connection_request(&token).await;
             });
         });
+        let mute = move |_| {
+            requests.update(|r| {
+                r.tokens.clear();
+                r.muted = true;
+            });
+            leptos::task::spawn_local(async move {
+                let _ = api::set_connection_requests_muted(true).await;
+            });
+        };
         Some(view! {
             <Modal title="Connection request" on_close=dismiss>
                 <p>"Someone (" <code>{short}</code> ") wants to connect with you."</p>
                 <p class="hint">
                     "To accept, scan the QR code on their screen. If you don't know who this is, ignore it."
                 </p>
+                {(waiting > 1).then(|| view! {
+                    <p class="hint">{format!("{} more waiting.", waiting - 1)}</p>
+                })}
                 <div class="modal-actions">
                     <button
                         type="button"
@@ -938,6 +952,9 @@ fn ConnectionRequestNotice(
                         "Not now"
                     </button>
                 </div>
+                <button type="button" class="link-btn" on:click=mute>
+                    "Mute connection requests"
+                </button>
             </Modal>
         })
     }
@@ -980,7 +997,7 @@ fn Modal(title: &'static str, on_close: Callback<()>, children: Children) -> imp
 fn ContactPanel(
     contacts: RwSignal<Vec<api::ContactDto>>,
     selected: RwSignal<Option<String>>,
-    requests: RwSignal<Vec<String>>,
+    requests: RwSignal<api::ConnectionRequestsDto>,
     scanning: RwSignal<bool>,
 ) -> impl IntoView {
     let token_input = RwSignal::new(String::new());
@@ -996,7 +1013,13 @@ fn ContactPanel(
     // now rather than at the next poll.
     let clear_request = move |token: &str| {
         let token = token.trim().to_ascii_lowercase();
-        requests.update(|list| list.retain(|t| *t != token));
+        requests.update(|r| r.tokens.retain(|t| *t != token));
+    };
+    let unmute = move |_| {
+        requests.update(|r| r.muted = false);
+        leptos::task::spawn_local(async move {
+            let _ = api::set_connection_requests_muted(false).await;
+        });
     };
 
     // Runs for every QR code the scanner decodes. Anything that isn't a
@@ -1135,6 +1158,12 @@ fn ContactPanel(
                 </For>
             </ul>
 
+            {move || requests.with(|r| r.muted).then(|| view! {
+                <p class="hint">
+                    "Connection requests are muted. "
+                    <button type="button" class="link-btn" on:click=unmute>"Unmute"</button>
+                </p>
+            })}
             <h3>"Add contact"</h3>
             <p class="hint">
                 "You each add the other. A contact stays pending until they've added you too."

@@ -200,6 +200,23 @@ button.secondary {
   border: 1px solid var(--border);
 }
 
+/* Reads as a link: a lesser action that shouldn't compete with the
+   buttons around it (e.g. muting connection requests). */
+button.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 0.9rem;
+  font-weight: normal;
+  text-decoration: underline;
+}
+
+.modal > button.link-btn {
+  display: block;
+  margin: 0.75rem auto 0;
+}
+
 .login-actions {
   display: flex;
   flex-wrap: wrap;

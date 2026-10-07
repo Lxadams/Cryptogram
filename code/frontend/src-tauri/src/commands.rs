@@ -760,9 +760,9 @@ mod tests {
 #[derive(Serialize, Clone)]
 pub struct ContactDto {
     pub token: String,
-    /// "established" once the PQXDH session handshake completed, otherwise
-    /// "pending" (added, waiting for them to add us back and the handshake
-    /// to finish).
+    /// "established" once both sides have the session and messages can be
+    /// sent (see `Client::is_connected`), otherwise "pending" (added,
+    /// waiting for them to add us back and the handshake to finish).
     pub status: String,
     /// The display name this contact chose for themselves, learned from
     /// their KeyExchange (see `Client::contact_names`), if they set one.
@@ -938,8 +938,8 @@ fn spawn_keepalive_loop(
                 _ = ticker.tick() => {}
                 _ = background::RESYNC.notified() => {}
             }
-            let guard = state.runtime.lock().await;
-            let Some(rt) = guard.as_ref() else {
+            let mut guard = state.runtime.lock().await;
+            let Some(rt) = guard.as_mut() else {
                 continue;
             };
             let sync_packet = rt.client.generate_sync_packet();
@@ -1003,8 +1003,9 @@ fn contact_label(client: &Client, token: &RoutingToken) -> String {
 }
 
 /// Union of `pending_contacts` (KeyExchange in flight) and `e2e_sessions`
-/// (fully established) — everyone the UI should show in the contact list,
-/// with a status badge for which stage they're at.
+/// — everyone the UI should show in the contact list, with a status badge
+/// for which stage they're at: "established" only once both sides have the
+/// session (see `Client::is_connected`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>, String> {
     let guard = state.runtime.lock().await;
@@ -1019,7 +1020,7 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
     let mut contacts: Vec<ContactDto> = tokens
         .into_iter()
         .map(|token| {
-            let established = client.e2e_sessions.contains_key(token);
+            let established = client.is_connected(token);
             ContactDto {
                 token: hex::encode(token),
                 status: if established {
@@ -1067,23 +1068,51 @@ pub async fn connect_to_peer(
     Ok(())
 }
 
-/// People who tried to connect but aren't contacts yet, newest first, as
-/// token hex (see `Client::connection_requests`). Their request was
-/// dropped; the frontend asks the user to scan their code, which is what
-/// accepts it.
-#[tauri::command(rename_all = "snake_case")]
-pub async fn connection_requests(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let guard = state.runtime.lock().await;
-    let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
-    Ok(rt
-        .client
-        .connection_requests()
-        .iter()
-        .map(hex::encode)
-        .collect())
+/// What `connection_requests` reports.
+#[derive(Serialize, Clone)]
+pub struct ConnectionRequestsDto {
+    /// People who tried to connect but aren't contacts yet, in the order
+    /// they first tried, as token hex. Empty while muted.
+    pub tokens: Vec<String>,
+    pub muted: bool,
 }
 
-/// Stop listing a connection request ("Not now"), until they send another.
+/// People who tried to connect but aren't contacts yet (see
+/// `Client::connection_requests`), and whether requests are muted. Their
+/// request was dropped; the frontend asks the user to scan their code,
+/// which is what accepts it.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn connection_requests(
+    state: State<'_, AppState>,
+) -> Result<ConnectionRequestsDto, String> {
+    let guard = state.runtime.lock().await;
+    let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
+    Ok(ConnectionRequestsDto {
+        tokens: rt
+            .client
+            .connection_requests()
+            .iter()
+            .map(hex::encode)
+            .collect(),
+        muted: rt.client.requests_muted(),
+    })
+}
+
+/// Mute or unmute connection requests (see `Client::set_requests_muted`).
+/// Saved with the identity.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_connection_requests_muted(
+    state: State<'_, AppState>,
+    muted: bool,
+) -> Result<(), String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    rt.client.set_requests_muted(muted);
+    Ok(())
+}
+
+/// Stop listing a connection request ("Not now"), and don't list another
+/// from them for a day (see `Client::dismiss_connection_request`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn dismiss_connection_request(
     state: State<'_, AppState>,

@@ -25,6 +25,7 @@ jobs:
         # Add all your subfolder paths containing a Cargo.toml here
         project-path:
           - "code/server"
+          - "code/relay-link"
           - "code/fec"
           - "code/client"
           - "code/frontend"

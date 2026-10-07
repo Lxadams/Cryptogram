@@ -7,7 +7,7 @@ This document describes the cryptographic architecture of the E2E Messenger MVP 
 ## 1. Architectural Role Summary
 
 *   **Clients (Alice & Bob)**: Generate all keys locally in memory. Trust is established strictly in person via Micro-QR codes (48 bytes). The clients handle all asymmetric/symmetric cryptography and the Deferred Key Exchange protocol.
-*   **Server Relay**: A blind RAM-only router. It has zero knowledge of User IDs or E2E keys. It uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID to identify the link key, decrypts the outer shell, reads the 16-byte Routing Token, re-encrypts the inner payload with the recipient's link key, and forwards it to their active IP. Every forwarded packet waits in a RAM queue (bounded to 2 MiB per recipient, refusing new packets once full, and kept up to 7 days) until the recipient acknowledges it, and is resent until then, so a recipient that's offline, asleep or behind a changed NAT mapping still gets it once it syncs again. Presence pings are the exception: they're sent once, and only to a recipient that's online.
+*   **Server Relay**: A blind RAM-only router. It has zero knowledge of User IDs or E2E keys. It uses a "WireGuard-Lite" X25519 Link Handshake to establish ephemeral link keys with clients. It reads an unencrypted 4-byte Session ID (which it picks itself, in the handshake) to identify the link key, decrypts the outer shell, reads the 16-byte Routing Token, re-encrypts the inner payload with the recipient's link key, and forwards it to the address that link has proven it's at. Every forwarded packet waits in a RAM queue (bounded to 2 MiB per recipient for its contacts' packets, refusing new packets once full, plus 64 KiB for everyone else's, and kept up to 7 days) until the recipient acknowledges it, and is resent until then, so a recipient that's offline, asleep or behind a changed NAT mapping still gets it once it syncs again. Presence pings are the exception: they're sent once, and only to a recipient that's online.
 
 ---
 
@@ -29,13 +29,16 @@ Because ML-KEM-768 public keys are 1184 bytes (far too large for a reliable QR c
 
 Before any E2E communication can occur, each client must establish a link-layer encrypted tunnel with the server.
 
-1.  **Client Boot**: The client generates an ephemeral X25519 keypair, signs the ephemeral public key with its Ed25519 identity, and sends a Handshake packet `[TYPE_HANDSHAKE | SessionID | EphX25519Pub | Ed25519Pub | Ed25519Signature]` to the server.
-2.  **Server Processing**: The server verifies the client's Ed25519 signature over the ephemeral key (Mutual Auth). It performs `DH(ServerEphPriv, ClientEphPub)` and derives a Link Master Key via `HKDF-SHA256` with salt `"e2e-messenger-v1"` and info string `"wireguard-lite-link"`. It returns `[TYPE_HANDSHAKE_RESP | SessionID | ServerEphPub | ServerEd25519Sig]`.
-3.  **Client Completion**: The client verifies the server's signature using the server's static identity, performs DH with the server's ephemeral public key, and derives the identical Link Master Key using the same HKDF parameters.
-4.  **Sync Packet**: The client sends its Routing Token (link-encrypted) so the server can map `RoutingToken → (SocketAddr, SessionID)` for routing. Clients resend it every 15 seconds to keep their NAT mapping (and the server's record) alive.
-5.  **Delivery & Acks**: The server gives each queued packet a random 16-byte Delivery ID and sends it to the recipient in the 16-byte prefix of the forwarded envelope (all zeros on a dummy packet). The recipient handles the packet, then replies with an Ack `[TYPE_ACK (3) | SessionID | Nonce | link-encrypted: own RoutingToken | DeliveryID...]`, and the server drops the packet from its queue. Only the link session the token last synced from can ack it. Until then the server resends it after 2s, 4s, 8s… (at most 60s apart), and straight away when the recipient syncs from a new address or after more than 30 seconds of silence (it was asleep). Resends are safe: the client remembers recent Delivery IDs, so a repeat is only acked again, never handled twice.
+The formats below live in `code/relay-link`, which both the client and the server build on.
 
-All subsequent packets are wrapped in `XChaCha20-Poly1305` link encryption using this key.
+1.  **Client Boot**: The client generates an ephemeral X25519 keypair, signs the ephemeral public key with its Ed25519 identity, and sends a Handshake packet `[TYPE_HANDSHAKE | EphX25519Pub | Ed25519Pub | Ed25519Signature]` to the server.
+2.  **Server Processing**: The server verifies the client's Ed25519 signature over the ephemeral key (Mutual Auth). It performs `DH(ServerEphPriv, ClientEphPub)` and derives a Link Master Key via `HKDF-SHA256` with salt `"e2e-messenger-v1"` and info string `"wireguard-lite-link"`. It gives the link a random Session ID that no live link has, remembers the address the handshake came from, and returns `[TYPE_HANDSHAKE_RESP | SessionID | ServerEphPub | ServerEd25519Sig]`, the signature covering both ephemeral keys and the Session ID. The Session ID is in the clear on every packet, so the server picks it: nobody who sees one can claim that link.
+3.  **Client Completion**: The client verifies the server's signature using the server's static identity, performs DH with the server's ephemeral public key, and derives the identical Link Master Key using the same HKDF parameters.
+4.  **Sync Packet**: The client proves it owns its Routing Token (a hash of a token key, which signs a value derived from the link key) so the server can map `RoutingToken → (SocketAddr, SessionID)` for routing, and registers one 8-byte admission tag per contact (see below). Clients resend it every 15 seconds to keep their NAT mapping (and the server's record) alive. A sync only takes effect from the address the link has proven it's at; from any other address (the phone's NAT mapping changed, or someone replayed a captured sync from elsewhere) the server sends a path challenge there, sealed with the link key, and moves the link only once the answer comes back over the link from that address. A token's sync on a new link retires its old link.
+5.  **Admission**: Each pair of contacts derives an 8-byte tag per direction from their static X25519 keys (`HKDF(DH(X25519_A, X25519_B), "e2e-messenger/admission/v1" || sender || recipient)`), which only they can compute. A recipient registers its contacts' tags in its sync, and senders put the tag on their packets (`TYPE_ADMITTED_DATA`). Once a recipient has registered tags, packets without one (including from anyone who only knows its token from its QR code) share a 64 KiB queue of their own, so they can't crowd out its contacts' messages.
+6.  **Delivery & Acks**: The server gives each queued packet a random 16-byte Delivery ID and sends it to the recipient in the 16-byte prefix of the forwarded envelope (all zeros on a dummy packet). The recipient handles the packet, then replies with an Ack `[TYPE_ACK (3) | SessionID | Nonce | link-encrypted: own RoutingToken | DeliveryID...]`, and the server drops the packet from its queue. Only the link session the token last synced from can ack it. Until then the server resends it after 2s, 4s, 8s… (at most 60s apart), and straight away when the recipient syncs from a new address or after more than 30 seconds of silence (it was asleep). Resends are safe: the client remembers recent Delivery IDs, so a repeat is only acked again, never handled twice.
+
+All subsequent packets are wrapped in `XChaCha20-Poly1305` link encryption using this key, with the packet type and Session ID authenticated as associated data.
 
 ---
 
@@ -50,8 +53,10 @@ The 3-way handshake exchanges the massive Post-Quantum keys in-band, authenticat
     *   Generates an ephemeral X25519 keypair and computes `DH(AliceEphPriv, BobX25519Pub)`.
     *   Encapsulates a secret against Bob's Kyber public key: `encapsulate(BobKyberPub) → (PQ_SharedSecret, KyberCiphertext)`.
     *   Derives the Master Key: `HKDF-SHA256(DH_Secret || PQ_Secret, salt="e2e-messenger-v1", info="pqxdh-root-key")`.
-    *   Sends a `SessionEstablishPayload` (1224 bytes) containing: `[AliceToken | BobToken | Timestamp | KyberCT | EphX25519Pub | Ed25519Signature]`.
-5.  **Bob Accepts**: Bob verifies the signature against Alice's stored Ed25519 key, decapsulates the Kyber ciphertext, performs the same hybrid derivation, and arrives at the identical Master Key. The E2E tunnel is now established.
+    *   Sends a `SessionEstablishPayload` (1232 bytes) containing: `[AliceToken | BobToken | Timestamp | KyberCT | EphX25519Pub | AliceAddId | BobAddId | Ed25519Signature]`.
+5.  **Bob Accepts**: Bob verifies the signature against Alice's stored Ed25519 key, decapsulates the Kyber ciphertext, performs the same hybrid derivation, and arrives at the identical Master Key. He confirms with a KeyExchange naming the session, and only then does Alice use it. The E2E tunnel is now established.
+
+In the implementation both people add each other (scanning each other's QR code), the contact with the lower routing token always establishes, and the KeyExchange carries whether the sender has the target's keys, its *add ID* for the target, and which session it holds. A client gives a contact a new add ID, from a counter that only goes up, whenever it adds them from scratch (the first time, or after removing them). A SessionEstablish names the pair of add IDs it was made for. So the establisher offers the session it already has (re-signed) however often it's asked, rather than a new one each time; both sides recognise a message from before either last removed the other; and adding the contact again from either side picks the setup up wherever it stopped.
 
 ---
 
@@ -64,7 +69,7 @@ Once the session is bootstrapped, ongoing messaging uses a **Symmetric Hash Ratc
     *   `NextSendChainKey = HMAC-SHA256(SendChainKey, "chain-key")` (and similarly for `RecvChainKey` on decryption).
     *   The old Chain Key is destroyed, but unused Message Keys are temporarily stored in a **Skip Dictionary** (up to 100 keys ahead) to handle out-of-order delivery gracefully.
 2.  **Message Encryption**: The plaintext is encrypted with `XChaCha20-Poly1305` using the Message Key. A fresh 24-byte random nonce is generated per message. The sender's 8-byte sequence number (`seq_no`) is included in the E2E payload structure.
-    *   **Chunking & padding**: before encryption, a message is split into chunks of up to 1011 bytes (`[kind | 8-byte message id | index | count | data]`, at most 16 chunks, so messages up to 16,176 bytes), and each chunk is padded to a fixed 1024-byte block (`[2-byte length | chunk | zeros]`). Each chunk is its own ratcheted message, so every chat packet is exactly 1150 bytes on the wire — under the 1232-byte UDP payload that avoids IP fragmentation on any path — and neither the relay nor a network observer can read a message's length beyond its chunk count. The receiver reassembles chunks (in any order) before anything reaches the inbox or chat history; incomplete messages are dropped after 5 minutes.
+    *   **Chunking & padding**: before encryption, a message is split into chunks of up to 1011 bytes (`[kind | 8-byte message id | index | count | data]`, at most 16 chunks, so messages up to 16,176 bytes), and each chunk is padded to a fixed 1024-byte block (`[2-byte length | chunk | zeros]`). Each chunk is its own ratcheted message, so every chat packet to a contact is exactly 1158 bytes on the wire (with its admission tag) — under the 1232-byte UDP payload that avoids IP fragmentation on any path — and neither the relay nor a network observer can read a message's length beyond its chunk count. The receiver reassembles chunks (in any order) before anything reaches the inbox or chat history; incomplete messages are dropped after 5 minutes.
 3.  **Periodic KEM Injection (PQ Ratchet)**: To provide continuous Post-Quantum secrecy without full session resets, a new Kyber encapsulation is performed against the peer's stored Kyber public key every 5 messages (counted in ratchet steps, i.e. chunks; checked once per message, so the inject is always sent after a message's last chunk and never between two). The new PQ shared secret is mixed independently into the respective Chain Key via HKDF. The Kyber ciphertext is sent as a `0x05 PQInjectPayload` (1200 bytes), which carries `applies_at`: the sender's `send_count` when it mixed the secret in. The receiver mixes it in at exactly that position — straight away if its receive chain is already there, otherwise held until the messages before it arrive — so the inject can arrive before or after the messages around it, and any number of times: a copy for a position already reached is ignored. That position check replaces both a signature replay cache and the 5-minute timestamp check (which would have dropped an inject queued at the relay while the recipient was offline for longer, breaking the session). To stop an inject being replayed into a *later* session with the same peer, where positions restart from 0, its signature also covers a session binding (`HMAC(root_key, "pq-inject-session-binding")`) that is never sent, so it only verifies on the session it was made for. Every packet of a message, inject included, is therefore safe to resend.
 4.  **Packet Structure**: `[0x01 | 16-byte SenderToken | 8-byte SeqNo | 24-byte Nonce | E2E Ciphertext of one padded chunk]`, wrapped in link encryption. The 16-byte `SenderToken` enables O(1) direct session lookup, preventing speculative ratchet corruption.
 5.  **Decryption**: The receiver extracts the `SenderToken` to locate the correct session, then uses the `seq_no`. If it's a previously skipped message, it retrieves the key from the Skip Dictionary. If it's a future message, it fast-forwards the `recv_chain_key` (up to 100 steps) and stores the intermediate skipped keys.
@@ -102,7 +107,7 @@ sequenceDiagram
     
     A->>A: Hybrid PQXDH (X25519 DH + Kyber KEM)
     A->>A: HKDF → Master Key → Init Hash Ratchet
-    A->>A: Sign SessionEstablishPayload (1224 bytes)
+    A->>A: Sign SessionEstablishPayload (1232 bytes)
     A->>S: Link-Encrypted 0x04 → Bob's Token
     S->>B: Re-encrypt → Forward
     
@@ -117,11 +122,12 @@ sequenceDiagram
 
 ```
 Raw UDP Datagram
-├── [1 byte]  Packet Type (0=Handshake, 1=Data, 2=Handshake response, 3=Ack)
+├── [1 byte]  Packet Type (0=Handshake, 1=Data, 2=Handshake response, 3=Ack, 4=Sync, 5=Admitted data, 6=Path challenge, 7=Path response)
 ├── [4 bytes] Link Session ID (unencrypted, identifies link key)
 ├── [24 bytes] XChaCha20 Nonce
 └── XChaCha20-Poly1305 Link-Encrypted Envelope
-    ├── [16 bytes] Routing Token (read by server for forwarding);
+    ├── [16 bytes] Routing Token (read by server for forwarding), then on
+    │              admitted data an 8-byte admission tag;
     │              on packets the server forwards, the Delivery ID instead
     └── Inner E2E Payload
         ├── [1 byte] Inner Type (0x00=Relay dummy, 0x01=Msg, 0x02=KeyExchange, 0x04=SessionEstablish, 0x05=PQInject, 0x06=Presence)
@@ -145,7 +151,7 @@ Raw UDP Datagram
 | 3 | **Unauthenticated KEM Hijacking** | Mallory encapsulates a Kyber secret against Bob's key and sends a fake `SessionEstablish` claiming to be Alice | `SessionEstablish` is now signed by sender's Ed25519 key. Bob verifies against Alice's stored key before accepting. |
 | 4 | **Server Forwarding Plaintext** | Server stored raw inner payloads and forwarded them without re-encrypting with recipient's link key | Server now re-encrypts all outbound messages with recipient's `XChaCha20-Poly1305` link key before sending. |
 | 5 | **Plaintext Dummy Packets** | Server sent cleartext dummy packets (`b"dummy_padding_to_look_real"`), making them trivially distinguishable from real traffic | Dummy packets are now random 64-byte payloads encrypted with recipient's link key, indistinguishable from real traffic. |
-| 6 | **Session Reset DoS** | Attacker replays intercepted `SessionEstablish` packets to force redundant derivations | Added a `seen_session_keys` cache to drop previously processed ephemeral X25519 keys silently. |
+| 6 | **Session Reset DoS** | Attacker replays intercepted `SessionEstablish` packets to force redundant derivations | Originally a `seen_session_keys` cache. Now each SessionEstablish names the add IDs it was made for, and is only taken in for the recipient's current one; a copy of the session it already has is only confirmed again. (The cache also blocked the establisher's legitimate re-offer of the same session.) |
 | 7 | **Bidirectional Desync** | A single shared `chain_key` meant that Alice sending a message would desync Bob's sending state, permanently breaking the session if both parties sent messages. | Split `chain_key` into independent `send_chain_key` and `recv_chain_key` to maintain separate bidirectional state. |
 | 8 | **Ratchet Corruption via Speculative Decryption** | E2E messages did not contain sender identities, forcing receivers to brute-force decrypt against all sessions. This speculatively advanced ratchets, permanently corrupting innocent sessions. | Prepend 16-byte `SenderToken` to the E2E `0x01` message payload. Receiver now performs $O(1)$ direct session lookup without touching other sessions. |
 
@@ -242,9 +248,10 @@ Raw UDP Datagram
 | `test_edge_case_max_skip_dict_exhaustion` | Attempts to decrypt a message with seq_no 150 (gap > 100). Verifies the ratchet rejects it and recv_count stays at 0. |
 | `test_edge_case_duplicate_message_rejection` | Delivers msg1 out of order (skip_dict), then delivers msg0 from skip_dict, then replays msg0. Verifies replay is rejected (returns None). |
 | `test_edge_case_pending_contacts_exhaustion` | Floods 55 KeyExchanges to a single client. Verifies pending_contacts is bounded to 51 (50 + 1 already accepted before the check). |
-| `test_edge_case_seen_session_keys_exhaustion` | Floods 1050 SessionEstablish packets. Verifies seen_session_keys cache is bounded to ≤1000 entries. |
-| `test_edge_case_session_establish_replay_detection` | Full handshake, then replays the same SessionEstablish. Verifies seen_session_keys blocks the replay from creating a new session. |
-| `test_storage_save_load_roundtrip` | Creates a Client with sessions, pending contacts, and seen keys. Saves to JSON, loads back, and verifies all keys survive round-trip. |
+| `test_edge_case_session_establish_flood_keeps_one_session` | Floods 100 SessionEstablish packets from a contact. Verifies one session remains and nothing grows with the flood. |
+| `test_repeated_session_establish_changes_nothing` | Delivers the same SessionEstablish again after the session is in use. Verifies it's only confirmed again, with the session untouched. |
+| `test_messages_from_before_a_re_add_are_ignored` | A KeyExchange and a SessionEstablish from before one side removed and re-added the other are ignored, and the new session stands. |
+| `test_storage_save_load_roundtrip` | Creates a Client with sessions, pending contacts, add IDs and a pending session offer. Saves to JSON, loads back, and verifies all of it survives round-trip. |
 | `test_concurrent_multi_peer_out_of_order` | Simulates receiving highly interleaved and out-of-order packets from multiple peers simultaneously. Asserts $O(1)$ SenderToken lookup routes to the correct session and skip dictionaries handle the disorder cleanly without advancing the wrong ratchets. |
 
 ### Known Issues & Acceptable MVP Compromises

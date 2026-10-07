@@ -24,6 +24,7 @@ pub fn run() {
             commands::connect_to_peer,
             commands::remove_contact,
             commands::connection_requests,
+            commands::set_connection_requests_muted,
             commands::dismiss_connection_request,
             commands::send_message,
             commands::poll_inbox,

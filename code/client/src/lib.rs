@@ -1,16 +1,19 @@
 use anyhow::{Result, anyhow};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-use ed25519_dalek::{SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use pqcrypto_kyber::kyber768::*;
 use pqcrypto_traits::kem::SharedSecret as _;
 use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256};
+use relay_link::{
+    AdmissionTag, TYPE_ACK, TYPE_DATA, TYPE_PATH_CHALLENGE, TYPE_PATH_RESPONSE, TYPE_SYNC,
+};
+use sha2::Sha256;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     net::SocketAddr,
 };
 use subtle::ConstantTimeEq;
@@ -28,19 +31,15 @@ mod storage;
 mod transport;
 pub use chunks::MAX_MESSAGE_LEN;
 pub use history::{ChatHistory, StoredMessage};
-use std::collections::HashSet;
+/// Routing tokens, link session IDs and delivery IDs are the relay link's
+/// (see the `relay-link` crate), as is how a routing token is derived.
+pub use relay_link::{DeliveryId, RoutingToken, SessionId, routing_token_for};
 pub use storage::{ClientStateDto, IdentityStateStore};
 pub use transport::{BurstSender, send_burst};
 #[cfg(test)]
 mod test_support;
 
 type HmacSha256 = Hmac<Sha256>;
-pub type SessionId = [u8; 4];
-pub type RoutingToken = [u8; 16];
-/// The relay's ID for one packet it forwards to us, which we echo back in
-/// an ack so it stops resending it (see `Client::handle_relay_packet`). All
-/// zeros on a packet that needs no ack, like a relay dummy packet.
-pub type DeliveryId = [u8; 16];
 /// What `Client::create_encrypted_packets` returns: a message's chunk
 /// packets, then an optional PQ inject packet to send after them. Every one
 /// is safe to deliver more than once, in any order, so a resend should
@@ -61,10 +60,9 @@ const MAX_SKIP_DICT_SIZE: usize = 500;
 // Domain-separation salt for HKDF derivations
 const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
 
-// Domain separators for proving routing-token ownership to the relay (must
-// match the server; see `routing_token_for` and `sync_signing_input`).
-const ROUTING_TOKEN_LABEL: &[u8] = b"e2e-messenger/routing-token/v1";
-const SYNC_SIGNATURE_LABEL: &[u8] = b"e2e-messenger/sync/v1";
+// Domain separator for the admission tags contacts put on what they send
+// each other (see `admission_tag`).
+const ADMISSION_LABEL: &[u8] = b"e2e-messenger/admission/v1";
 
 // Maximum timestamp drift allowed (seconds)
 const MAX_TIMESTAMP_DRIFT: u64 = 300;
@@ -77,10 +75,14 @@ const MAX_PENDING_PQ_INJECTS: usize = 32;
 // How long `perform_handshake` waits for the relay's reply
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-// How long a connection request from someone who isn't a contact is kept
-// to show the user (see `Client::connection_requests`), and how many.
+// Connection requests from people who aren't contacts (see
+// `Client::connection_requests`): how long one is listed, and how many new
+// ones at most are listed in that time, however many identities they come
+// from.
 const CONNECTION_REQUEST_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_CONNECTION_REQUESTS: usize = 8;
+// How long "Not now" keeps someone's requests from being listed again.
+const DISMISSED_REQUEST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where `Client::save`/callers' `ClientStateDto::load` persist identity +
 /// session state. Overridable via `E2E_STATE_FILE` so multiple peer
@@ -100,35 +102,40 @@ pub fn parse_routing_token(hex_str: &str) -> Result<RoutingToken> {
     Ok(token)
 }
 
-/// The routing token owned by `token_public`: a truncated hash of it. The
-/// relay only accepts a sync for a token from whoever can sign with the
-/// matching secret key (see `Client::generate_sync_packet`), so nobody else
-/// can have a token's packets sent to them. Must match the server.
-pub fn routing_token_for(token_public: &VerifyingKey) -> RoutingToken {
-    let digest = Sha256::new()
-        .chain_update(ROUTING_TOKEN_LABEL)
-        .chain_update(token_public.as_bytes())
-        .finalize();
-    digest[..16].try_into().unwrap()
-}
-
-/// What a sync's signature covers: a value derived from the link key, which
-/// only we and the relay know, so the signed sync proves nothing on any
-/// other link. Must match the server.
-fn sync_signing_input(link_key: &[u8; 32]) -> Vec<u8> {
-    let mut binding = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(HKDF_SALT), link_key)
-        .expand(b"sync-binding", &mut binding)
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
-    [SYNC_SIGNATURE_LABEL, &binding].concat()
-}
-
 /// Parse a hex Ed25519 public key (a contact's, or the relay's).
 pub fn parse_verifying_key(hex_str: &str) -> Result<VerifyingKey> {
     let mut bytes = [0u8; 32];
     hex::decode_to_slice(hex_str.trim(), &mut bytes)
         .map_err(|_| anyhow!("Ed25519 key must be 64 hex characters"))?;
     VerifyingKey::from_bytes(&bytes).map_err(|_| anyhow!("Invalid Ed25519 key"))
+}
+
+/// The admission tag `sender` puts on what it sends `recipient`, so the
+/// relay files it in the recipient's queue for contacts rather than the
+/// small one for everyone else (see `relay_link`). It's made from the
+/// two's static X25519 keys, which they only send each other in their
+/// KeyExchanges, so nobody else can work it out. `None` for a degenerate
+/// key that would make it guessable.
+fn admission_tag(
+    my_secret: &StaticSecret,
+    their_public: &X25519PublicKey,
+    sender: &RoutingToken,
+    recipient: &RoutingToken,
+) -> Option<AdmissionTag> {
+    let shared = my_secret.diffie_hellman(their_public);
+    if !shared.was_contributory() {
+        return None;
+    }
+    let mut tag = [0u8; 8];
+    Hkdf::<Sha256>::new(Some(HKDF_SALT), shared.as_bytes())
+        .expand(&[ADMISSION_LABEL, sender, recipient].concat(), &mut tag)
+        .expect("8 bytes is a valid HKDF-SHA256 output length");
+    Some(tag)
+}
+
+/// The first four bytes of a token, in hex: how the console names someone.
+fn short(token: &RoutingToken) -> String {
+    hex::encode(&token[0..4])
 }
 
 // Argon2id parameters for every login secret derived below (OWASP's
@@ -262,13 +269,6 @@ pub fn derive_vault_key(passcode: &str, stored: &str) -> Option<Zeroizing<[u8; 3
     }
     Some(Zeroizing::new(hkdf_label(ms.as_ref(), VAULT_KEY_LABEL)))
 }
-
-// Request Types for Server
-const TYPE_HANDSHAKE_INIT: u8 = 0;
-pub const TYPE_DATA: u8 = 1;
-const TYPE_HANDSHAKE_RESP: u8 = 2;
-const TYPE_ACK: u8 = 3;
-const TYPE_SYNC: u8 = 4;
 
 pub struct UserIdentity {
     /// Always `routing_token_for(&token_public)`.
@@ -510,15 +510,64 @@ impl SymmetricSessionState {
     }
 }
 
+/// Which time each side added the other "from scratch" a session belongs
+/// to. Whenever a client adds a contact it doesn't have (the first time, or
+/// after removing them), it gives them a new add ID from a counter that only
+/// goes up, and keeps it until it removes them. Both sides send theirs in
+/// every KeyExchange and SessionEstablish. So a message from before either
+/// side last removed the other is recognisably old, and a session is named
+/// by the pair of add IDs it was made for: one pair, one session. That's
+/// what lets the establisher offer the session it already has, however
+/// often it's asked, while a contact who has removed and re-added it gets a
+/// new one.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub(crate) struct AddIds {
+    /// Ours for this contact. 0 for a contact added before add IDs existed.
+    pub(crate) mine: u32,
+    /// The latest of theirs we've seen; 0 until we hear from them.
+    pub(crate) theirs: u32,
+}
+
+/// How a session came about: the add IDs it was made for, and, while the
+/// establisher waits for the responder to confirm it has it, what the
+/// establisher needs to offer it again.
+pub(crate) struct SessionSetup {
+    pub(crate) establisher_add_id: u32,
+    pub(crate) responder_add_id: u32,
+    /// Establisher only, until the responder confirms: the
+    /// SessionEstablish's ephemeral key and Kyber ciphertext, to re-sign and
+    /// send again when asked (see `Client::session_est_packet`). The
+    /// session isn't used until then (see `Client::is_connected`).
+    pub(crate) offer: Option<SessionOffer>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SessionOffer {
+    pub(crate) eph_x25519_pub: X25519PublicKey,
+    pub(crate) kyber_ct: Ciphertext,
+}
+
 pub struct Client {
     pub identity: UserIdentity,
     pub server_addr: SocketAddr,
     pub link_master_key: [u8; 32],
+    /// Our link's ID at the relay, which the relay picks in its handshake
+    /// reply (see `complete_handshake`).
     pub session_id: SessionId,
     pub e2e_sessions: HashMap<RoutingToken, SymmetricSessionState>,
     pub pending_contacts: HashMap<RoutingToken, VerifyingKey>,
     pub peer_kyber_keys: HashMap<RoutingToken, PublicKey>,
-    pub seen_session_keys: HashSet<[u8; 32]>,
+    /// Contacts' static X25519 keys, from their KeyExchanges: what the
+    /// admission tags we share with each of them come from (see
+    /// `admission_tag`).
+    pub peer_x25519_keys: HashMap<RoutingToken, X25519PublicKey>,
+    /// Each contact's add IDs, ours and theirs (see `AddIds`).
+    pub(crate) add_ids: HashMap<RoutingToken, AddIds>,
+    /// The add ID the next contact added from scratch gets.
+    pub(crate) next_add_id: u32,
+    /// How each session in `e2e_sessions` came about (see `SessionSetup`).
+    /// Missing for a session from before add IDs existed.
+    pub(crate) session_setups: HashMap<RoutingToken, SessionSetup>,
     /// Where `save()` persists this exact instance — set at load/creation
     /// time (see `ClientStateDto::load` and the frontend's `login` command,
     /// which resolves this per-pseudonym under `identities/<pseudonym>/`).
@@ -576,32 +625,50 @@ pub struct Client {
     /// Relay deliveries already handled, so a resend is only acked again.
     /// Live local state, not persisted, like `inbox`.
     recent_deliveries: deliveries::RecentDeliveries,
-    /// Contacts we've sent a KeyExchange asking for a SessionEstablish, and
-    /// haven't had one from yet, so we ask each of them only once (see the
-    /// 0x02 branch of `handle_incoming_packet`). Live state, like `inbox`.
-    awaiting_session_est: HashSet<RoutingToken>,
-    /// Recent KeyExchanges from people who aren't contacts, oldest first,
-    /// so a front end can prompt the user to add them back (see
-    /// `connection_requests`). Just the token and when: nothing else they
-    /// sent is verified until the user scans their code. Live state, like
-    /// `inbox`.
+    /// Set when the admission tags our sync registers have changed since
+    /// our last sync (a contact's X25519 key arrived, or a contact was
+    /// removed), so the next relay packet we handle is answered with a fresh
+    /// sync too, rather than leaving it to the keepalive. Live state.
+    admission_changed: bool,
+    /// Whether connection requests are muted: none are listed (see
+    /// `connection_requests`). Saved with the identity.
+    pub(crate) requests_muted: bool,
+    /// Recent KeyExchanges from people who aren't contacts, in the order
+    /// they first arrived, so a front end can prompt the user to add them
+    /// back (see `connection_requests`). Just the token and when: nothing
+    /// else they sent is verified until the user scans their code. Live
+    /// state, like `inbox`.
     connection_requests: Vec<(RoutingToken, Instant)>,
+    /// When each request listed in the last `CONNECTION_REQUEST_TTL` was
+    /// first listed, dismissed ones included, for the limit on how many new
+    /// ones are. Live state.
+    listed_requests: VecDeque<Instant>,
+    /// Whose requests were dismissed ("Not now"), and when. Live state.
+    dismissed_requests: HashMap<RoutingToken, Instant>,
+}
+
+/// Where a new identity's add-ID counter starts (see `AddIds`): somewhere
+/// in the lower half of the range, so it doesn't give away how many
+/// contacts the identity has added, with plenty of room to count up.
+pub(crate) fn first_add_id() -> u32 {
+    1 + (OsRng.next_u32() >> 1)
 }
 
 impl Client {
     pub fn new(server_addr: SocketAddr) -> Self {
-        let identity = UserIdentity::generate();
-        let mut session_id = [0u8; 4];
-        OsRng.fill_bytes(&mut session_id);
         Self {
-            identity,
+            identity: UserIdentity::generate(),
             server_addr,
             link_master_key: [0u8; 32],
-            session_id,
+            // The relay gives the link its ID in the handshake.
+            session_id: [0u8; 4],
             e2e_sessions: HashMap::new(),
             pending_contacts: HashMap::new(),
             peer_kyber_keys: HashMap::new(),
-            seen_session_keys: HashSet::new(),
+            peer_x25519_keys: HashMap::new(),
+            add_ids: HashMap::new(),
+            next_add_id: first_add_id(),
+            session_setups: HashMap::new(),
             state_path: state_file_path(),
             local_name: String::new(),
             contact_names: HashMap::new(),
@@ -612,8 +679,11 @@ impl Client {
             reassembler: chunks::Reassembler::default(),
             fec_rx: Default::default(),
             recent_deliveries: Default::default(),
-            awaiting_session_est: HashSet::new(),
+            admission_changed: false,
+            requests_muted: false,
             connection_requests: Vec::new(),
+            listed_requests: VecDeque::new(),
+            dismissed_requests: HashMap::new(),
         }
     }
 
@@ -654,8 +724,9 @@ impl Client {
     }
 
     /// Permanently remove `token` as a contact — drops any pending/
-    /// established session, its Kyber key and learned display name, then
-    /// persists the change. This is the *local*
+    /// established session, its keys, add IDs and learned display name, then
+    /// persists the change. Adding them again later starts from scratch,
+    /// with a new add ID (see `AddIds`). This is the *local*
     /// cleanup path for a stale contact (e.g. one whose identity was
     /// deleted and recreated elsewhere, leaving this peer with two entries
     /// for what is now a different identity under the same name) — it is
@@ -673,9 +744,13 @@ impl Client {
     pub fn forget_contact(&mut self, token: RoutingToken) {
         self.pending_contacts.remove(&token);
         self.e2e_sessions.remove(&token);
+        self.session_setups.remove(&token);
+        self.add_ids.remove(&token);
         self.peer_kyber_keys.remove(&token);
+        // Their packets no longer get our queue for contacts, from our next
+        // sync on.
+        self.admission_changed |= self.peer_x25519_keys.remove(&token).is_some();
         self.contact_names.remove(&token);
-        self.awaiting_session_est.remove(&token);
         self.reassembler.forget(&token);
         self.save();
         if let Some(history) = &self.history
@@ -700,154 +775,270 @@ impl Client {
         }
     }
 
+    /// Our opening handshake packet: a fresh X25519 key, signed with our
+    /// Ed25519 identity (see `relay_link::handshake_init`).
     pub fn generate_handshake_packet(&self) -> (EphemeralSecret, Vec<u8>) {
-        use ed25519_dalek::Signer;
-        let client_ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-        let client_ephemeral_public = X25519PublicKey::from(&client_ephemeral_secret);
-        // Sign the ephemeral X25519 public key with our Ed25519 identity
-        let signature = self
-            .identity
-            .ed25519_secret
-            .sign(client_ephemeral_public.as_bytes());
-        let mut packet = vec![TYPE_HANDSHAKE_INIT];
-        packet.extend_from_slice(&self.session_id);
-        packet.extend_from_slice(client_ephemeral_public.as_bytes());
-        packet.extend_from_slice(self.identity.ed25519_public.as_bytes());
-        packet.extend_from_slice(&signature.to_bytes());
-        (client_ephemeral_secret, packet)
+        let secret = EphemeralSecret::random_from_rng(OsRng);
+        let packet = relay_link::handshake_init(
+            &self.identity.ed25519_secret,
+            &X25519PublicKey::from(&secret),
+        );
+        (secret, packet)
     }
 
+    /// Finish the link handshake with the relay's reply: check it's signed
+    /// by the relay we pinned and answers our handshake, then take the
+    /// session ID the relay gave the link and derive the link key.
     pub fn complete_handshake(
         &mut self,
         client_secret: EphemeralSecret,
         server_ed25519_pub: &VerifyingKey,
         response: &[u8],
     ) -> Result<()> {
-        if response.len() < 1 + 4 + 32 + 64 || response[0] != TYPE_HANDSHAKE_RESP {
-            return Err(anyhow!("Invalid handshake response"));
-        }
-        let mut server_eph_pub_bytes = [0u8; 32];
-        server_eph_pub_bytes.copy_from_slice(&response[5..37]);
-        let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
-
-        let mut signature_bytes = [0u8; 64];
-        signature_bytes.copy_from_slice(&response[37..101]);
-        let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-
-        let client_pub = X25519PublicKey::from(&client_secret);
-        let mut msg = Vec::new();
-        msg.extend_from_slice(client_pub.as_bytes());
-        msg.extend_from_slice(server_eph_pub.as_bytes());
-
-        server_ed25519_pub.verify(&msg, &signature)?;
-
-        let shared_secret = client_secret.diffie_hellman(&server_eph_pub);
-        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
-            .expand(b"wireguard-lite-link", &mut self.link_master_key)
-            .unwrap();
+        let client_ephemeral = X25519PublicKey::from(&client_secret);
+        let (session_id, relay_ephemeral) =
+            relay_link::parse_handshake_resp(response, server_ed25519_pub, &client_ephemeral)
+                .map_err(|e| anyhow!("Invalid handshake response: {e}"))?;
+        self.session_id = session_id;
+        self.link_master_key =
+            relay_link::derive_link_key(client_secret.diffie_hellman(&relay_ephemeral).as_bytes());
         Ok(())
     }
 
-    /// Tells the relay which routing token lives at our current address,
-    /// and proves it's ours: our token public key (which the token is a
-    /// hash of, see `routing_token_for`) and its signature over this link
-    /// (see `sync_signing_input`).
-    pub fn generate_sync_packet(&self) -> Vec<u8> {
-        use ed25519_dalek::Signer;
-        let signature = self
-            .identity
-            .token_secret
-            .sign(&sync_signing_input(&self.link_master_key));
-        let mut proof = self.identity.token_public.as_bytes().to_vec();
-        proof.extend_from_slice(&signature.to_bytes());
-        self.wrap_link(TYPE_SYNC, self.identity.routing_token, &proof)
+    /// Tells the relay our routing token lives on this link and proves it's
+    /// ours (see `relay_link::Sync`), and registers the admission tags of
+    /// our contacts, so their packets get our queue for contacts. Sent when
+    /// we connect and then as the keepalive.
+    pub fn generate_sync_packet(&mut self) -> Vec<u8> {
+        self.admission_changed = false;
+        let sync = relay_link::Sync::new(
+            &self.identity.token_secret,
+            &self.link_master_key,
+            self.admission_tags_in(),
+        );
+        relay_link::seal(
+            &self.link_master_key,
+            TYPE_SYNC,
+            &self.session_id,
+            &sync.to_bytes(),
+        )
     }
 
     /// Tells the relay we have the packets it forwarded with delivery IDs
     /// `ids`, so it stops resending them. Only the link session we last
     /// synced from can ack our routing token's packets.
     pub fn generate_ack_packet(&self, ids: &[DeliveryId]) -> Vec<u8> {
-        self.wrap_link(TYPE_ACK, self.identity.routing_token, ids.as_flattened())
+        relay_link::seal(
+            &self.link_master_key,
+            TYPE_ACK,
+            &self.session_id,
+            &relay_link::ack_plaintext(&self.identity.routing_token, ids),
+        )
     }
 
     fn wrap_link_encryption(&self, target_token: RoutingToken, inner_payload: &[u8]) -> Vec<u8> {
-        self.wrap_link(TYPE_DATA, target_token, inner_payload)
+        let tag = self.admission_tag_for(&target_token);
+        self.wrap_data(target_token, tag.as_ref(), inner_payload)
     }
 
-    fn wrap_link(
+    /// `inner_payload` for `target_token`, link-encrypted for the relay, with
+    /// the admission tag we put on what we send them, if we have one.
+    fn wrap_data(
         &self,
-        packet_type: u8,
         target_token: RoutingToken,
+        tag: Option<&AdmissionTag>,
         inner_payload: &[u8],
     ) -> Vec<u8> {
-        let mut raw_udp_payload = Vec::new();
-        raw_udp_payload.extend_from_slice(&target_token);
-        raw_udp_payload.extend_from_slice(inner_payload);
+        relay_link::data_packet(
+            &self.link_master_key,
+            &self.session_id,
+            &target_token,
+            tag,
+            inner_payload,
+        )
+    }
 
-        let link_cipher = XChaCha20Poly1305::new(Key::from_slice(&self.link_master_key));
-        let mut link_nonce_bytes = [0u8; 24];
-        OsRng.fill_bytes(&mut link_nonce_bytes);
-        let link_nonce = XNonce::from_slice(&link_nonce_bytes);
-        let link_ciphertext = link_cipher
-            .encrypt(link_nonce, raw_udp_payload.as_ref())
-            .unwrap();
+    /// The admission tag we put on what we send `peer`, once we have their
+    /// X25519 key from their KeyExchange.
+    fn admission_tag_for(&self, peer: &RoutingToken) -> Option<AdmissionTag> {
+        let key = self.peer_x25519_keys.get(peer)?;
+        admission_tag(
+            &self.identity.x25519_secret,
+            key,
+            &self.identity.routing_token,
+            peer,
+        )
+    }
 
-        let mut final_packet = vec![packet_type];
-        final_packet.extend_from_slice(&self.session_id);
-        final_packet.extend_from_slice(&link_nonce_bytes);
-        final_packet.extend_from_slice(&link_ciphertext);
-        final_packet
+    /// The admission tags our contacts put on what they send us, for our
+    /// sync to register: at most `relay_link::MAX_ADMISSION_TAGS`, contacts
+    /// we have a session with first.
+    fn admission_tags_in(&self) -> Vec<AdmissionTag> {
+        let mut contacts: Vec<_> = self.peer_x25519_keys.iter().collect();
+        contacts.sort_by_key(|(token, _)| (!self.e2e_sessions.contains_key(*token), **token));
+        contacts
+            .into_iter()
+            .filter_map(|(token, key)| {
+                admission_tag(
+                    &self.identity.x25519_secret,
+                    key,
+                    token,
+                    &self.identity.routing_token,
+                )
+            })
+            .take(relay_link::MAX_ADMISSION_TAGS)
+            .collect()
     }
 
     /// Trust a contact's routing token and Ed25519 key, as scanned from
-    /// their QR code (or pasted), and return the KeyExchange to send them.
-    /// Only contacts added this way can start a session with us, so both
-    /// sides add each other; the session comes up once both have.
+    /// their QR code (or pasted), save that, and return the KeyExchange to
+    /// send them. Only contacts added this way can start a session with us,
+    /// so both sides add each other; the session comes up once both have.
+    ///
+    /// Adding someone who's already a contact sends them our KeyExchange
+    /// again, which restarts the session setup from wherever it got stuck
+    /// (see `handle_key_exchange`). Someone new, or removed since, gets a
+    /// new add ID (see `AddIds`).
     pub fn add_contact(&mut self, token: RoutingToken, ed25519_public: VerifyingKey) -> Vec<u8> {
-        self.pending_contacts.insert(token, ed25519_public);
-        self.dismiss_connection_request(&token);
-        // Re-adding a contact whose keys we have asks them for a new
-        // session, if they're the one who sends it.
-        if self.peer_kyber_keys.contains_key(&token) && !self.establishes_session_with(&token) {
-            self.awaiting_session_est.insert(token);
+        if self
+            .pending_contacts
+            .insert(token, ed25519_public)
+            .is_none()
+        {
+            let mine = self.next_add_id;
+            self.next_add_id = self.next_add_id.saturating_add(1);
+            self.add_ids.insert(token, AddIds { mine, theirs: 0 });
         }
+        self.connection_requests.retain(|(t, _)| *t != token);
+        self.save();
         self.create_kx_request(token)
     }
 
-    /// People who tried to connect but aren't contacts, newest first. Their
-    /// KeyExchange was dropped (see the 0x02 branch of
-    /// `handle_incoming_packet`); adding them with `add_contact`, by
-    /// scanning their code, is what accepts it. Only the token is kept, as
-    /// nothing else they sent is verified.
+    /// Whether we can message `token`: we share a session, and if we made
+    /// it, they've confirmed they have it too. Until then, anything we sent
+    /// on it could arrive before they have it, and be lost.
+    pub fn is_connected(&self, token: &RoutingToken) -> bool {
+        self.e2e_sessions.contains_key(token)
+            && self
+                .session_setups
+                .get(token)
+                .is_none_or(|setup| setup.offer.is_none())
+    }
+
+    /// People who tried to connect but aren't contacts, in the order they
+    /// first tried; none while requests are muted. Their KeyExchange was
+    /// dropped (see the 0x02 branch of `handle_incoming_packet`); adding
+    /// them with `add_contact`, by scanning their code, is what accepts it.
+    /// Only the token is kept, as nothing else they sent is verified.
     pub fn connection_requests(&self) -> Vec<RoutingToken> {
+        if self.requests_muted {
+            return Vec::new();
+        }
         self.connection_requests
             .iter()
-            .rev()
             .filter(|(_, at)| at.elapsed() < CONNECTION_REQUEST_TTL)
             .map(|(token, _)| *token)
             .collect()
     }
 
-    /// Stop listing `token`'s connection request, until they send another.
+    /// "Not now": stop listing `token`'s request, and don't list another
+    /// from them for `DISMISSED_REQUEST_TTL`.
     pub fn dismiss_connection_request(&mut self, token: &RoutingToken) {
         self.connection_requests.retain(|(t, _)| t != token);
+        self.dismissed_requests.insert(*token, Instant::now());
     }
 
-    fn note_connection_request(&mut self, token: RoutingToken) {
-        self.connection_requests
-            .retain(|(t, at)| *t != token && at.elapsed() < CONNECTION_REQUEST_TTL);
-        if self.connection_requests.len() >= MAX_CONNECTION_REQUESTS {
-            self.connection_requests.remove(0);
+    pub fn requests_muted(&self) -> bool {
+        self.requests_muted
+    }
+
+    /// Mute or unmute connection requests. While muted, none are listed or
+    /// kept. Saved with the identity.
+    pub fn set_requests_muted(&mut self, muted: bool) {
+        self.requests_muted = muted;
+        if muted {
+            self.connection_requests.clear();
         }
-        self.connection_requests.push((token, Instant::now()));
+        self.save();
     }
 
+    /// List `token`'s request so the user can be asked to add them back,
+    /// unless requests are muted, `token` was dismissed recently, or
+    /// `MAX_CONNECTION_REQUESTS` new ones have been listed in the last
+    /// `CONNECTION_REQUEST_TTL` already: anyone can make as many identities
+    /// as they like, and each would otherwise be another pop-up. Another
+    /// request from someone already listed only keeps it listed for longer.
+    fn note_connection_request(&mut self, token: RoutingToken) {
+        let now = Instant::now();
+        self.connection_requests
+            .retain(|(_, at)| now.duration_since(*at) < CONNECTION_REQUEST_TTL);
+        self.listed_requests
+            .retain(|at| now.duration_since(*at) < CONNECTION_REQUEST_TTL);
+        self.dismissed_requests
+            .retain(|_, at| now.duration_since(*at) < DISMISSED_REQUEST_TTL);
+        if self.requests_muted || self.dismissed_requests.contains_key(&token) {
+            return;
+        }
+        if let Some((_, at)) = self
+            .connection_requests
+            .iter_mut()
+            .find(|(t, _)| *t == token)
+        {
+            *at = now;
+        } else if self.listed_requests.len() < MAX_CONNECTION_REQUESTS {
+            self.listed_requests.push_back(now);
+            self.connection_requests.push((token, now));
+        }
+    }
+
+    /// Our add IDs for `peer` (see `AddIds`).
+    fn add_ids(&self, peer: &RoutingToken) -> AddIds {
+        self.add_ids.get(peer).copied().unwrap_or_default()
+    }
+
+    /// Which of `peer`'s add IDs our session with them was made for, or
+    /// `None` if we have no session with them.
+    fn session_peer_add_id(&self, peer: &RoutingToken) -> Option<u32> {
+        if !self.e2e_sessions.contains_key(peer) {
+            return None;
+        }
+        Some(match self.session_setups.get(peer) {
+            Some(setup) if self.establishes_session_with(peer) => setup.responder_add_id,
+            Some(setup) => setup.establisher_add_id,
+            None => 0, // from before add IDs existed, like the contact
+        })
+    }
+
+    /// `peer` has added us from scratch since we last heard (they're new to
+    /// us, or removed and re-added us): note their new add ID, and drop any
+    /// session made for an older one, which they no longer have.
+    fn set_their_add_id(&mut self, peer: RoutingToken, add_id: u32) {
+        self.add_ids.entry(peer).or_default().theirs = add_id;
+        if self
+            .session_peer_add_id(&peer)
+            .is_some_and(|session| session < add_id)
+        {
+            println!(
+                ">> {} added you again, so your old session with them is gone.",
+                short(&peer)
+            );
+            self.e2e_sessions.remove(&peer);
+            self.session_setups.remove(&peer);
+            self.reassembler.forget(&peer);
+        }
+    }
+
+    /// Our KeyExchange for `target_token`: our keys, whether we have
+    /// theirs, our add ID for them, and which session we have with them, if
+    /// any.
     pub fn create_kx_request(&self, target_token: RoutingToken) -> Vec<u8> {
         let payload = KeyExchangePayload::generate(
             &self.identity,
             target_token,
             &self.local_name,
             self.peer_kyber_keys.contains_key(&target_token),
+            self.add_ids(&target_token).mine,
+            self.session_peer_add_id(&target_token),
         );
         let mut inner = vec![0x02];
         inner.extend_from_slice(&payload.to_bytes());
@@ -862,19 +1053,22 @@ impl Client {
         self.identity.routing_token < *peer
     }
 
-    pub fn create_session_est_packet(
-        &self,
-        target_token: RoutingToken,
-        bob_x25519: &X25519PublicKey,
-        bob_kyber: &PublicKey,
-    ) -> (Vec<u8>, SymmetricSessionState) {
+    /// Make a new session with `peer`, which we establish, for our current
+    /// add IDs (replacing any we had), and return the SessionEstablish that
+    /// offers it. We don't use it until they confirm they have it.
+    fn offer_new_session(
+        &mut self,
+        peer: RoutingToken,
+        peer_x25519: &X25519PublicKey,
+        peer_kyber: &PublicKey,
+    ) -> Vec<u8> {
         // 1. Classical X25519 DH
-        let alice_e2e_secret = EphemeralSecret::random_from_rng(OsRng);
-        let alice_e2e_pub = X25519PublicKey::from(&alice_e2e_secret);
-        let classical_shared_secret = alice_e2e_secret.diffie_hellman(bob_x25519);
+        let eph_secret = EphemeralSecret::random_from_rng(OsRng);
+        let eph_x25519_pub = X25519PublicKey::from(&eph_secret);
+        let classical_shared_secret = eph_secret.diffie_hellman(peer_x25519);
 
         // 2. Post-Quantum Encapsulation
-        let (pq_shared_secret, kyber_ct) = encapsulate(bob_kyber);
+        let (pq_shared_secret, kyber_ct) = encapsulate(peer_kyber);
 
         // 3. Hybrid Derivation (keeping the peer's Kyber pub for future PQ
         // ratchet injections)
@@ -882,43 +1076,74 @@ impl Client {
             classical_shared_secret.as_bytes(),
             pq_shared_secret.as_bytes(),
         );
-        let session_state = SymmetricSessionState::from_root_key(root_key, Some(*bob_kyber));
-
-        let est_payload = SessionEstablishPayload::generate(
-            &self.identity,
-            target_token,
-            kyber_ct,
-            alice_e2e_pub,
+        self.e2e_sessions.insert(
+            peer,
+            SymmetricSessionState::from_root_key(root_key, Some(*peer_kyber)),
         );
-        let mut inner = vec![0x04];
-        inner.extend_from_slice(&est_payload.to_bytes());
-        let packet = self.wrap_link_encryption(target_token, &inner);
-        (packet, session_state)
+        let ids = self.add_ids(&peer);
+        self.session_setups.insert(
+            peer,
+            SessionSetup {
+                establisher_add_id: ids.mine,
+                responder_add_id: ids.theirs,
+                offer: Some(SessionOffer {
+                    eph_x25519_pub,
+                    kyber_ct,
+                }),
+            },
+        );
+        self.save();
+        println!(">> Offered {} a new E2E session.", short(&peer));
+        self.session_est_packet(&peer)
+            .expect("the session was just offered")
     }
 
-    pub fn accept_session_est(&mut self, est: &SessionEstablishPayload) {
-        let alice_x25519_pub = est.eph_x25519_pub;
-        let kyber_ciphertext = &est.kyber_ct;
+    /// The SessionEstablish offering the session we made with `peer`,
+    /// freshly signed, as long as they haven't confirmed they have it.
+    /// Offering the same session again (rather than a new one each time
+    /// they ask) is what keeps both sides on one session however often the
+    /// request and the offer cross, repeat or go missing.
+    fn session_est_packet(&self, peer: &RoutingToken) -> Option<Vec<u8>> {
+        let setup = self.session_setups.get(peer)?;
+        let offer = setup.offer?;
+        let est = SessionEstablishPayload::generate(
+            &self.identity,
+            *peer,
+            offer.kyber_ct,
+            offer.eph_x25519_pub,
+            setup.establisher_add_id,
+            setup.responder_add_id,
+        );
+        let mut inner = vec![0x04];
+        inner.extend_from_slice(&est.to_bytes());
+        Some(self.wrap_link_encryption(*peer, &inner))
+    }
 
+    /// `peer` has the session we offered them: stop offering it, and start
+    /// using it.
+    fn confirm_session(&mut self, peer: &RoutingToken) {
+        if let Some(setup) = self.session_setups.get_mut(peer)
+            && setup.offer.take().is_some()
+        {
+            self.save();
+            println!(">> E2E Session established with {}!", short(peer));
+        }
+    }
+
+    /// The session a SessionEstablish offers us.
+    fn session_from_est(&self, est: &SessionEstablishPayload) -> SymmetricSessionState {
         let classical_shared_secret = self
             .identity
             .x25519_secret
-            .diffie_hellman(&alice_x25519_pub);
-        let pq_shared_secret = decapsulate(kyber_ciphertext, &self.identity.kyber_secret);
-
+            .diffie_hellman(&est.eph_x25519_pub);
+        let pq_shared_secret = decapsulate(&est.kyber_ct, &self.identity.kyber_secret);
         let root_key = hybrid_root_key(
             classical_shared_secret.as_bytes(),
             pq_shared_secret.as_bytes(),
         );
         // Peer's Kyber public key was stored during the KeyExchange phase
         let peer_kyber = self.peer_kyber_keys.get(&est.routing_token).copied();
-        let session_state = SymmetricSessionState::from_root_key(root_key, peer_kyber);
-        self.e2e_sessions.insert(est.routing_token, session_state);
-        self.save();
-        println!(
-            ">> E2E Session established with {}!",
-            hex::encode(&est.routing_token[0..4])
-        );
+        SymmetricSessionState::from_root_key(root_key, peer_kyber)
     }
 
     /// Encrypt a message as single link-encrypted datagrams: (message_packets,
@@ -965,9 +1190,10 @@ impl Client {
             &msg_payloads,
             pq_payload.as_deref(),
         )?;
+        let tag = self.admission_tag_for(&target_token);
         Ok(symbols
             .iter()
-            .map(|inner| self.wrap_link_encryption(target_token, inner))
+            .map(|inner| self.wrap_data(target_token, tag.as_ref(), inner))
             .collect())
     }
 
@@ -978,8 +1204,9 @@ impl Client {
     /// The message is split into chunks (see `chunks`), each padded to a
     /// fixed size (see `padding`) and encrypted as its own ratcheted chat
     /// payload, so every one is the same size whatever the message length.
-    /// Messages over `chunks::MAX_MESSAGE_LEN` bytes are rejected before the
-    /// ratchet moves.
+    /// Messages over `chunks::MAX_MESSAGE_LEN` bytes, and messages on a
+    /// session the other side hasn't confirmed yet (see `is_connected`), are
+    /// rejected before the ratchet moves.
     ///
     /// Every PQ_INJECT_INTERVAL ratchet steps, a PQ inject is generated
     /// automatically — checked once per message, not per chunk, so it always
@@ -991,6 +1218,11 @@ impl Client {
         target_token: RoutingToken,
         plaintext: &[u8],
     ) -> Result<MessagePayloads> {
+        if self.e2e_sessions.contains_key(&target_token) && !self.is_connected(&target_token) {
+            return Err(anyhow!(
+                "Not connected yet: waiting for them to confirm the session."
+            ));
+        }
         let padded_chunks = chunks::split(plaintext)?
             .iter()
             .map(|chunk| padding::pad(chunk))
@@ -1073,9 +1305,11 @@ impl Client {
     /// addressed to us, and its timestamp is within `MAX_TIMESTAMP_DRIFT` of
     /// our clock. Logs and returns `false` if not.
     fn accepts_payload(&self, what: &str, target_token: &RoutingToken, timestamp: u64) -> bool {
-        if !self.is_addressed_to_us(what, target_token) {
-            return false;
-        }
+        self.is_addressed_to_us(what, target_token) && self.is_fresh(what, timestamp)
+    }
+
+    /// The second of `accepts_payload`'s checks, on its own.
+    fn is_fresh(&self, what: &str, timestamp: u64) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1112,35 +1346,53 @@ impl Client {
     /// `open_link_packet`, plus the delivery ID from the packet's 16-byte
     /// prefix.
     pub fn open_relay_packet(&self, packet: &[u8]) -> Option<(DeliveryId, Vec<u8>)> {
-        if packet.len() < 1 + 4 + 24 + 16
-            || packet[0] != TYPE_DATA
-            || packet[1..5] != self.session_id
-        {
+        if relay_link::header(packet)? != (TYPE_DATA, self.session_id) {
             return None;
         }
-        let link_cipher = XChaCha20Poly1305::new(Key::from_slice(&self.link_master_key));
-        let mut inner = link_cipher
-            .decrypt(XNonce::from_slice(&packet[5..29]), &packet[29..])
-            .ok()?;
-        if inner.len() < 16 {
+        let plaintext = relay_link::open(&self.link_master_key, packet)?;
+        let (delivery_id, inner) = relay_link::parse_forwarded(&plaintext)?;
+        Some((delivery_id, inner.to_vec()))
+    }
+
+    /// If `packet` is the relay asking whether we're really at the address
+    /// our last sync came from (see `relay_link::TYPE_PATH_CHALLENGE`; it
+    /// asks when that address is new to it, say after our NAT mapping
+    /// changed), our answer: the challenge back, then a fresh sync, which the
+    /// relay takes in once the answer has shown we're there.
+    fn answer_path_challenge(&mut self, packet: &[u8]) -> Option<Vec<Vec<u8>>> {
+        if relay_link::header(packet)? != (TYPE_PATH_CHALLENGE, self.session_id) {
             return None;
         }
-        let payload = inner.split_off(16);
-        Some((inner.try_into().unwrap(), payload))
+        let challenge =
+            relay_link::parse_challenge(&relay_link::open(&self.link_master_key, packet)?)?;
+        Some(vec![
+            relay_link::seal(
+                &self.link_master_key,
+                TYPE_PATH_RESPONSE,
+                &self.session_id,
+                &challenge,
+            ),
+            self.generate_sync_packet(),
+        ])
     }
 
     /// Everything a receive loop does with one UDP packet from the relay:
     /// open it, handle it unless it's a resend we've already handled, and
     /// acknowledge it so the relay stops resending it. Returns the packets
     /// to send back to the relay, in order: any protocol reply (e.g. a
-    /// KeyExchange response), then the ack. Packets that aren't for us
-    /// return nothing.
+    /// KeyExchange response), a fresh sync if a contact's admission tag has
+    /// just turned up (so the relay knows it now, not at the next
+    /// keepalive), then the ack. A path challenge gets its answer (see
+    /// `answer_path_challenge`). Packets that aren't for us return nothing.
     ///
     /// The ack goes out after the packet is handled (and its effects
     /// saved), so a crash in between means a resend rather than a lost
     /// message. A packet that fails to handle is acked anyway: resending it
     /// wouldn't change the outcome.
     pub fn handle_relay_packet(&mut self, packet: &[u8]) -> Vec<Vec<u8>> {
+        if let Some(answer) = self.answer_path_challenge(packet) {
+            return answer;
+        }
         let Some((delivery_id, payload)) = self.open_relay_packet(packet) else {
             return Vec::new();
         };
@@ -1150,6 +1402,9 @@ impl Client {
             && let Ok(Some(reply)) = self.handle_incoming_packet(&payload)
         {
             out.push(reply);
+        }
+        if self.admission_changed {
+            out.push(self.generate_sync_packet());
         }
         if needs_ack {
             out.push(self.generate_ack_packet(&[delivery_id]));
@@ -1191,7 +1446,7 @@ impl Client {
                 let Some(expected_ed25519) = self.pending_contacts.get(&peer_token) else {
                     println!(
                         ">> Ignored a connection request from {}, who isn't one of your contacts. Add each other to connect.",
-                        hex::encode(&peer_token[0..4])
+                        short(&peer_token)
                     );
                     self.note_connection_request(peer_token);
                     return Ok(None);
@@ -1205,98 +1460,38 @@ impl Client {
                 if kx.ed25519_public.as_bytes() != expected_ed25519.as_bytes() {
                     println!(
                         ">> [SECURITY ALERT] KeyExchange from {} failed QR code verification!",
-                        hex::encode(&peer_token[0..4])
+                        short(&peer_token)
                     );
                     return Ok(None);
                 }
-
-                // Store peer's Kyber key for future PQ injections
-                self.peer_kyber_keys.insert(peer_token, kx.kyber_public);
-
-                // Learn the peer's self-chosen name (if any) the moment
-                // their KeyExchange arrives, so it shows up for pending AND
-                // established contacts.
-                if kx.name.is_empty() {
-                    self.contact_names.remove(&peer_token);
-                } else {
-                    self.contact_names.insert(peer_token, kx.name.clone());
-                }
-                self.save();
-
-                // Each side sends its KeyExchange when it adds the other,
-                // and whoever adds first has theirs dropped. So a contact
-                // without our keys gets ours again, and the one of us who
-                // establishes (see `establishes_session_with`) does so only
-                // once the other has our keys, or their PQ injections would
-                // have nothing to encapsulate to.
-                let establisher = self.establishes_session_with(&peer_token);
-                if !kx.has_peer_keys {
-                    if !establisher {
-                        self.awaiting_session_est.insert(peer_token);
-                    }
-                    return Ok(Some(self.create_kx_request(peer_token)));
-                }
-                if establisher {
-                    println!(">> Verified keys against QR code!");
-                    let (est_packet, session) = self.create_session_est_packet(
-                        peer_token,
-                        &kx.x25519_public,
-                        &kx.kyber_public,
-                    );
-                    self.e2e_sessions.insert(peer_token, session);
-                    self.save();
-                    println!(
-                        ">> E2E Session established with {}!",
-                        hex::encode(&peer_token[0..4])
-                    );
-                    return Ok(Some(est_packet));
-                }
-                // They have our keys, so they're waiting on us to ask for a
-                // session, unless we have one or already asked.
-                if self.e2e_sessions.contains_key(&peer_token)
-                    || !self.awaiting_session_est.insert(peer_token)
-                {
-                    return Ok(None);
-                }
-                Ok(Some(self.create_kx_request(peer_token)))
+                Ok(self.handle_key_exchange(&kx))
             }
             0x04 => {
                 // SessionEstablish
-
-                if let Ok(est) = SessionEstablishPayload::from_bytes(pkt_data) {
-                    if !self.accepts_payload("SessionEstablish", &est.target_token, est.timestamp) {
-                        return Ok(None);
-                    }
-                    // Only the contact with the lower routing token sends
-                    // one (see `establishes_session_with`).
-                    if self.establishes_session_with(&est.routing_token) {
-                        println!(
-                            ">> Dropped SessionEstablish from {}: this side establishes the session.",
-                            hex::encode(&est.routing_token[0..4])
-                        );
-                        return Ok(None);
-                    }
-                    if let Some(alice_pub) = self.pending_contacts.get(&est.routing_token) {
-                        if est.verify(alice_pub).is_ok() {
-                            self.awaiting_session_est.remove(&est.routing_token);
-                            if !self.seen_session_keys.insert(est.eph_x25519_pub.to_bytes()) {
-                                println!(
-                                    ">> [SECURITY ALERT] Dropped SessionEstablish! Replay detected (key already seen)."
-                                );
-                                return Ok(None);
-                            }
-                            if self.seen_session_keys.len() > 1000 {
-                                self.seen_session_keys.clear();
-                            }
-                            self.accept_session_est(&est);
-                        } else {
-                            println!(">> [SECURITY ALERT] SessionEstablish signature invalid!");
-                        }
-                    } else {
-                        println!(">> Received SessionEstablish but no pending contact found.");
-                    }
+                let Ok(est) = SessionEstablishPayload::from_bytes(pkt_data) else {
+                    return Ok(None);
+                };
+                if !self.is_addressed_to_us("SessionEstablish", &est.target_token) {
+                    return Ok(None);
                 }
-                Ok(None)
+                // Only the contact with the lower routing token sends one
+                // (see `establishes_session_with`).
+                if self.establishes_session_with(&est.routing_token) {
+                    println!(
+                        ">> Dropped SessionEstablish from {}: this side establishes the session.",
+                        short(&est.routing_token)
+                    );
+                    return Ok(None);
+                }
+                let Some(peer_ed25519) = self.pending_contacts.get(&est.routing_token) else {
+                    println!(">> Received SessionEstablish but no pending contact found.");
+                    return Ok(None);
+                };
+                if est.verify(peer_ed25519).is_err() {
+                    println!(">> [SECURITY ALERT] SessionEstablish signature invalid!");
+                    return Ok(None);
+                }
+                Ok(self.handle_session_establish(&est))
             }
             0x05 => {
                 // PQ Inject
@@ -1366,6 +1561,9 @@ impl Client {
                     println!(">> [SECURITY ALERT] Dropped FEC symbol that failed authentication.");
                     return Ok(None);
                 };
+                // Only someone with the session could have sealed it, so if
+                // it's one we offered, they have it.
+                self.confirm_session(&sender_token);
                 let object = match self
                     .fec_rx
                     .reassemble(sender_token, &symbol, Instant::now())
@@ -1415,6 +1613,136 @@ impl Client {
             }
             _ => Ok(None),
         }
+    }
+
+    /// The rest of a KeyExchange from a contact, once it has checked out
+    /// (see the 0x02 branch of `handle_incoming_packet`). Returns our reply,
+    /// if there is one.
+    ///
+    /// Each side sends its KeyExchange when it adds the other, and whoever
+    /// adds first has theirs dropped, so a contact without our keys gets
+    /// ours again. The one of us who establishes (see
+    /// `establishes_session_with`) offers a session once the other has its
+    /// keys and asks for one, and offers that same session, re-signed, each
+    /// time it's asked again, until the other side confirms it has it. So
+    /// however the KeyExchanges cross, repeat or get lost, only one session
+    /// is ever on offer, and either side adding the other again picks the
+    /// setup up wherever it stopped. Add IDs (see `AddIds`) tell an old
+    /// message from a current one, and a session the other side has lost
+    /// from one it just hasn't received yet.
+    fn handle_key_exchange(&mut self, kx: &KeyExchangePayload) -> Option<Vec<u8>> {
+        let peer = kx.routing_token;
+        let theirs = self.add_ids(&peer).theirs;
+        if kx.add_id < theirs {
+            println!(
+                ">> Ignored an old KeyExchange from {}, sent before they last added you.",
+                short(&peer)
+            );
+            return None;
+        }
+        if kx.add_id > theirs {
+            self.set_their_add_id(peer, kx.add_id);
+        }
+
+        // Keep the peer's keys: Kyber for our PQ injections (into a session
+        // that was made before we had it, too), X25519 for the admission
+        // tags we share (see `admission_tag`).
+        self.peer_kyber_keys.insert(peer, kx.kyber_public);
+        if let Some(session) = self.e2e_sessions.get_mut(&peer) {
+            session.peer_kyber_pub.get_or_insert(kx.kyber_public);
+        }
+        if self.peer_x25519_keys.insert(peer, kx.x25519_public) != Some(kx.x25519_public) {
+            self.admission_changed = true;
+        }
+        // Learn the peer's self-chosen name (if any) the moment their
+        // KeyExchange arrives, so it shows up for pending AND established
+        // contacts.
+        if kx.name.is_empty() {
+            self.contact_names.remove(&peer);
+        } else {
+            self.contact_names.insert(peer, kx.name.clone());
+        }
+        self.save();
+
+        let mine = self.add_ids(&peer).mine;
+        let have_session = self.e2e_sessions.contains_key(&peer);
+        if !self.establishes_session_with(&peer) {
+            return match (have_session, kx.session) {
+                // They have the session we have: confirm it, as they may not
+                // have heard that we do.
+                (true, Some(add_id)) if add_id == mine => Some(self.create_kx_request(peer)),
+                // Sent before they made the session we have.
+                (true, _) => None,
+                // Ask for one: our KeyExchange says we have none.
+                (false, _) => Some(self.create_kx_request(peer)),
+            };
+        }
+        if !kx.has_peer_keys {
+            return Some(self.create_kx_request(peer));
+        }
+        match kx.session {
+            // They're asking for a session. If we've offered them one, offer
+            // it again: nothing has been sent on it, and they may never have
+            // got it. If they've confirmed it, this is an old request.
+            None if have_session => self.session_est_packet(&peer),
+            None => {
+                println!(">> Verified keys against QR code!");
+                Some(self.offer_new_session(peer, &kx.x25519_public, &kx.kyber_public))
+            }
+            // They have the session we offered them.
+            Some(add_id) if add_id == mine && have_session => {
+                self.confirm_session(&peer);
+                None
+            }
+            // They have one from before we last added them, or one we no
+            // longer have: our KeyExchange says what we have, so they can
+            // drop theirs and ask again.
+            Some(_) => Some(self.create_kx_request(peer)),
+        }
+    }
+
+    /// The rest of a SessionEstablish from a contact, once it has checked
+    /// out (see the 0x04 branch of `handle_incoming_packet`): take in the
+    /// session it offers, if it's for the add IDs we have now, and confirm
+    /// we have it. A repeat of the offer is confirmed again, since our first
+    /// confirmation may have gone missing. One held up so long (say at the
+    /// relay while we were offline) that it fails the timestamp check is
+    /// answered with a fresh request for it instead, if we're still waiting.
+    fn handle_session_establish(&mut self, est: &SessionEstablishPayload) -> Option<Vec<u8>> {
+        let peer = est.routing_token;
+        if !self.is_fresh("SessionEstablish", est.timestamp) {
+            return (!self.e2e_sessions.contains_key(&peer)).then(|| self.create_kx_request(peer));
+        }
+        let ids = self.add_ids(&peer);
+        if est.establisher_add_id < ids.theirs || est.responder_add_id != ids.mine {
+            println!(
+                ">> Ignored an old SessionEstablish from {}, made before one of you last added the other.",
+                short(&peer)
+            );
+            return None;
+        }
+        if est.establisher_add_id > ids.theirs {
+            self.set_their_add_id(peer, est.establisher_add_id);
+        }
+        let session = self.session_from_est(est);
+        let have_it = self
+            .e2e_sessions
+            .get(&peer)
+            .is_some_and(|ours| ours.root_key == session.root_key);
+        if !have_it {
+            self.e2e_sessions.insert(peer, session);
+            self.session_setups.insert(
+                peer,
+                SessionSetup {
+                    establisher_add_id: est.establisher_add_id,
+                    responder_add_id: est.responder_add_id,
+                    offer: None,
+                },
+            );
+            self.save();
+            println!(">> E2E Session established with {}!", short(&peer));
+        }
+        Some(self.create_kx_request(peer))
     }
 
     /// Decrypt a 0x01 chat payload: [16-byte sender_token | 8-byte seq_no |
@@ -1568,8 +1896,8 @@ pub async fn perform_handshake(
 mod tests {
     use super::*;
     use crate::test_support::{
-        connect, connected_pair, establisher_and_responder, exchange, new_client, session,
-        strip_link,
+        cleanup, connect, connected_pair, establisher_and_responder, exchange, inbox_texts,
+        new_client, relay, session, strip_link,
     };
     use pqcrypto_traits::kem::PublicKey as _;
 
@@ -1719,9 +2047,9 @@ mod tests {
         let alice_id = UserIdentity::generate();
         let mut bob_token = [0u8; 16];
         bob_token[0] = 0xBB;
-        let payload = KeyExchangePayload::generate(&alice_id, bob_token, "", false);
+        let payload = KeyExchangePayload::generate(&alice_id, bob_token, "", false, 0, None);
         let bytes = payload.to_bytes();
-        assert_eq!(bytes.len(), 1385);
+        assert_eq!(bytes.len(), 1393);
         let parsed = KeyExchangePayload::from_bytes(&bytes).unwrap();
         assert!(parsed.verify(&parsed.ed25519_public).is_ok());
         assert!(!parsed.has_peer_keys);
@@ -1736,10 +2064,16 @@ mod tests {
         let eph_sec = EphemeralSecret::random_from_rng(OsRng);
         let eph_pub = X25519PublicKey::from(&eph_sec);
         let (_ks, kyber_ct) = encapsulate(&bob_id.kyber_public);
-        let est =
-            SessionEstablishPayload::generate(&alice_id, bob_id.routing_token, kyber_ct, eph_pub);
+        let est = SessionEstablishPayload::generate(
+            &alice_id,
+            bob_id.routing_token,
+            kyber_ct,
+            eph_pub,
+            0,
+            0,
+        );
         let bytes = est.to_bytes();
-        assert_eq!(bytes.len(), 1224);
+        assert_eq!(bytes.len(), 1232);
         let parsed = SessionEstablishPayload::from_bytes(&bytes).unwrap();
         assert!(parsed.verify(&alice_id.ed25519_public).is_ok());
     }
@@ -1775,11 +2109,11 @@ mod tests {
     fn test_edge_case_invalid_packet_sizes() {
         assert!(KeyExchangePayload::from_bytes(&[0u8; 0]).is_err());
         assert!(KeyExchangePayload::from_bytes(&[0u8; 100]).is_err());
-        assert!(KeyExchangePayload::from_bytes(&[0u8; 1384]).is_err());
-        assert!(KeyExchangePayload::from_bytes(&[0u8; 1386]).is_err());
+        assert!(KeyExchangePayload::from_bytes(&[0u8; 1392]).is_err());
+        assert!(KeyExchangePayload::from_bytes(&[0u8; 1394]).is_err());
         assert!(SessionEstablishPayload::from_bytes(&[0u8; 0]).is_err());
-        assert!(SessionEstablishPayload::from_bytes(&[0u8; 1223]).is_err());
-        assert!(SessionEstablishPayload::from_bytes(&[0u8; 1225]).is_err());
+        assert!(SessionEstablishPayload::from_bytes(&[0u8; 1231]).is_err());
+        assert!(SessionEstablishPayload::from_bytes(&[0u8; 1233]).is_err());
         assert!(PQInjectPayload::from_bytes(&[0u8; 0]).is_err());
         assert!(PQInjectPayload::from_bytes(&[0u8; 1199]).is_err());
         assert!(PQInjectPayload::from_bytes(&[0u8; 1201]).is_err());
@@ -1801,7 +2135,7 @@ mod tests {
     #[test]
     fn test_edge_case_bad_kx_signature() {
         let alice_id = UserIdentity::generate();
-        let payload = KeyExchangePayload::generate(&alice_id, [0u8; 16], "", false);
+        let payload = KeyExchangePayload::generate(&alice_id, [0u8; 16], "", false, 0, None);
         let mut bytes = payload.to_bytes();
         bytes[104] ^= 0x01;
         let parsed = KeyExchangePayload::from_bytes(&bytes).unwrap();
@@ -1815,8 +2149,14 @@ mod tests {
         let eph_sec = EphemeralSecret::random_from_rng(OsRng);
         let eph_pub = X25519PublicKey::from(&eph_sec);
         let (_, kyber_ct) = encapsulate(&bob_id.kyber_public);
-        let est =
-            SessionEstablishPayload::generate(&alice_id, bob_id.routing_token, kyber_ct, eph_pub);
+        let est = SessionEstablishPayload::generate(
+            &alice_id,
+            bob_id.routing_token,
+            kyber_ct,
+            eph_pub,
+            0,
+            0,
+        );
         let mut bytes = est.to_bytes();
         bytes[1200] ^= 0x01;
         let parsed = SessionEstablishPayload::from_bytes(&bytes).unwrap();
@@ -1843,8 +2183,14 @@ mod tests {
         let eph_sec = EphemeralSecret::random_from_rng(OsRng);
         let eph_pub = X25519PublicKey::from(&eph_sec);
         let (_, kyber_ct) = encapsulate(&bob_id.kyber_public);
-        let est =
-            SessionEstablishPayload::generate(&alice_id, bob_id.routing_token, kyber_ct, eph_pub);
+        let est = SessionEstablishPayload::generate(
+            &alice_id,
+            bob_id.routing_token,
+            kyber_ct,
+            eph_pub,
+            0,
+            0,
+        );
         let bytes = est.to_bytes();
         let parsed = SessionEstablishPayload::from_bytes(&bytes).unwrap();
         assert!(parsed.verify(&bob_id.ed25519_public).is_err());
@@ -1870,7 +2216,7 @@ mod tests {
     #[test]
     fn test_edge_case_timestamp_expiration() {
         let alice_id = UserIdentity::generate();
-        let mut payload = KeyExchangePayload::generate(&alice_id, [0u8; 16], "", false);
+        let mut payload = KeyExchangePayload::generate(&alice_id, [0u8; 16], "", false, 0, None);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1885,7 +2231,7 @@ mod tests {
         let alice_id = UserIdentity::generate();
         let mut charlie_token = [0u8; 16];
         charlie_token[0] = 0xCC;
-        let payload = KeyExchangePayload::generate(&alice_id, charlie_token, "", false);
+        let payload = KeyExchangePayload::generate(&alice_id, charlie_token, "", false, 0, None);
         let mut bob_token = [0u8; 16];
         bob_token[0] = 0xBB;
         assert_ne!(payload.target_token, bob_token);
@@ -2252,11 +2598,66 @@ mod tests {
             session(b, a).peer_kyber_pub.is_some(),
             "needed for PQ injects"
         );
+        assert!(a.is_connected(&b.identity.routing_token));
+        assert!(b.is_connected(&a.identity.routing_token));
+    }
+
+    /// Hand `packet` from `from` to `to`, returning `to`'s reply.
+    fn hand(from: &Client, to: &mut Client, packet: &[u8]) -> Option<Vec<u8>> {
+        to.handle_incoming_packet(&relay(packet, from)).unwrap()
+    }
+
+    /// The setup up to the establisher's offer: the establisher adds the
+    /// responder first (dropped), the responder adds it back, they swap
+    /// keys, and the responder asks for a session. Returns the offer, not
+    /// yet delivered.
+    fn up_to_the_offer(e: &mut Client, r: &mut Client) -> Vec<u8> {
+        let early = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+        assert_eq!(exchange(e, r, early), [0x02], "dropped");
+        let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+        let keys = hand(r, e, &kx).unwrap();
+        let request = hand(e, r, &keys).unwrap();
+        let offer = hand(r, e, &request).unwrap();
+        assert_eq!(relay(&offer, e)[0], 0x04);
+        offer
+    }
+
+    /// Deliver `in_flight` (each packet tagged with whether `e` sent it),
+    /// and every reply after it, newest first or oldest first, each one
+    /// `copies` times, until neither side has anything left to say. For
+    /// checking the setup settles the same way whatever order things
+    /// arrive in, and however often.
+    fn settle(
+        e: &mut Client,
+        r: &mut Client,
+        mut in_flight: Vec<(bool, Vec<u8>)>,
+        newest_first: bool,
+        copies: usize,
+    ) {
+        let mut delivered = 0;
+        while !in_flight.is_empty() {
+            let (from_e, packet) = if newest_first {
+                in_flight.pop().unwrap()
+            } else {
+                in_flight.remove(0)
+            };
+            for _ in 0..copies {
+                delivered += 1;
+                assert!(delivered < 200, "didn't settle");
+                let reply = if from_e {
+                    hand(e, r, &packet)
+                } else {
+                    hand(r, e, &packet)
+                };
+                in_flight.extend(reply.map(|reply| (!from_e, reply)));
+            }
+        }
     }
 
     /// The establisher (lower token) adds the responder first, so its
     /// KeyExchange is dropped. When the responder adds it back, each sends
-    /// the other its keys before the session is made.
+    /// the other its keys, the responder asks for a session, the establisher
+    /// offers one, and the responder confirms it has it.
     #[test]
     fn test_handshake_when_establisher_adds_first() {
         let (mut e, mut r) = establisher_and_responder();
@@ -2265,8 +2666,9 @@ mod tests {
         assert!(r.peer_kyber_keys.is_empty() && r.contact_names.is_empty());
 
         let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
-        assert_eq!(exchange(&mut r, &mut e, kx), [0x02, 0x02, 0x02, 0x04]);
+        assert_eq!(exchange(&mut r, &mut e, kx), [0x02, 0x02, 0x02, 0x04, 0x02]);
         assert_one_session_with_pq_keys(&e, &r);
+        cleanup(&[&e, &r]);
     }
 
     #[test]
@@ -2276,34 +2678,157 @@ mod tests {
         assert_eq!(exchange(&mut r, &mut e, early), [0x02], "dropped");
 
         let kx = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
-        assert_eq!(exchange(&mut e, &mut r, kx), [0x02, 0x02, 0x04]);
+        assert_eq!(exchange(&mut e, &mut r, kx), [0x02, 0x02, 0x04, 0x02]);
         assert_one_session_with_pq_keys(&e, &r);
+        cleanup(&[&e, &r]);
     }
 
     /// Both add each other before either KeyExchange arrives, so the two
-    /// cross. Only one SessionEstablish may come of it, or each side would
-    /// end up on the other's session.
+    /// cross. Only one session may come of it, or each side would end up on
+    /// a different one.
     #[test]
     fn test_handshake_when_both_add_before_hearing_back() {
         let (mut e, mut r) = establisher_and_responder();
         let kx_e = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
         let kx_r = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
-        let r_reply = r
-            .handle_incoming_packet(&strip_link(&kx_e, &e.link_master_key))
-            .unwrap()
-            .unwrap();
-        let e_reply = e
-            .handle_incoming_packet(&strip_link(&kx_r, &r.link_master_key))
-            .unwrap()
-            .unwrap();
+        let r_reply = hand(&e, &mut r, &kx_e).unwrap();
+        let e_reply = hand(&r, &mut e, &kx_r).unwrap();
 
-        assert_eq!(exchange(&mut r, &mut e, r_reply), [0x02, 0x04]);
+        assert_eq!(exchange(&mut r, &mut e, r_reply), [0x02, 0x04, 0x02]);
         assert_eq!(
             exchange(&mut e, &mut r, e_reply),
             [0x02],
-            "the responder already asked for (and got) the session"
+            "sent before the session was made, so ignored"
         );
         assert_one_session_with_pq_keys(&e, &r);
+        cleanup(&[&e, &r]);
+    }
+
+    /// The responder asked for a session, and the establisher's offer never
+    /// arrived. Adding the contact again, from either side, picks the setup
+    /// up where it stopped, on the session already offered: the establisher
+    /// offers that one again rather than making another.
+    #[test]
+    fn test_re_adding_from_either_side_restarts_a_stuck_setup() {
+        for re_adder_establishes in [true, false] {
+            let (mut e, mut r) = establisher_and_responder();
+            let _lost_offer = up_to_the_offer(&mut e, &mut r);
+            let offered = session(&e, &r).root_key;
+            assert!(!e.is_connected(&r.identity.routing_token), "not confirmed");
+            assert!(!r.e2e_sessions.contains_key(&e.identity.routing_token));
+
+            if re_adder_establishes {
+                let kx = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+                assert_eq!(exchange(&mut e, &mut r, kx), [0x02, 0x02, 0x04, 0x02]);
+            } else {
+                let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+                assert_eq!(exchange(&mut r, &mut e, kx), [0x02, 0x04, 0x02]);
+            }
+            assert_one_session_with_pq_keys(&e, &r);
+            assert_eq!(session(&r, &e).root_key, offered, "the one already offered");
+            cleanup(&[&e, &r]);
+        }
+    }
+
+    /// The responder has the session, but its confirmation never reached
+    /// the establisher, which keeps the session unused meanwhile. Adding the
+    /// contact again from either side gets a confirmation through.
+    #[test]
+    fn test_re_adding_from_either_side_recovers_a_lost_confirmation() {
+        for re_adder_establishes in [true, false] {
+            let (mut e, mut r) = establisher_and_responder();
+            let offer = up_to_the_offer(&mut e, &mut r);
+            let _lost_confirmation = hand(&e, &mut r, &offer).unwrap();
+            assert!(r.is_connected(&e.identity.routing_token));
+            assert!(!e.is_connected(&r.identity.routing_token));
+            assert!(
+                e.create_fec_packets(r.identity.routing_token, b"too soon")
+                    .is_err(),
+                "not used before it's confirmed"
+            );
+
+            if re_adder_establishes {
+                let kx = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+                assert_eq!(exchange(&mut e, &mut r, kx), [0x02, 0x02]);
+            } else {
+                let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+                assert_eq!(exchange(&mut r, &mut e, kx), [0x02]);
+            }
+            assert_one_session_with_pq_keys(&e, &r);
+            cleanup(&[&e, &r]);
+        }
+    }
+
+    /// A message from the responder on the session also shows the
+    /// establisher it has it, if its confirmation went missing.
+    #[test]
+    fn test_a_message_on_the_session_confirms_it() {
+        let (mut e, mut r) = establisher_and_responder();
+        let offer = up_to_the_offer(&mut e, &mut r);
+        let _lost_confirmation = hand(&e, &mut r, &offer).unwrap();
+        let burst = r
+            .create_fec_packets(e.identity.routing_token, b"hi")
+            .unwrap();
+        for packet in &burst {
+            hand(&r, &mut e, packet);
+        }
+        assert_eq!(inbox_texts(&mut e), ["hi"]);
+        assert_one_session_with_pq_keys(&e, &r);
+        cleanup(&[&e, &r]);
+    }
+
+    /// The responder's request arrives twice (two KeyExchanges crossed, or
+    /// the relay resent one): the establisher offers the same session both
+    /// times, so whichever offer arrives first, both sides end up on it.
+    #[test]
+    fn test_repeated_requests_get_the_same_session_whatever_the_order() {
+        let (mut e, mut r) = establisher_and_responder();
+        let early = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+        exchange(&mut e, &mut r, early);
+        let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+        let keys = hand(&r, &mut e, &kx).unwrap();
+        let request = hand(&e, &mut r, &keys).unwrap();
+        let first = hand(&r, &mut e, &request).unwrap();
+        let second = hand(&r, &mut e, &request).unwrap();
+        let offered = session(&e, &r).root_key;
+
+        let confirmations = [second, first].map(|offer| hand(&e, &mut r, &offer).unwrap());
+        assert_eq!(session(&r, &e).root_key, offered);
+        for confirmation in confirmations {
+            assert!(hand(&r, &mut e, &confirmation).is_none());
+        }
+        assert_one_session_with_pq_keys(&e, &r);
+        cleanup(&[&e, &r]);
+    }
+
+    /// An offer held up past the timestamp window (the relay kept it while
+    /// the responder was offline, say) is answered with a fresh request,
+    /// and the establisher offers the same session again, freshly signed.
+    #[test]
+    fn test_stale_offer_is_answered_with_a_fresh_request() {
+        use ed25519_dalek::Signer;
+        use pqcrypto_traits::kem::Ciphertext as _;
+        let (mut e, mut r) = establisher_and_responder();
+        let offer = up_to_the_offer(&mut e, &mut r);
+        let mut est = SessionEstablishPayload::from_bytes(&relay(&offer, &e)[1..]).unwrap();
+        est.timestamp -= 600;
+        let mut signed = Vec::new();
+        signed.extend_from_slice(&est.routing_token);
+        signed.extend_from_slice(&est.target_token);
+        signed.extend_from_slice(&est.timestamp.to_be_bytes());
+        signed.extend_from_slice(est.kyber_ct.as_bytes());
+        signed.extend_from_slice(est.eph_x25519_pub.as_bytes());
+        signed.extend_from_slice(&est.establisher_add_id.to_be_bytes());
+        signed.extend_from_slice(&est.responder_add_id.to_be_bytes());
+        est.signature = e.identity.ed25519_secret.sign(&signed);
+        let mut stale = vec![0x04];
+        stale.extend_from_slice(&est.to_bytes());
+
+        let request = r.handle_incoming_packet(&stale).unwrap().unwrap();
+        assert!(r.e2e_sessions.is_empty(), "too old to take in");
+        assert_eq!(exchange(&mut r, &mut e, request), [0x02, 0x04, 0x02]);
+        assert_one_session_with_pq_keys(&e, &r);
+        cleanup(&[&e, &r]);
     }
 
     /// One side removes the other, then adds them back: the other still
@@ -2326,7 +2851,119 @@ mod tests {
             exchange(remover, other, kx);
             assert_one_session_with_pq_keys(&e, &r);
             assert_ne!(session(&e, &r).root_key, old_root, "a new session");
+            cleanup(&[&e, &r]);
         }
+    }
+
+    /// One side removes the other, then both add each other again at once.
+    /// Their KeyExchanges cross, and whatever order everything arrives in,
+    /// and even if everything arrives twice, they end up on one new
+    /// session.
+    #[test]
+    fn test_both_re_adding_at_once_after_a_removal_ends_on_one_session() {
+        for remover_establishes in [true, false] {
+            for newest_first in [true, false] {
+                for copies in [1, 2] {
+                    let (mut e, mut r) = establisher_and_responder();
+                    connect(&mut e, &mut r);
+                    let old_root = session(&e, &r).root_key;
+                    if remover_establishes {
+                        e.forget_contact(r.identity.routing_token);
+                    } else {
+                        r.forget_contact(e.identity.routing_token);
+                    }
+                    let kx_e = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+                    let kx_r = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+                    settle(
+                        &mut e,
+                        &mut r,
+                        vec![(true, kx_e), (false, kx_r)],
+                        newest_first,
+                        copies,
+                    );
+                    assert_one_session_with_pq_keys(&e, &r);
+                    assert_ne!(session(&e, &r).root_key, old_root);
+                    cleanup(&[&e, &r]);
+                }
+            }
+        }
+    }
+
+    /// A KeyExchange or SessionEstablish sent before the other side last
+    /// removed and re-added us is recognisably old (see `AddIds`), so a late
+    /// copy can't knock anyone off the session they've set up since.
+    #[test]
+    fn test_messages_from_before_a_re_add_are_ignored() {
+        let (mut e, mut r) = establisher_and_responder();
+        connect(&mut e, &mut r);
+        let old_kx = r.create_kx_request(e.identity.routing_token);
+        let eph = X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng));
+        let (_, kyber_ct) = encapsulate(&r.identity.kyber_public);
+        let old_offer = SessionEstablishPayload::generate(
+            &e.identity,
+            r.identity.routing_token,
+            kyber_ct,
+            eph,
+            e.add_ids(&r.identity.routing_token).mine,
+            r.add_ids(&e.identity.routing_token).mine,
+        );
+        let mut old_offer = [vec![0x04], old_offer.to_bytes()].concat();
+
+        r.forget_contact(e.identity.routing_token);
+        let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+        exchange(&mut r, &mut e, kx);
+        let current = session(&e, &r).root_key;
+
+        assert!(hand(&r, &mut e, &old_kx).is_none());
+        assert!(r.handle_incoming_packet(&old_offer).unwrap().is_none());
+        old_offer[1] ^= 1; // and nothing else gets past the signature
+        assert!(r.handle_incoming_packet(&old_offer).unwrap().is_none());
+        assert_eq!(session(&e, &r).root_key, current);
+        assert_one_session_with_pq_keys(&e, &r);
+        cleanup(&[&e, &r]);
+    }
+
+    /// The same SessionEstablish twice (the relay resent it, say): the
+    /// second only gets the confirmation again, with the session untouched,
+    /// even after it has been used.
+    #[test]
+    fn test_repeated_session_establish_changes_nothing() {
+        let (mut e, mut r) = establisher_and_responder();
+        let offer = up_to_the_offer(&mut e, &mut r);
+        let confirmation = hand(&e, &mut r, &offer).unwrap();
+        assert!(hand(&r, &mut e, &confirmation).is_none());
+        let (msgs, _) = e
+            .create_encrypted_packets(r.identity.routing_token, b"hello")
+            .unwrap();
+        hand(&e, &mut r, &msgs[0]);
+        let before = session(&r, &e).recv_chain_key;
+
+        let again = hand(&e, &mut r, &offer).unwrap();
+        assert_eq!(relay(&again, &r)[0], 0x02, "confirmed again");
+        assert_eq!(session(&r, &e).recv_chain_key, before);
+        assert_eq!(inbox_texts(&mut r), ["hello"]);
+        cleanup(&[&e, &r]);
+    }
+
+    /// Adding a contact is saved straight away, not only once their reply
+    /// comes: an app closed in between still knows it added them, so their
+    /// KeyExchange isn't taken for a stranger's.
+    #[test]
+    fn test_adding_a_contact_is_saved_straight_away() {
+        let (mut alice, mut bob) = (new_client(), new_client());
+        alice.add_contact(bob.identity.routing_token, bob.identity.ed25519_public);
+        let mut restarted = ClientStateDto::load(&alice.state_path).unwrap();
+        assert!(
+            restarted
+                .pending_contacts
+                .contains_key(&bob.identity.routing_token)
+        );
+
+        let kx = bob.add_contact(alice.identity.routing_token, alice.identity.ed25519_public);
+        exchange(&mut bob, &mut restarted, kx);
+        assert!(restarted.connection_requests().is_empty());
+        assert_one_session_with_pq_keys(&restarted, &bob);
+        cleanup(&[&alice, &bob]);
     }
 
     #[test]
@@ -2339,6 +2976,8 @@ mod tests {
                 bob.identity.routing_token,
                 "stranger",
                 false,
+                1,
+                None,
             );
             let mut packet = vec![0x02];
             packet.extend_from_slice(&kx.to_bytes());
@@ -2346,13 +2985,13 @@ mod tests {
         }
         assert!(bob.pending_contacts.is_empty());
         assert!(bob.peer_kyber_keys.is_empty());
+        assert!(bob.peer_x25519_keys.is_empty());
         assert!(bob.contact_names.is_empty());
-        assert!(bob.awaiting_session_est.is_empty());
         assert_eq!(bob.connection_requests().len(), MAX_CONNECTION_REQUESTS);
     }
 
-    /// A stranger's request is listed (newest first) so the user can be
-    /// asked to scan them back, until they do, or dismiss it.
+    /// A stranger's request is listed (in the order they arrived) so the
+    /// user can be asked to scan them back, until they do, or dismiss it.
     #[test]
     fn test_connection_requests_listed_until_added_or_dismissed() {
         let (mut alice, mut bob, mut carol) = (new_client(), new_client(), new_client());
@@ -2362,7 +3001,7 @@ mod tests {
         };
         request(&mut alice, &mut bob);
         request(&mut carol, &mut bob);
-        request(&mut alice, &mut bob); // again: moves to the front, once
+        request(&mut alice, &mut bob); // again: listed once, still first
         assert_eq!(
             bob.connection_requests(),
             [alice.identity.routing_token, carol.identity.routing_token]
@@ -2370,14 +3009,62 @@ mod tests {
 
         bob.dismiss_connection_request(&carol.identity.routing_token);
         assert_eq!(bob.connection_requests(), [alice.identity.routing_token]);
+        request(&mut carol, &mut bob);
+        assert_eq!(
+            bob.connection_requests(),
+            [alice.identity.routing_token],
+            "dismissed, so not listed again"
+        );
 
         // Scanning Alice back accepts: no longer a request, and connected.
         let kx = bob.add_contact(alice.identity.routing_token, alice.identity.ed25519_public);
         assert!(bob.connection_requests().is_empty());
         exchange(&mut bob, &mut alice, kx);
-        assert!(bob.e2e_sessions.contains_key(&alice.identity.routing_token));
+        assert!(bob.is_connected(&alice.identity.routing_token));
         assert!(alice.connection_requests().is_empty());
-        crate::test_support::cleanup(&[&alice, &bob, &carol]);
+        cleanup(&[&alice, &bob, &carol]);
+    }
+
+    /// However many identities someone makes, only
+    /// `MAX_CONNECTION_REQUESTS` new requests are listed per
+    /// `CONNECTION_REQUEST_TTL`, dismissed ones included, so they can't keep
+    /// popping up requests. Muting lists none at all, and is saved.
+    #[test]
+    fn test_connection_requests_are_limited_and_can_be_muted() {
+        let request = |to: &mut Client, from: &UserIdentity| {
+            let kx =
+                KeyExchangePayload::generate(from, to.identity.routing_token, "", false, 1, None);
+            to.handle_incoming_packet(&[vec![0x02], kx.to_bytes()].concat())
+                .unwrap();
+        };
+        let mut bob = new_client();
+        for _ in 0..MAX_CONNECTION_REQUESTS {
+            let stranger = UserIdentity::generate();
+            request(&mut bob, &stranger);
+            assert_eq!(bob.connection_requests(), [stranger.routing_token]);
+            bob.dismiss_connection_request(&stranger.routing_token);
+        }
+        request(&mut bob, &UserIdentity::generate());
+        assert!(bob.connection_requests().is_empty(), "over the limit");
+
+        let mut carol = new_client();
+        carol.set_requests_muted(true);
+        request(&mut carol, &UserIdentity::generate());
+        assert!(carol.connection_requests().is_empty());
+        assert!(
+            ClientStateDto::load(&carol.state_path)
+                .unwrap()
+                .requests_muted()
+        );
+        carol.set_requests_muted(false);
+        assert!(
+            carol.connection_requests().is_empty(),
+            "none kept while muted"
+        );
+        let stranger = UserIdentity::generate();
+        request(&mut carol, &stranger);
+        assert_eq!(carol.connection_requests(), [stranger.routing_token]);
+        cleanup(&[&bob, &carol]);
     }
 
     /// Only an intact KeyExchange addressed to us gets noted: not a
@@ -2386,9 +3073,9 @@ mod tests {
     fn test_misaddressed_or_forged_request_is_not_noted() {
         let mut bob = new_client();
         let stranger = UserIdentity::generate();
-        let misaddressed = KeyExchangePayload::generate(&stranger, [0xCC; 16], "", false);
+        let misaddressed = KeyExchangePayload::generate(&stranger, [0xCC; 16], "", false, 0, None);
         let mut forged =
-            KeyExchangePayload::generate(&stranger, bob.identity.routing_token, "", false);
+            KeyExchangePayload::generate(&stranger, bob.identity.routing_token, "", false, 0, None);
         forged.name = "tampered".into();
         for kx in [misaddressed, forged] {
             let mut packet = vec![0x02];
@@ -2402,53 +3089,148 @@ mod tests {
     /// responder is dropped even when it's a contact and signed properly.
     #[test]
     fn test_session_establish_from_the_responder_is_dropped() {
-        let (e, r) = establisher_and_responder();
-        let mut e = e;
+        let (mut e, r) = establisher_and_responder();
         e.pending_contacts
             .insert(r.identity.routing_token, r.identity.ed25519_public);
         e.peer_kyber_keys
             .insert(r.identity.routing_token, r.identity.kyber_public);
-        let (est, _) = r.create_session_est_packet(
+        let eph = X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng));
+        let (_, kyber_ct) = encapsulate(&e.identity.kyber_public);
+        let est = SessionEstablishPayload::generate(
+            &r.identity,
             e.identity.routing_token,
-            &e.identity.x25519_public,
-            &e.identity.kyber_public,
+            kyber_ct,
+            eph,
+            0,
+            0,
         );
-        assert!(
-            e.handle_incoming_packet(&strip_link(&est, &r.link_master_key))
-                .unwrap()
-                .is_none()
-        );
+        let packet = [vec![0x04], est.to_bytes()].concat();
+        assert!(e.handle_incoming_packet(&packet).unwrap().is_none());
         assert!(e.e2e_sessions.is_empty());
     }
 
     #[test]
     fn test_sync_packet_proves_routing_token_ownership() {
-        use ed25519_dalek::Signature;
         let mut client = new_client();
         client.link_master_key = [7u8; 32];
-        let sync = client.generate_sync_packet();
-        assert_eq!(sync[0], TYPE_SYNC);
-        assert_eq!(sync[1..5], client.session_id);
-        let plaintext = XChaCha20Poly1305::new(Key::from_slice(&client.link_master_key))
-            .decrypt(XNonce::from_slice(&sync[5..29]), &sync[29..])
-            .unwrap();
-        assert_eq!(plaintext.len(), 16 + 32 + 64);
-
-        let token_key = VerifyingKey::from_bytes(plaintext[16..48].try_into().unwrap()).unwrap();
-        assert_eq!(plaintext[..16], client.identity.routing_token);
-        assert_eq!(routing_token_for(&token_key), client.identity.routing_token);
-        let signature = Signature::from_bytes(plaintext[48..].try_into().unwrap());
+        client.session_id = [1, 2, 3, 4];
+        let packet = client.generate_sync_packet();
+        assert_eq!(relay_link::header(&packet), Some((TYPE_SYNC, [1, 2, 3, 4])));
+        let sync =
+            relay_link::Sync::from_bytes(&relay_link::open(&[7u8; 32], &packet).unwrap()).unwrap();
+        assert_eq!(sync.token, client.identity.routing_token);
+        assert!(sync.verify(&[7u8; 32]).is_ok());
         assert!(
-            token_key
-                .verify_strict(&sync_signing_input(&[7u8; 32]), &signature)
-                .is_ok()
-        );
-        assert!(
-            token_key
-                .verify_strict(&sync_signing_input(&[8u8; 32]), &signature)
-                .is_err(),
+            sync.verify(&[8u8; 32]).is_err(),
             "only proves anything on this link"
         );
+    }
+
+    /// The relay picks the link's session ID, and only a reply signed by
+    /// the relay we pinned, to our own handshake, is taken.
+    #[test]
+    fn test_handshake_takes_the_session_id_the_relay_gives() {
+        let relay_identity = SigningKey::from_bytes(&[7; 32]);
+        let reply = |init: &[u8], session_id: SessionId| {
+            let client_ephemeral = relay_link::parse_handshake_init(init).unwrap();
+            let relay_secret = EphemeralSecret::random_from_rng(OsRng);
+            let relay_ephemeral = X25519PublicKey::from(&relay_secret);
+            let resp = relay_link::handshake_resp(
+                &relay_identity,
+                &client_ephemeral,
+                &relay_ephemeral,
+                &session_id,
+            );
+            let link_key = relay_link::derive_link_key(
+                relay_secret.diffie_hellman(&client_ephemeral).as_bytes(),
+            );
+            (resp, link_key)
+        };
+        let mut client = new_client();
+
+        let (secret, init) = client.generate_handshake_packet();
+        let (resp, _) = reply(&init, [5, 6, 7, 8]);
+        let impostor = SigningKey::from_bytes(&[8; 32]).verifying_key();
+        assert!(client.complete_handshake(secret, &impostor, &resp).is_err());
+        let (secret, _) = client.generate_handshake_packet();
+        assert!(
+            client
+                .complete_handshake(secret, &relay_identity.verifying_key(), &resp)
+                .is_err(),
+            "a reply to another handshake"
+        );
+
+        let (secret, init) = client.generate_handshake_packet();
+        let (resp, link_key) = reply(&init, [5, 6, 7, 8]);
+        client
+            .complete_handshake(secret, &relay_identity.verifying_key(), &resp)
+            .unwrap();
+        assert_eq!(client.session_id, [5, 6, 7, 8]);
+        assert_eq!(client.link_master_key, link_key);
+    }
+
+    /// The relay's path challenge is answered with the same challenge, then
+    /// a fresh sync for the relay to take in once it has checked the
+    /// answer. One that isn't from our link is ignored.
+    #[test]
+    fn test_path_challenge_is_answered_then_synced() {
+        let mut client = new_client();
+        client.link_master_key = [4; 32];
+        client.session_id = [1, 2, 3, 4];
+        let challenge = [9u8; 16];
+        let packet = relay_link::seal(&[4; 32], TYPE_PATH_CHALLENGE, &[1, 2, 3, 4], &challenge);
+        let answer = client.handle_relay_packet(&packet);
+        assert_eq!(answer.len(), 2);
+        assert_eq!(
+            relay_link::header(&answer[0]),
+            Some((TYPE_PATH_RESPONSE, [1, 2, 3, 4]))
+        );
+        assert_eq!(relay_link::open(&[4; 32], &answer[0]).unwrap(), challenge);
+        assert_eq!(answer[1][0], TYPE_SYNC);
+
+        let forged = relay_link::seal(&[5; 32], TYPE_PATH_CHALLENGE, &[1, 2, 3, 4], &challenge);
+        assert!(client.handle_relay_packet(&forged).is_empty());
+    }
+
+    /// Contacts work out the same admission tag for each direction, which
+    /// nobody else can, our sync registers the ones contacts use to reach
+    /// us, and what we send a contact carries theirs. Removing a contact
+    /// takes theirs out of the next sync.
+    #[test]
+    fn test_contacts_share_admission_tags_the_sync_registers() {
+        let (mut alice, mut bob) = connected_pair();
+        let (a, b) = (alice.identity.routing_token, bob.identity.routing_token);
+        let alice_to_bob = alice.admission_tag_for(&b).unwrap();
+        assert_eq!(bob.admission_tags_in(), [alice_to_bob]);
+        assert_eq!(
+            alice.admission_tags_in(),
+            [bob.admission_tag_for(&a).unwrap()]
+        );
+        assert_ne!(
+            Some(alice_to_bob),
+            bob.admission_tag_for(&a),
+            "one per direction"
+        );
+        let mallory = UserIdentity::generate();
+        assert_ne!(
+            admission_tag(&mallory.x25519_secret, &bob.identity.x25519_public, &a, &b),
+            Some(alice_to_bob)
+        );
+
+        let sync = relay_link::Sync::from_bytes(
+            &relay_link::open(&[0u8; 32], &bob.generate_sync_packet()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sync.admission, [alice_to_bob]);
+        let packet = alice.create_fec_packets(b, b"hi").unwrap().remove(0);
+        let (packet_type, _) = relay_link::header(&packet).unwrap();
+        let plaintext = relay_link::open(&alice.link_master_key, &packet).unwrap();
+        let (_, tag, _) = relay_link::parse_data(packet_type, &plaintext).unwrap();
+        assert_eq!(tag, Some(alice_to_bob));
+
+        bob.forget_contact(a);
+        assert!(bob.admission_tags_in().is_empty());
+        cleanup(&[&alice, &bob]);
     }
 
     #[test]
@@ -2566,9 +3348,8 @@ mod tests {
     #[test]
     fn test_full_handshake_then_pq_inject() {
         // Full handshake + 5 messages + PQ inject: end-to-end integration
-        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
-        let mut alice = Client::new(server_addr);
-        let mut bob = Client::new(server_addr);
+        let mut alice = new_client();
+        let mut bob = new_client();
         connect(&mut alice, &mut bob);
 
         // Send 5 messages with PQ inject at #5
@@ -2627,21 +3408,22 @@ mod tests {
 
     /// An identity that `client` would accept a SessionEstablish from (its
     /// routing token is the lower one), so a test reaches the checks after
-    /// that.
-    fn identity_establishing_with(client: &Client) -> UserIdentity {
-        loop {
-            let id = UserIdentity::generate();
-            if id.routing_token < client.identity.routing_token {
-                return id;
-            }
+    /// that. Swaps identities with `client` when the new one's token is the
+    /// higher: generating until one happened to be lower could take any
+    /// number of tries.
+    fn identity_establishing_with(client: &mut Client) -> UserIdentity {
+        let mut id = UserIdentity::generate();
+        if id.routing_token > client.identity.routing_token {
+            std::mem::swap(&mut id, &mut client.identity);
         }
+        id
     }
 
     #[test]
     fn test_attack_session_overwrite_prevention() {
         let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
         let mut bob = Client::new(server_addr);
-        let alice_id = identity_establishing_with(&bob);
+        let alice_id = identity_establishing_with(&mut bob);
         let mallory_id = UserIdentity::generate();
         bob.pending_contacts
             .insert(alice_id.routing_token, alice_id.ed25519_public);
@@ -2654,6 +3436,8 @@ mod tests {
             bob.identity.routing_token,
             kyber_ct,
             eph_pub,
+            0,
+            0,
         );
         est.routing_token = alice_id.routing_token;
         let mut inner = vec![0x04];
@@ -2666,7 +3450,7 @@ mod tests {
     fn test_attack_no_session_without_pending() {
         let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
         let mut bob = Client::new(server_addr);
-        let alice_id = identity_establishing_with(&bob);
+        let alice_id = identity_establishing_with(&mut bob);
         let eph_sec = EphemeralSecret::random_from_rng(OsRng);
         let eph_pub = X25519PublicKey::from(&eph_sec);
         let (_, kyber_ct) = encapsulate(&bob.identity.kyber_public);
@@ -2675,6 +3459,8 @@ mod tests {
             bob.identity.routing_token,
             kyber_ct,
             eph_pub,
+            0,
+            0,
         );
         let mut inner = vec![0x04];
         inner.extend_from_slice(&est.to_bytes());
@@ -2834,36 +3620,35 @@ mod tests {
         assert_eq!(bob_state.recv_count, 0);
     }
 
+    /// A contact flooding us with SessionEstablishes leaves one session,
+    /// and nothing that grows with the flood.
     #[test]
-    fn test_edge_case_seen_session_keys_exhaustion() {
-        let server_addr: std::net::SocketAddr = "127.0.0.1:4430".parse().unwrap();
-        let mut bob = Client::new(server_addr);
-
-        // Insert a dummy pending contact to allow verification
-        let alice_id = identity_establishing_with(&bob);
+    fn test_edge_case_session_establish_flood_keeps_one_session() {
+        let mut bob = new_client();
+        let alice_id = identity_establishing_with(&mut bob);
         bob.pending_contacts
             .insert(alice_id.routing_token, alice_id.ed25519_public);
 
-        // Flood with 1050 SessionEstablish payloads
-        for _ in 0..1050 {
+        for _ in 0..100 {
             let eph_sec = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
             let eph_pub = x25519_dalek::PublicKey::from(&eph_sec);
-            let (_, kyber_ct) = pqcrypto_kyber::kyber768::encapsulate(&alice_id.kyber_public);
+            let (_, kyber_ct) = pqcrypto_kyber::kyber768::encapsulate(&bob.identity.kyber_public);
             let payload = SessionEstablishPayload::generate(
                 &alice_id,
                 bob.identity.routing_token,
                 kyber_ct,
                 eph_pub,
+                0,
+                0,
             );
-
             let mut packet = vec![0x04];
             packet.extend_from_slice(&payload.to_bytes());
-
             let _ = bob.handle_incoming_packet(&packet);
         }
 
-        // Ensure bounded to 1000 or cleared
-        assert!(bob.seen_session_keys.len() <= 1000);
+        assert_eq!(bob.e2e_sessions.len(), 1);
+        assert_eq!(bob.session_setups.len(), 1);
+        cleanup(&[&bob]);
     }
 
     // ==========================================
@@ -2932,7 +3717,7 @@ mod tests {
 
         // Generate a valid payload, then manually set a stale timestamp and re-sign
         let mut payload =
-            KeyExchangePayload::generate(&alice_id, bob.identity.routing_token, "", false);
+            KeyExchangePayload::generate(&alice_id, bob.identity.routing_token, "", false, 0, None);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2948,7 +3733,8 @@ mod tests {
         msg.extend_from_slice(payload.x25519_public.as_bytes());
         msg.extend_from_slice(payload.kyber_public.as_bytes());
         msg.extend_from_slice(&[0u8; 32]); // empty name
-        msg.push(0); // has_peer_keys
+        msg.push(0); // flags: no peer keys, no session
+        msg.extend_from_slice(&[0u8; 8]); // add IDs
         payload.signature = alice_id.ed25519_secret.sign(&msg);
         assert!(payload.verify(&alice_id.ed25519_public).is_ok());
 
@@ -2978,7 +3764,7 @@ mod tests {
         let mut charlie_token = [0u8; 16];
         charlie_token[0] = 0xCC;
         // Alice signs a KX intended for Charlie, NOT Bob
-        let payload = KeyExchangePayload::generate(&alice_id, charlie_token, "", false);
+        let payload = KeyExchangePayload::generate(&alice_id, charlie_token, "", false, 0, None);
         let mut packet = vec![0x02];
         packet.extend_from_slice(&payload.to_bytes());
 
@@ -2991,48 +3777,6 @@ mod tests {
             !bob.peer_kyber_keys.contains_key(&alice_id.routing_token),
             "Misbound KX must not be taken in"
         );
-    }
-
-    #[test]
-    fn test_edge_case_session_establish_replay_detection() {
-        // Sends the same SessionEstablish twice; second must be dropped
-        let (mut alice, mut bob) = establisher_and_responder();
-        alice
-            .pending_contacts
-            .insert(bob.identity.routing_token, bob.identity.ed25519_public);
-        alice
-            .peer_kyber_keys
-            .insert(bob.identity.routing_token, bob.identity.kyber_public);
-        bob.add_contact(alice.identity.routing_token, alice.identity.ed25519_public);
-        bob.peer_kyber_keys
-            .insert(alice.identity.routing_token, alice.identity.kyber_public);
-
-        // Bob (who has Alice's keys) asks; Alice sends SessionEstablish
-        let kx = strip_link(
-            &bob.create_kx_request(alice.identity.routing_token),
-            &bob.link_master_key,
-        );
-        let alice_reply = alice.handle_incoming_packet(&kx).unwrap().unwrap();
-
-        // Bob processes SessionEstablish — first time should succeed
-        let est_inner = strip_link(&alice_reply, &alice.link_master_key);
-        assert_eq!(est_inner[0], 0x04);
-        let result1 = bob.handle_incoming_packet(&est_inner).unwrap();
-        assert!(result1.is_none()); // SessionEstablish returns None on success
-        assert!(bob.e2e_sessions.contains_key(&alice.identity.routing_token));
-
-        // Remove the session to test replay detection (session already exists,
-        // but seen_session_keys should still block replay)
-        bob.e2e_sessions.remove(&alice.identity.routing_token);
-
-        // Replay the same SessionEstablish — must be rejected via seen_session_keys
-        let result2 = bob.handle_incoming_packet(&est_inner).unwrap();
-        assert!(result2.is_none());
-        assert!(
-            !bob.e2e_sessions.contains_key(&alice.identity.routing_token),
-            "Replayed SessionEstablish must NOT create a new session"
-        );
-        crate::test_support::cleanup(&[&alice, &bob]);
     }
 
     #[test]
@@ -3106,7 +3850,29 @@ mod tests {
                 },
             },
         );
-        original.seen_session_keys.insert([0xDD; 32]);
+        original
+            .peer_x25519_keys
+            .insert(peer_token, peer_id.x25519_public);
+        original.add_ids.insert(
+            peer_token,
+            AddIds {
+                mine: 11,
+                theirs: 22,
+            },
+        );
+        let (_, kyber_ct) = encapsulate(&peer_id.kyber_public);
+        original.session_setups.insert(
+            peer_token,
+            SessionSetup {
+                establisher_add_id: 11,
+                responder_add_id: 22,
+                offer: Some(SessionOffer {
+                    eph_x25519_pub: peer_id.x25519_public,
+                    kyber_ct,
+                }),
+            },
+        );
+        original.requests_muted = true;
 
         // Save to a temp file
         let tmp_path = "test_roundtrip_state.json";
@@ -3151,8 +3917,17 @@ mod tests {
         // Verify pending contacts
         assert!(loaded.pending_contacts.contains_key(&peer_token));
 
-        // Verify seen_session_keys
-        assert!(loaded.seen_session_keys.contains(&[0xDD; 32]));
+        // Verify what keeps the session setup and admission going
+        assert_eq!(loaded.peer_x25519_keys[&peer_token], peer_id.x25519_public);
+        assert_eq!(loaded.add_ids[&peer_token], original.add_ids[&peer_token]);
+        assert_eq!(loaded.next_add_id, original.next_add_id);
+        let setup = &loaded.session_setups[&peer_token];
+        assert_eq!((setup.establisher_add_id, setup.responder_add_id), (11, 22));
+        let offer = setup.offer.expect("still on offer");
+        assert_eq!(offer.eph_x25519_pub, peer_id.x25519_public);
+        use pqcrypto_traits::kem::Ciphertext as _;
+        assert_eq!(offer.kyber_ct.as_bytes(), kyber_ct.as_bytes());
+        assert!(loaded.requests_muted());
 
         // Clean up
         let _ = std::fs::remove_file(tmp_path);
@@ -3428,7 +4203,7 @@ mod tests {
             assert_eq!(pkts.len(), 1);
             assert_eq!(
                 pkts[0].len(),
-                1150,
+                1158,
                 "chat packet size must not depend on message length"
             );
             let inner = strip_link(&pkts[0], &alice.link_master_key);
@@ -3452,7 +4227,7 @@ mod tests {
             .create_encrypted_packets(bob.identity.routing_token, text.as_bytes())
             .unwrap();
         assert_eq!(pkts.len(), 3);
-        assert!(pkts.iter().all(|p| p.len() == 1150));
+        assert!(pkts.iter().all(|p| p.len() == 1158));
 
         for pkt in pkts.iter().rev().take(2) {
             let inner = strip_link(pkt, &alice.link_master_key);
@@ -3579,53 +4354,54 @@ mod tests {
     /// Helper: wrap an inner E2E payload the way the relay forwards it to
     /// `to`, behind `delivery_id`.
     fn relay_forward(to: &Client, delivery_id: DeliveryId, inner: &[u8]) -> Vec<u8> {
-        let mut plaintext = delivery_id.to_vec();
-        plaintext.extend_from_slice(inner);
-        let mut nonce = [0u8; 24];
-        OsRng.fill_bytes(&mut nonce);
-        let ciphertext = XChaCha20Poly1305::new(Key::from_slice(&to.link_master_key))
-            .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
-            .unwrap();
-        let mut packet = vec![TYPE_DATA];
-        packet.extend_from_slice(&to.session_id);
-        packet.extend_from_slice(&nonce);
-        packet.extend_from_slice(&ciphertext);
-        packet
+        relay_link::forwarded_packet(&to.link_master_key, &to.session_id, &delivery_id, inner)
     }
 
     #[test]
     fn test_relay_packet_is_acked_and_resend_handled_once() {
-        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
-        let alice = Client::new(server_addr);
-        let mut bob = Client::new(server_addr);
+        let alice = new_client();
+        let mut bob = new_client();
         bob.link_master_key = [7u8; 32];
         bob.add_contact(alice.identity.routing_token, alice.identity.ed25519_public);
 
-        let kx =
-            KeyExchangePayload::generate(&alice.identity, bob.identity.routing_token, "", false);
+        let kx = KeyExchangePayload::generate(
+            &alice.identity,
+            bob.identity.routing_token,
+            "",
+            false,
+            0,
+            None,
+        );
         let mut kx_inner = vec![0x02];
         kx_inner.extend_from_slice(&kx.to_bytes());
         let delivery_id = [0x11; 16];
         let packet = relay_forward(&bob, delivery_id, &kx_inner);
 
         let first = bob.handle_relay_packet(&packet);
-        assert_eq!(first.len(), 2, "KeyExchange reply, then the ack");
+        let types: Vec<u8> = first.iter().map(|packet| packet[0]).collect();
+        assert_eq!(
+            types,
+            [relay_link::TYPE_ADMITTED_DATA, TYPE_SYNC, TYPE_ACK],
+            "KeyExchange reply (which now carries Alice's admission tag), a sync registering \
+             the one she'll use, then the ack"
+        );
         let resend = bob.handle_relay_packet(&packet);
         assert_eq!(resend.len(), 1, "a resend is only acked again");
 
         let ack = &resend[0];
-        assert_eq!(ack[0], TYPE_ACK);
-        assert_eq!(ack[1..5], bob.session_id);
-        let plaintext = XChaCha20Poly1305::new(Key::from_slice(&bob.link_master_key))
-            .decrypt(XNonce::from_slice(&ack[5..29]), &ack[29..])
-            .unwrap();
-        assert_eq!(plaintext[..16], bob.identity.routing_token);
-        assert_eq!(plaintext[16..], delivery_id);
+        assert_eq!(relay_link::header(ack), Some((TYPE_ACK, bob.session_id)));
+        let plaintext = relay_link::open(&bob.link_master_key, ack).unwrap();
+        assert_eq!(
+            relay_link::parse_ack(&plaintext),
+            Some((bob.identity.routing_token, [delivery_id].as_slice()))
+        );
+        cleanup(&[&alice, &bob]);
     }
 
     #[test]
     fn test_relay_dummy_packet_is_not_acked() {
         let (_alice, mut bob) = connected_pair();
+        bob.generate_sync_packet(); // registered Alice's admission tag already
         let dummy_inner = [0u8; 1 + 16 + 8 + 24 + padding::PADDED_LEN + 16];
         let packet = relay_forward(&bob, [0u8; 16], &dummy_inner);
         assert!(bob.handle_relay_packet(&packet).is_empty());
@@ -3649,8 +4425,14 @@ mod tests {
 
         let mut mallory = UserIdentity::generate();
         mallory.routing_token = bob.routing_token;
-        let forged =
-            KeyExchangePayload::generate(&mallory, alice.identity.routing_token, "not-bob", false);
+        let forged = KeyExchangePayload::generate(
+            &mallory,
+            alice.identity.routing_token,
+            "not-bob",
+            false,
+            0,
+            None,
+        );
         let mut packet = vec![0x02];
         packet.extend_from_slice(&forged.to_bytes());
 

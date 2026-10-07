@@ -140,6 +140,14 @@ Android, set up the toolchain first; see [ANDROID.md](ANDROID.md).
    and send messages in either window. The same pattern (both sides add
    each other) applies for any additional peers.
 
+If a contact stays "pending" after you've both added each other (say a
+packet went missing), adding them again, from either side, picks the setup
+up where it stopped. Someone who tries to connect before you've added them
+pops up as "Someone wants to connect": scanning their code accepts, "Not
+now" hides them for a day, and "Mute connection requests" stops the pop-ups
+until you unmute them in the contact list. At most 8 new ones are listed
+every 10 minutes, however many identities they come from.
+
 ## What's real vs. what's still a prototype shortcut
 
 - **Real**: identity generation, the link handshake, the PQXDH session
