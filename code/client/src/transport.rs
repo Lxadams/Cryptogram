@@ -382,10 +382,24 @@ impl BurstSender {
     /// case none of it leaves this machine — while the rest is paced out in
     /// the background.
     pub async fn send(&self, packets: Vec<Vec<u8>>) -> io::Result<()> {
-        let stopped = || io::Error::other("burst sender task has stopped");
+        self.queue(packets).await
+    }
+
+    /// `send`, but the burst is queued straight away, before the returned
+    /// future is first polled. Bursts are numbered in their link's paced
+    /// lane as they're made (see `Client::create_fec_packets`), and must
+    /// leave in that order, so a front end queues each one before letting
+    /// go of the `Client` that made it, then waits outside the lock.
+    pub fn queue(&self, packets: Vec<Vec<u8>>) -> impl Future<Output = io::Result<()>> + use<> {
+        fn stopped() -> io::Error {
+            io::Error::other("burst sender task has stopped")
+        }
         let (tx, rx) = oneshot::channel();
-        self.0.send((packets, tx)).map_err(|_| stopped())?;
-        rx.await.map_err(|_| stopped())?
+        let queued = self.0.send((packets, tx)).map_err(|_| stopped());
+        async move {
+            queued?;
+            rx.await.map_err(|_| stopped())?
+        }
     }
 }
 
@@ -815,6 +829,13 @@ mod tests {
         }
         assert!(sizes.iter().all(|&size| size == sizes[0]), "{sizes:?}");
         assert!(sizes[0] <= 1200, "{}-byte datagrams", sizes[0]);
+        // The size the docs give (see `padding::PADDED_LEN`): link header,
+        // recipient token, admission tag, symbol, AEAD tag.
+        assert_eq!(
+            sizes[0],
+            relay_link::LINK_OVERHEAD + 16 + 8 + relay_link::CHAT_INNER_PAYLOAD_LEN
+        );
+        assert_eq!(sizes[0], 1146);
         cleanup(&[&alice, &bob]);
     }
 
@@ -892,7 +913,7 @@ mod tests {
     /// re-key the session, a nested symbol) is ignored.
     #[test]
     fn bundles_only_carry_the_sealing_peers_own_messages() {
-        let (alice, mut bob) = connected_pair();
+        let (mut alice, mut bob) = connected_pair();
         let mut carol = new_client();
         connect(&mut carol, &mut bob);
         let (alice_token, bob_token) = (alice.identity.routing_token, bob.identity.routing_token);

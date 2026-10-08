@@ -899,18 +899,35 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
 /// from popping up again for a day, and muting stops them all until it's
 /// undone in the contact list; the client also caps how many new ones it
 /// lists, so nobody can keep these coming by making new identities. Just
-/// the start of their token is shown: anything else they sent, like a name,
-/// is unverified until that scan. Hidden while the scanner is open.
+/// closing it (the X, a click outside it, or Escape) only hides that
+/// request until the app restarts, as a stray tap shouldn't put someone
+/// off for a day. Just the start of their token is shown: anything else
+/// they sent, like a name, is unverified until that scan. Hidden while the
+/// scanner is open.
 #[component]
 fn ConnectionRequestNotice(
     requests: RwSignal<api::ConnectionRequestsDto>,
     scanning: RwSignal<bool>,
     selected: RwSignal<Option<String>>,
 ) -> impl IntoView {
+    let closed = RwSignal::new(HashSet::<String>::new());
     move || {
-        let (first, waiting) = requests.with(|r| (r.tokens.first().cloned(), r.tokens.len()));
+        let (first, waiting) = requests.with(|r| {
+            let open: Vec<&String> = r
+                .tokens
+                .iter()
+                .filter(|token| !closed.with(|closed| closed.contains(*token)))
+                .collect();
+            (open.first().map(|token| (*token).clone()), open.len())
+        });
         let token = first.filter(|_| !scanning.get())?;
         let short = format!("{}...", token.chars().take(8).collect::<String>());
+        let token_to_close = token.clone();
+        let close = Callback::new(move |()| {
+            closed.update(|closed| {
+                closed.insert(token_to_close.clone());
+            });
+        });
         let dismiss = Callback::new(move |()| {
             let token = token.clone();
             requests.update(|r| r.tokens.retain(|t| *t != token));
@@ -928,7 +945,7 @@ fn ConnectionRequestNotice(
             });
         };
         Some(view! {
-            <Modal title="Connection request" on_close=dismiss>
+            <Modal title="Connection request" on_close=close>
                 <p>"Someone (" <code>{short}</code> ") wants to connect with you."</p>
                 <p class="hint">
                     "To accept, scan the QR code on their screen. If you don't know who this is, ignore it."
@@ -1149,9 +1166,15 @@ fn ContactPanel(
                                         }.into_any()
                                     }
                                 }}
-                                {(contact.status == "pending").then(|| view! {
-                                    <span class="contact-hint">"Waiting for them to scan your code"</span>
-                                })}
+                                {match contact.status.as_str() {
+                                    "pending" => Some(view! {
+                                        <span class="contact-hint">"Waiting for them to scan your code"</span>
+                                    }.into_any()),
+                                    "connecting" => Some(view! {
+                                        <span class="contact-hint">"They've added you. Connecting..."</span>
+                                    }.into_any()),
+                                    _ => None,
+                                }}
                             </li>
                         }
                     }
@@ -1198,8 +1221,8 @@ fn ContactPanel(
 /// Message transcript + send box for whichever contact is selected. Shows
 /// a placeholder state until a contact is picked and until that contact's
 /// session has finished the PQXDH handshake ("established" status) —
-/// sending to a merely "pending" contact would fail server-side since
-/// there's no ratchet key yet.
+/// sending to a "pending" or "connecting" contact fails, since there's no
+/// session both sides have yet.
 #[component]
 fn ChatPanel(
     contacts: RwSignal<Vec<api::ContactDto>>,
@@ -1266,11 +1289,12 @@ fn ChatPanel(
                 Some(token) => {
                     let header_token = token.clone();
                     let len_token = token.clone();
-                    let pending_token = token.clone();
-                    let pending = move || {
+                    let status_token = token.clone();
+                    let status = move || {
                         contacts.get()
                             .iter()
-                            .any(|c| c.token == pending_token && c.status == "pending")
+                            .find(|c| c.token == status_token)
+                            .map(|c| c.status.clone())
                     };
                     let history = move || messages.get().get(&token).cloned().unwrap_or_default();
                     let chat_label = move || {
@@ -1317,11 +1341,19 @@ fn ChatPanel(
                             </button>
                             <h3>"Chat with " {chat_label}</h3>
                         </div>
-                        {move || pending().then(|| view! {
-                            <p class="hint chat-pending">
-                                "Waiting for them to scan your code. You can chat once they have."
-                            </p>
-                        })}
+                        {move || match status().as_deref() {
+                            Some("pending") => Some(view! {
+                                <p class="hint chat-pending">
+                                    "Waiting for them to scan your code. You can chat once they have."
+                                </p>
+                            }.into_any()),
+                            Some("connecting") => Some(view! {
+                                <p class="hint chat-pending">
+                                    "They've added you. Setting up a secure session; you can chat in a moment."
+                                </p>
+                            }.into_any()),
+                            _ => None,
+                        }}
                         <div class="transcript" node_ref=transcript_ref>
                             <For
                                 each=history

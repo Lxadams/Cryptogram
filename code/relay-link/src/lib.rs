@@ -8,13 +8,20 @@
 //! # Packets
 //!
 //! The handshake is two plain packets (`handshake_init`, `handshake_resp`).
-//! It gives the link a session ID, chosen by the relay, and a key. Every
-//! packet after it is a *link packet* (`seal`):
+//! It gives the link a session ID, chosen by the relay, and a key for each
+//! direction (`LinkKeys`). It doesn't say who the client is: a client only
+//! proves anything in its sync. Every packet after the handshake is a *link
+//! packet*, which each end seals and opens with its `LinkEnd`:
 //!
-//!   [1-byte type | 4-byte session ID | 24-byte nonce | XChaCha20-Poly1305(plaintext)]
+//!   [1-byte type | 4-byte session ID | 8-byte packet number | ChaCha20-Poly1305(plaintext)]
 //!
-//! The type and session ID are in the clear so the relay can find the key,
-//! and they're authenticated along with the plaintext. The plaintexts are:
+//! The header is in the clear, so the relay can find the link's keys, and
+//! it's authenticated along with the plaintext. The packet number is the
+//! nonce: each end numbers what it sends, and takes each number in at most
+//! once (see `ReplayWindow`), so a copy of a packet replayed by someone on
+//! the network path is refused. And as each direction has its own key, a
+//! packet can't be bounced back to the end that sent it. The plaintexts
+//! are:
 //!
 //! | Type | Direction | Plaintext |
 //! |---|---|---|
@@ -23,11 +30,21 @@
 //! | `TYPE_DATA` | relay -> client | delivery ID, inner payload |
 //! | `TYPE_ACK` | client -> relay | own token, delivery IDs |
 //! | `TYPE_SYNC` | client -> relay | see `Sync` |
+//! | `TYPE_SYNC_ACK` | relay -> client | the sync's packet number |
 //! | `TYPE_PATH_CHALLENGE` | relay -> client | a challenge |
 //! | `TYPE_PATH_RESPONSE` | client -> relay | the same challenge |
 //!
 //! The inner payload is the clients' own business (end-to-end encrypted
 //! wherever it says anything private); the relay only routes it.
+//!
+//! # Packet numbers
+//!
+//! A client numbers what it sends in two lanes (`Lane`): message bursts,
+//! which are sealed all at once and then paced out over the next few
+//! seconds, and everything else, which goes out as soon as it's sealed.
+//! Each lane leaves in the order it was numbered, so the relay only needs a
+//! short window per lane for packets reordered on the way. The relay sends
+//! in one lane.
 //!
 //! # What a client proves
 //!
@@ -39,8 +56,8 @@
 //!   the link it arrives on.
 //! - **It's at the address it syncs from.** A sync from an address the link
 //!   hasn't used yet only takes effect once a `TYPE_PATH_CHALLENGE` sent
-//!   there comes back over the link, so a sync copied off the wire and
-//!   replayed from somewhere else can't move anyone's messages.
+//!   there comes back over the link from that address. Packet numbers keep
+//!   both the sync and the answer from being replayed from anywhere else.
 //! - **Who its contacts are.** A sync registers one admission tag per
 //!   contact, which only that contact can compute, and contacts put it on
 //!   what they send (`TYPE_ADMITTED_DATA`). Packets without one, including
@@ -48,12 +65,11 @@
 //!   queue of their own, so they can't crowd out messages from contacts.
 
 use chacha20poly1305::{
-    Key, KeyInit, XChaCha20Poly1305, XNonce,
+    ChaCha20Poly1305, Key, KeyInit, Nonce,
     aead::{Aead, Payload},
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
-use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use x25519_dalek::PublicKey as X25519PublicKey;
@@ -73,6 +89,9 @@ pub type DeliveryId = [u8; 16];
 pub type AdmissionTag = [u8; 8];
 /// What a `TYPE_PATH_CHALLENGE` carries, and its response echoes.
 pub type Challenge = [u8; 16];
+/// A link packet's number: its lane in the top bit (see `Lane`), then its
+/// place in that lane. Also its nonce.
+pub type PacketNumber = u64;
 
 pub const TYPE_HANDSHAKE_INIT: u8 = 0;
 pub const TYPE_DATA: u8 = 1;
@@ -87,6 +106,10 @@ pub const TYPE_ADMITTED_DATA: u8 = 5;
 pub const TYPE_PATH_CHALLENGE: u8 = 6;
 /// The client's answer to a `TYPE_PATH_CHALLENGE`, from that address.
 pub const TYPE_PATH_RESPONSE: u8 = 7;
+/// The relay telling a client it has taken in one of its syncs, so the
+/// client knows its link is still there. A client whose syncs stop being
+/// acked does the handshake again.
+pub const TYPE_SYNC_ACK: u8 = 8;
 
 /// Most admission tags one `Sync` registers. Keeps a sync to one small
 /// datagram; contacts beyond this share the queue for everyone else.
@@ -99,20 +122,25 @@ pub const MAX_ADMISSION_TAGS: usize = 64;
 /// The relay's dummy packets are this size too, so the two look alike.
 pub const CHAT_INNER_PAYLOAD_LEN: usize = 1 + 16 + 24 + 12 + 1024 + 16;
 
-const NONCE_LEN: usize = 24;
-/// What a link packet adds around its plaintext: type, session ID, nonce
-/// and AEAD tag.
-pub const LINK_OVERHEAD: usize = 1 + 4 + NONCE_LEN + 16;
+/// A link packet's header: type, session ID and packet number.
+const HEADER_LEN: usize = 1 + 4 + 8;
+/// What a link packet adds around its plaintext: its header and AEAD tag.
+pub const LINK_OVERHEAD: usize = HEADER_LEN + 16;
 
-pub const HANDSHAKE_INIT_LEN: usize = 1 + 32 + 32 + 64;
+/// A handshake init is padded to more than the reply it gets, so the relay
+/// never sends an address more than it received from it: a handshake with
+/// someone else's source address can't make the relay an amplifier.
+pub const HANDSHAKE_INIT_LEN: usize = 1 + 32 + 96;
 pub const HANDSHAKE_RESP_LEN: usize = 1 + 4 + 32 + 64;
 const SYNC_BASE_LEN: usize = 16 + 32 + 64;
 
 const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
-const LINK_KEY_LABEL: &[u8] = b"wireguard-lite-link";
-const HANDSHAKE_LABEL: &[u8] = b"e2e-messenger/handshake/v1";
+const TO_RELAY_KEY_LABEL: &[u8] = b"e2e-messenger/link/v2/to-relay";
+const TO_CLIENT_KEY_LABEL: &[u8] = b"e2e-messenger/link/v2/to-client";
+const HANDSHAKE_LABEL: &[u8] = b"e2e-messenger/handshake/v2";
 const ROUTING_TOKEN_LABEL: &[u8] = b"e2e-messenger/routing-token/v1";
-const SYNC_SIGNATURE_LABEL: &[u8] = b"e2e-messenger/sync/v1";
+const SYNC_BINDING_LABEL: &[u8] = b"e2e-messenger/sync-binding/v2";
+const SYNC_SIGNATURE_LABEL: &[u8] = b"e2e-messenger/sync/v2";
 
 /// Why a packet was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +151,13 @@ pub enum LinkError {
     BadSignature,
     /// A sync for a routing token that isn't its key's.
     TokenNotOwned,
+    /// A link packet for another link.
+    WrongLink,
+    /// A link packet that wasn't sealed with the link's key as it reads.
+    Forged,
+    /// A link packet whose number was taken in already, or is too old to
+    /// tell (see `ReplayWindow`).
+    Replayed,
 }
 
 impl fmt::Display for LinkError {
@@ -131,100 +166,305 @@ impl fmt::Display for LinkError {
             LinkError::Malformed => "malformed packet",
             LinkError::BadSignature => "invalid signature",
             LinkError::TokenNotOwned => "sync for a routing token its key doesn't own",
+            LinkError::WrongLink => "packet for another link",
+            LinkError::Forged => "packet that doesn't authenticate",
+            LinkError::Replayed => "replayed packet",
         })
     }
 }
 
 impl std::error::Error for LinkError {}
 
-fn cipher(link_key: &[u8; 32]) -> XChaCha20Poly1305 {
-    XChaCha20Poly1305::new(Key::from_slice(link_key))
+/// A link's keys, one per direction, both from the handshake's X25519
+/// shared secret (see `derive_link_keys`).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkKeys {
+    /// Seals what the client sends the relay.
+    pub to_relay: [u8; 32],
+    /// Seals what the relay sends the client.
+    pub to_client: [u8; 32],
 }
 
-/// Seal `plaintext` as a link packet of `packet_type` on link `session_id`.
+impl fmt::Debug for LinkKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LinkKeys { .. }")
+    }
+}
+
+/// The link's keys, which both ends derive from the handshake's X25519
+/// shared secret.
+pub fn derive_link_keys(shared_secret: &[u8; 32]) -> LinkKeys {
+    let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret);
+    let mut keys = LinkKeys::default();
+    for (label, key) in [
+        (TO_RELAY_KEY_LABEL, &mut keys.to_relay),
+        (TO_CLIENT_KEY_LABEL, &mut keys.to_client),
+    ] {
+        hkdf.expand(label, key)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+    }
+    keys
+}
+
+/// The two runs of packet numbers a client sends in (see the crate docs).
+/// Each is numbered, and has its numbers taken in, on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    /// Packets that go out as soon as they're sealed: syncs, acks,
+    /// KeyExchanges and the like. The relay sends everything in this one.
+    Direct,
+    /// Message bursts: sealed all at once, then paced out over the next few
+    /// seconds, behind any bursts already going out.
+    Paced,
+}
+
+/// The top bit of a packet number: which lane it's in.
+const LANE_BIT: PacketNumber = 1 << 63;
+
+impl Lane {
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn of(packet_number: PacketNumber) -> Self {
+        if packet_number & LANE_BIT == 0 {
+            Lane::Direct
+        } else {
+            Lane::Paced
+        }
+    }
+}
+
+fn nonce(packet_number: PacketNumber) -> Nonce {
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&packet_number.to_be_bytes());
+    nonce.into()
+}
+
+/// Seal `plaintext` as packet `packet_number` of `packet_type` on link
+/// `session_id`, with the key for the direction it's going. A key must
+/// never seal two packets with one number, as the number is the nonce:
+/// `LinkEnd` sees to that.
 pub fn seal(
-    link_key: &[u8; 32],
+    key: &[u8; 32],
     packet_type: u8,
     session_id: &SessionId,
+    packet_number: PacketNumber,
     plaintext: &[u8],
 ) -> Vec<u8> {
     let mut packet = Vec::with_capacity(LINK_OVERHEAD + plaintext.len());
     packet.push(packet_type);
     packet.extend_from_slice(session_id);
-    let mut nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
-    let ciphertext = cipher(link_key)
+    packet.extend_from_slice(&packet_number.to_be_bytes());
+    let ciphertext = ChaCha20Poly1305::new(Key::from_slice(key))
         .encrypt(
-            XNonce::from_slice(&nonce),
+            &nonce(packet_number),
             Payload {
                 msg: plaintext,
-                aad: &packet[..5],
+                aad: &packet[..HEADER_LEN],
             },
         )
-        .expect("XChaCha20-Poly1305 encryption is infallible for in-memory buffers");
-    packet.extend_from_slice(&nonce);
+        .expect("ChaCha20-Poly1305 encryption is infallible for in-memory buffers");
     packet.extend_from_slice(&ciphertext);
     packet
 }
 
-/// A link packet's type and session ID, or `None` if it's too short to be
-/// one.
-pub fn header(packet: &[u8]) -> Option<(u8, SessionId)> {
+/// A link packet's header, which is in the clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Header {
+    pub packet_type: u8,
+    pub session_id: SessionId,
+    pub packet_number: PacketNumber,
+}
+
+/// A link packet's header, or `None` if it's too short to be one.
+pub fn header(packet: &[u8]) -> Option<Header> {
     if packet.len() < LINK_OVERHEAD {
         return None;
     }
-    Some((packet[0], packet[1..5].try_into().unwrap()))
+    Some(Header {
+        packet_type: packet[0],
+        session_id: packet[1..5].try_into().unwrap(),
+        packet_number: PacketNumber::from_be_bytes(packet[5..HEADER_LEN].try_into().unwrap()),
+    })
 }
 
-/// Open a link packet: its plaintext, or `None` unless it was sealed with
-/// `link_key` exactly as it reads, type and session ID included.
-pub fn open(link_key: &[u8; 32], packet: &[u8]) -> Option<Vec<u8>> {
-    header(packet)?;
-    cipher(link_key)
+/// Open a link packet sealed with `key`: its plaintext, or `None` unless it
+/// was sealed exactly as it reads, header included. This doesn't know
+/// whether it's a replay; `LinkEnd::open` checks that too.
+pub fn open(key: &[u8; 32], packet: &[u8]) -> Option<Vec<u8>> {
+    let header = header(packet)?;
+    ChaCha20Poly1305::new(Key::from_slice(key))
         .decrypt(
-            XNonce::from_slice(&packet[5..5 + NONCE_LEN]),
+            &nonce(header.packet_number),
             Payload {
-                msg: &packet[5 + NONCE_LEN..],
-                aad: &packet[..5],
+                msg: &packet[HEADER_LEN..],
+                aad: &packet[..HEADER_LEN],
             },
         )
         .ok()
 }
 
-/// The link key both ends derive from the handshake's X25519 shared secret.
-pub fn derive_link_key(shared_secret: &[u8; 32]) -> [u8; 32] {
-    let mut key = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret)
-        .expand(LINK_KEY_LABEL, &mut key)
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
-    key
+/// How many packet numbers behind the newest a lane still takes in, to
+/// allow for packets reordered on the way. Anything older is refused, as
+/// it can't be told from a replay.
+pub const REPLAY_WINDOW: u64 = 1024;
+const WINDOW_WORDS: usize = (REPLAY_WINDOW / 64) as usize;
+
+/// The packet numbers one lane has taken in: the newest, and which of the
+/// `REPLAY_WINDOW` before it (RFC 6479's sliding window).
+#[derive(Clone, Debug, Default)]
+pub struct ReplayWindow {
+    /// One past the newest number taken in, so 0 before the first.
+    next: u64,
+    /// Bit `n % REPLAY_WINDOW`: whether `n` was taken in, for each `n` in
+    /// the window.
+    seen: [u64; WINDOW_WORDS],
 }
 
-/// The client's first packet: a fresh X25519 key for the link key, and
-/// its Ed25519 identity key's signature over it.
-pub fn handshake_init(identity: &SigningKey, ephemeral: &X25519PublicKey) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(HANDSHAKE_INIT_LEN);
-    packet.push(TYPE_HANDSHAKE_INIT);
-    packet.extend_from_slice(ephemeral.as_bytes());
-    packet.extend_from_slice(identity.verifying_key().as_bytes());
-    packet.extend_from_slice(&identity.sign(ephemeral.as_bytes()).to_bytes());
+impl ReplayWindow {
+    fn bit(n: u64) -> (usize, u64) {
+        (((n / 64) % WINDOW_WORDS as u64) as usize, 1 << (n % 64))
+    }
+
+    /// Take in number `n`: `true`, recording it, unless it was taken in
+    /// before or is more than `REPLAY_WINDOW` behind the newest. Only call
+    /// this for a packet that has authenticated, or a forged one could move
+    /// the window.
+    pub fn accept(&mut self, n: u64) -> bool {
+        if n >= self.next {
+            if n - self.next >= REPLAY_WINDOW {
+                self.seen = [0; WINDOW_WORDS];
+            } else {
+                // The numbers skipped take over bits last used a window ago.
+                for skipped in self.next..n {
+                    let (word, mask) = Self::bit(skipped);
+                    self.seen[word] &= !mask;
+                }
+            }
+            self.next = n + 1;
+        } else if self.next - n > REPLAY_WINDOW {
+            return false;
+        } else {
+            let (word, mask) = Self::bit(n);
+            if self.seen[word] & mask != 0 {
+                return false;
+            }
+        }
+        let (word, mask) = Self::bit(n);
+        self.seen[word] |= mask;
+        true
+    }
+}
+
+/// One end of a link: the keys, how it numbers what it sends, and which
+/// numbers it has taken in from the other end.
+#[derive(Clone, Debug)]
+pub struct LinkEnd {
+    session_id: SessionId,
+    keys: LinkKeys,
+    side: Side,
+    /// The next packet number each lane sends with.
+    next: [PacketNumber; 2],
+    received: [ReplayWindow; 2],
+}
+
+/// Which end of a link a `LinkEnd` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Client,
+    Relay,
+}
+
+impl LinkEnd {
+    pub fn new(side: Side, keys: LinkKeys, session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            keys,
+            side,
+            next: [0, LANE_BIT],
+            received: Default::default(),
+        }
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn keys(&self) -> &LinkKeys {
+        &self.keys
+    }
+
+    fn sealing_key(&self) -> &[u8; 32] {
+        match self.side {
+            Side::Client => &self.keys.to_relay,
+            Side::Relay => &self.keys.to_client,
+        }
+    }
+
+    fn opening_key(&self) -> &[u8; 32] {
+        match self.side {
+            Side::Client => &self.keys.to_client,
+            Side::Relay => &self.keys.to_relay,
+        }
+    }
+
+    /// The number the next packet sealed in `lane` gets.
+    pub fn next_packet_number(&self, lane: Lane) -> PacketNumber {
+        self.next[lane.index()]
+    }
+
+    /// Seal `plaintext` as the next `packet_type` packet in `lane`.
+    pub fn seal(&mut self, lane: Lane, packet_type: u8, plaintext: &[u8]) -> Vec<u8> {
+        let packet_number = self.next[lane.index()];
+        self.next[lane.index()] += 1;
+        seal(
+            self.sealing_key(),
+            packet_type,
+            &self.session_id,
+            packet_number,
+            plaintext,
+        )
+    }
+
+    /// Open a packet from the other end: its header and plaintext, if it's
+    /// for this link, authenticates, and has a packet number not taken in
+    /// before, which now has been.
+    pub fn open(&mut self, packet: &[u8]) -> Result<(Header, Vec<u8>), LinkError> {
+        let header = header(packet).ok_or(LinkError::Malformed)?;
+        if header.session_id != self.session_id {
+            return Err(LinkError::WrongLink);
+        }
+        let plaintext = open(self.opening_key(), packet).ok_or(LinkError::Forged)?;
+        let lane = Lane::of(header.packet_number);
+        if !self.received[lane.index()].accept(header.packet_number & !LANE_BIT) {
+            return Err(LinkError::Replayed);
+        }
+        Ok((header, plaintext))
+    }
+}
+
+/// The client's first packet: the fresh X25519 key the link's keys come
+/// from, padded (see `HANDSHAKE_INIT_LEN`).
+pub fn handshake_init(ephemeral: &X25519PublicKey) -> Vec<u8> {
+    let mut packet = vec![0u8; HANDSHAKE_INIT_LEN];
+    packet[0] = TYPE_HANDSHAKE_INIT;
+    packet[1..33].copy_from_slice(ephemeral.as_bytes());
     packet
 }
 
 /// The client's ephemeral key from its handshake init, if the packet is
-/// well formed and its signature checks out.
+/// well formed.
 pub fn parse_handshake_init(packet: &[u8]) -> Result<X25519PublicKey, LinkError> {
-    if packet.len() != HANDSHAKE_INIT_LEN || packet[0] != TYPE_HANDSHAKE_INIT {
+    if packet.len() != HANDSHAKE_INIT_LEN
+        || packet[0] != TYPE_HANDSHAKE_INIT
+        || packet[33..].iter().any(|&byte| byte != 0)
+    {
         return Err(LinkError::Malformed);
     }
-    let ephemeral: [u8; 32] = packet[1..33].try_into().unwrap();
-    let identity = VerifyingKey::from_bytes(packet[33..65].try_into().unwrap())
-        .map_err(|_| LinkError::Malformed)?;
-    let signature = Signature::from_bytes(packet[65..].try_into().unwrap());
-    identity
-        .verify_strict(&ephemeral, &signature)
-        .map_err(|_| LinkError::BadSignature)?;
-    Ok(X25519PublicKey::from(ephemeral))
+    Ok(X25519PublicKey::from(
+        <[u8; 32]>::try_from(&packet[1..33]).unwrap(),
+    ))
 }
 
 /// What the relay signs in its handshake reply. Covers the client's
@@ -299,13 +539,13 @@ pub fn routing_token_for(token_public: &VerifyingKey) -> RoutingToken {
     digest[..16].try_into().unwrap()
 }
 
-/// What a sync's signature covers: a value derived from the link key, which
-/// only the link's two ends know, so a signed sync proves nothing on any
-/// other link.
-pub fn sync_signing_input(link_key: &[u8; 32]) -> Vec<u8> {
+/// What a sync's signature covers: a value derived from the link's keys,
+/// which only the link's two ends know, so a signed sync proves nothing on
+/// any other link.
+pub fn sync_signing_input(link: &LinkKeys) -> Vec<u8> {
     let mut binding = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(HKDF_SALT), link_key)
-        .expand(b"sync-binding", &mut binding)
+    Hkdf::<Sha256>::new(Some(HKDF_SALT), &link.to_relay)
+        .expand(SYNC_BINDING_LABEL, &mut binding)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     [SYNC_SIGNATURE_LABEL, &binding].concat()
 }
@@ -326,11 +566,11 @@ pub struct Sync {
 }
 
 impl Sync {
-    /// A sync for the token `token_secret` owns, on the link with key
-    /// `link_key`. Only the first `MAX_ADMISSION_TAGS` tags are kept.
+    /// A sync for the token `token_secret` owns, on the link with keys
+    /// `link`. Only the first `MAX_ADMISSION_TAGS` tags are kept.
     pub fn new(
         token_secret: &SigningKey,
-        link_key: &[u8; 32],
+        link: &LinkKeys,
         mut admission: Vec<AdmissionTag>,
     ) -> Self {
         admission.truncate(MAX_ADMISSION_TAGS);
@@ -338,7 +578,7 @@ impl Sync {
         Self {
             token: routing_token_for(&token_public),
             token_public,
-            signature: token_secret.sign(&sync_signing_input(link_key)),
+            signature: token_secret.sign(&sync_signing_input(link)),
             admission,
         }
     }
@@ -369,24 +609,33 @@ impl Sync {
         })
     }
 
-    /// Whether this proves the token's owner is on the link with key
-    /// `link_key`: the token is the key's, and the signature covers this
-    /// link.
-    pub fn verify(&self, link_key: &[u8; 32]) -> Result<(), LinkError> {
+    /// Whether this proves the token's owner is on the link with keys
+    /// `link`: the token is the key's, and the signature covers this link.
+    pub fn verify(&self, link: &LinkKeys) -> Result<(), LinkError> {
         if routing_token_for(&self.token_public) != self.token {
             return Err(LinkError::TokenNotOwned);
         }
         self.token_public
-            .verify_strict(&sync_signing_input(link_key), &self.signature)
+            .verify_strict(&sync_signing_input(link), &self.signature)
             .map_err(|_| LinkError::BadSignature)
     }
 }
 
-/// A client's packet for `recipient`: `TYPE_ADMITTED_DATA` carrying
-/// `admission` if there is one, otherwise `TYPE_DATA`.
+/// A `TYPE_SYNC_ACK` plaintext: the number of the sync it acks.
+pub fn sync_ack_plaintext(sync_packet_number: PacketNumber) -> [u8; 8] {
+    sync_packet_number.to_be_bytes()
+}
+
+pub fn parse_sync_ack(plaintext: &[u8]) -> Option<PacketNumber> {
+    Some(PacketNumber::from_be_bytes(plaintext.try_into().ok()?))
+}
+
+/// A client's packet for `recipient`, sealed on `link` in `lane`:
+/// `TYPE_ADMITTED_DATA` carrying `admission` if there is one, otherwise
+/// `TYPE_DATA`.
 pub fn data_packet(
-    link_key: &[u8; 32],
-    session_id: &SessionId,
+    link: &mut LinkEnd,
+    lane: Lane,
     recipient: &RoutingToken,
     admission: Option<&AdmissionTag>,
     inner: &[u8],
@@ -401,7 +650,7 @@ pub fn data_packet(
         None => TYPE_DATA,
     };
     plaintext.extend_from_slice(inner);
-    seal(link_key, packet_type, session_id, &plaintext)
+    link.seal(lane, packet_type, &plaintext)
 }
 
 /// The plaintext of a client's `TYPE_DATA` or `TYPE_ADMITTED_DATA` packet:
@@ -421,18 +670,12 @@ pub fn parse_data(
     }
 }
 
-/// The relay forwarding `inner` to a recipient, with the delivery ID it
-/// acks it with.
-pub fn forwarded_packet(
-    link_key: &[u8; 32],
-    session_id: &SessionId,
-    delivery_id: &DeliveryId,
-    inner: &[u8],
-) -> Vec<u8> {
-    seal(
-        link_key,
+/// The relay forwarding `inner` to the client on `link`, with the delivery
+/// ID it acks it with.
+pub fn forwarded_packet(link: &mut LinkEnd, delivery_id: &DeliveryId, inner: &[u8]) -> Vec<u8> {
+    link.seal(
+        Lane::Direct,
         TYPE_DATA,
-        session_id,
         &[delivery_id.as_slice(), inner].concat(),
     )
 }
@@ -464,6 +707,7 @@ pub fn parse_challenge(plaintext: &[u8]) -> Option<Challenge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand_core::{OsRng, RngCore};
     use x25519_dalek::EphemeralSecret;
 
     fn signing_key() -> SigningKey {
@@ -476,18 +720,37 @@ mod tests {
         X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng))
     }
 
+    fn keys() -> LinkKeys {
+        derive_link_keys(&[3u8; 32])
+    }
+
+    /// A client's end and the relay's end of one link.
+    fn ends() -> (LinkEnd, LinkEnd) {
+        (
+            LinkEnd::new(Side::Client, keys(), [1, 2, 3, 4]),
+            LinkEnd::new(Side::Relay, keys(), [1, 2, 3, 4]),
+        )
+    }
+
     #[test]
     fn link_packets_open_only_as_sealed() {
         let key = [7u8; 32];
-        let packet = seal(&key, TYPE_SYNC, &[1, 2, 3, 4], b"hello");
+        let packet = seal(&key, TYPE_SYNC, &[1, 2, 3, 4], 9, b"hello");
         assert_eq!(packet.len(), LINK_OVERHEAD + 5);
-        assert_eq!(header(&packet), Some((TYPE_SYNC, [1, 2, 3, 4])));
+        assert_eq!(
+            header(&packet),
+            Some(Header {
+                packet_type: TYPE_SYNC,
+                session_id: [1, 2, 3, 4],
+                packet_number: 9
+            })
+        );
         assert_eq!(open(&key, &packet).unwrap(), b"hello");
         assert!(open(&[8u8; 32], &packet).is_none(), "another link's key");
 
-        // The type and session ID are authenticated too: a packet can't be
-        // relabelled as another type, or moved to another link.
-        for byte in 0..5 {
+        // The whole header is authenticated: a packet can't be relabelled
+        // as another type, moved to another link, or renumbered.
+        for byte in 0..HEADER_LEN {
             let mut tampered = packet.clone();
             tampered[byte] ^= 1;
             assert!(open(&key, &tampered).is_none(), "byte {byte}");
@@ -496,22 +759,100 @@ mod tests {
     }
 
     #[test]
-    fn handshake_gives_both_ends_the_session_id_and_key() {
-        let (client, relay) = (signing_key(), signing_key());
+    fn each_direction_has_its_own_key() {
+        let keys = keys();
+        assert_ne!(keys.to_relay, keys.to_client);
+        let (mut client, mut relay) = ends();
+        let to_client = relay.seal(Lane::Direct, TYPE_DATA, b"for the client");
+        assert_eq!(client.open(&to_client).unwrap().1, b"for the client");
+        // The same packet bounced back to the relay doesn't open there.
+        assert_eq!(relay.open(&to_client), Err(LinkError::Forged));
+
+        let to_relay = client.seal(Lane::Direct, TYPE_DATA, b"for the relay");
+        assert_eq!(relay.open(&to_relay).unwrap().1, b"for the relay");
+        assert_eq!(client.open(&to_relay), Err(LinkError::Forged));
+    }
+
+    #[test]
+    fn a_packet_is_taken_in_once() {
+        let (mut client, mut relay) = ends();
+        let first = client.seal(Lane::Direct, TYPE_ACK, b"a");
+        let second = client.seal(Lane::Direct, TYPE_ACK, b"b");
+        assert_eq!(relay.open(&second).unwrap().1, b"b");
+        assert_eq!(relay.open(&first).unwrap().1, b"a", "reordered is fine");
+        assert_eq!(relay.open(&first), Err(LinkError::Replayed));
+        assert_eq!(relay.open(&second), Err(LinkError::Replayed));
+
+        let mut other_link = LinkEnd::new(Side::Relay, keys(), [9, 9, 9, 9]);
+        let third = client.seal(Lane::Direct, TYPE_ACK, b"c");
+        assert_eq!(other_link.open(&third), Err(LinkError::WrongLink));
+    }
+
+    /// A burst sealed before some direct packets but sent after them is
+    /// still taken in: the lanes are numbered and windowed apart.
+    #[test]
+    fn lanes_are_numbered_apart() {
+        let (mut client, mut relay) = ends();
+        let burst: Vec<_> = (0..300)
+            .map(|_| client.seal(Lane::Paced, TYPE_DATA, b"burst"))
+            .collect();
+        for _ in 0..2 * REPLAY_WINDOW {
+            let direct = client.seal(Lane::Direct, TYPE_ACK, b"ack");
+            assert!(relay.open(&direct).is_ok());
+        }
+        for packet in &burst {
+            assert!(relay.open(packet).is_ok());
+        }
+        assert_eq!(header(&burst[0]).unwrap().packet_number, LANE_BIT);
+        assert_eq!(client.next_packet_number(Lane::Direct), 2 * REPLAY_WINDOW);
+    }
+
+    #[test]
+    fn replay_window_takes_in_each_number_once_within_its_reach() {
+        let mut window = ReplayWindow::default();
+        assert!(window.accept(0));
+        assert!(!window.accept(0));
+        assert!(window.accept(5));
+        assert!(window.accept(3), "behind the newest, within the window");
+        assert!(!window.accept(3));
+        assert!(window.accept(4));
+
+        assert!(window.accept(5 + REPLAY_WINDOW));
+        assert!(window.accept(6), "exactly a window behind");
+        assert!(!window.accept(5), "more than a window behind");
+        assert!(window.accept(7), "not taken in before");
+        assert!(!window.accept(6));
+
+        // A jump of more than a window forgets everything before it.
+        let far = 10 * REPLAY_WINDOW;
+        assert!(window.accept(far));
+        assert!(window.accept(far - 1));
+        assert!(!window.accept(far - REPLAY_WINDOW - 1));
+        // Bits reused after the window moves on start clear.
+        for n in far + 1..far + 3 * REPLAY_WINDOW {
+            assert!(window.accept(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn handshake_gives_both_ends_the_session_id_and_keys() {
+        let relay = signing_key();
         let client_secret = EphemeralSecret::random_from_rng(OsRng);
         let client_ephemeral = X25519PublicKey::from(&client_secret);
-        let init = handshake_init(&client, &client_ephemeral);
+        let init = handshake_init(&client_ephemeral);
+        assert_eq!(init.len(), HANDSHAKE_INIT_LEN);
         assert_eq!(parse_handshake_init(&init), Ok(client_ephemeral));
 
         let relay_secret = EphemeralSecret::random_from_rng(OsRng);
         let relay_ephemeral = X25519PublicKey::from(&relay_secret);
         let resp = handshake_resp(&relay, &client_ephemeral, &relay_ephemeral, &[9, 9, 9, 9]);
+        assert!(resp.len() < init.len(), "never an amplifier");
         let (session_id, got_ephemeral) =
             parse_handshake_resp(&resp, &relay.verifying_key(), &client_ephemeral).unwrap();
         assert_eq!(session_id, [9, 9, 9, 9]);
         assert_eq!(
-            derive_link_key(client_secret.diffie_hellman(&got_ephemeral).as_bytes()),
-            derive_link_key(relay_secret.diffie_hellman(&client_ephemeral).as_bytes()),
+            derive_link_keys(client_secret.diffie_hellman(&got_ephemeral).as_bytes()),
+            derive_link_keys(relay_secret.diffie_hellman(&client_ephemeral).as_bytes()),
         );
     }
 
@@ -546,35 +887,43 @@ mod tests {
             Err(LinkError::Malformed)
         );
 
-        let mut forged_init = handshake_init(&signing_key(), &client_ephemeral);
-        forged_init[1] ^= 1;
+        let mut init = handshake_init(&client_ephemeral);
         assert_eq!(
-            parse_handshake_init(&forged_init),
-            Err(LinkError::BadSignature)
+            parse_handshake_init(&init[..init.len() - 1]),
+            Err(LinkError::Malformed)
+        );
+        init[HANDSHAKE_INIT_LEN - 1] = 1;
+        assert_eq!(
+            parse_handshake_init(&init),
+            Err(LinkError::Malformed),
+            "the padding is zeros"
         );
     }
 
     #[test]
     fn sync_proves_token_ownership_on_one_link_only() {
         let token_key = signing_key();
-        let link_key = [3u8; 32];
-        let sync = Sync::new(&token_key, &link_key, vec![[1; 8], [2; 8]]);
+        let link = keys();
+        let sync = Sync::new(&token_key, &link, vec![[1; 8], [2; 8]]);
         let parsed = Sync::from_bytes(&sync.to_bytes()).unwrap();
         assert_eq!(parsed.token, routing_token_for(&token_key.verifying_key()));
         assert_eq!(parsed.admission, [[1; 8], [2; 8]]);
-        assert_eq!(parsed.verify(&link_key), Ok(()));
-        assert_eq!(parsed.verify(&[4u8; 32]), Err(LinkError::BadSignature));
+        assert_eq!(parsed.verify(&link), Ok(()));
+        assert_eq!(
+            parsed.verify(&derive_link_keys(&[4u8; 32])),
+            Err(LinkError::BadSignature)
+        );
 
         // Someone else's token, with your own key.
-        let mut claim = Sync::new(&signing_key(), &link_key, Vec::new());
+        let mut claim = Sync::new(&signing_key(), &link, Vec::new());
         claim.token = parsed.token;
-        assert_eq!(claim.verify(&link_key), Err(LinkError::TokenNotOwned));
+        assert_eq!(claim.verify(&link), Err(LinkError::TokenNotOwned));
     }
 
     #[test]
     fn sync_admission_tags_are_bounded() {
         let token_key = signing_key();
-        let sync = Sync::new(&token_key, &[0; 32], vec![[5; 8]; MAX_ADMISSION_TAGS + 3]);
+        let sync = Sync::new(&token_key, &keys(), vec![[5; 8]; MAX_ADMISSION_TAGS + 3]);
         assert_eq!(sync.admission.len(), MAX_ADMISSION_TAGS);
 
         let mut too_many = sync.to_bytes();
@@ -588,14 +937,18 @@ mod tests {
 
     #[test]
     fn data_packets_carry_an_admission_tag_only_when_admitted() {
-        let key = [1u8; 32];
-        let session = [2; 4];
+        let (mut client, mut relay) = ends();
         for admission in [None, Some([7u8; 8])] {
-            let packet = data_packet(&key, &session, &[9; 16], admission.as_ref(), b"inner");
-            let (packet_type, _) = header(&packet).unwrap();
-            let plaintext = open(&key, &packet).unwrap();
+            let packet = data_packet(
+                &mut client,
+                Lane::Paced,
+                &[9; 16],
+                admission.as_ref(),
+                b"inner",
+            );
+            let (header, plaintext) = relay.open(&packet).unwrap();
             assert_eq!(
-                parse_data(packet_type, &plaintext),
+                parse_data(header.packet_type, &plaintext),
                 Some(([9; 16], admission, b"inner".as_slice()))
             );
         }
@@ -605,9 +958,10 @@ mod tests {
 
     #[test]
     fn forwarded_packets_and_acks_round_trip() {
-        let key = [1u8; 32];
-        let packet = forwarded_packet(&key, &[2; 4], &[3; 16], b"inner");
-        let plaintext = open(&key, &packet).unwrap();
+        let (mut client, mut relay) = ends();
+        let packet = forwarded_packet(&mut relay, &[3; 16], b"inner");
+        let (header, plaintext) = client.open(&packet).unwrap();
+        assert_eq!(header.packet_type, TYPE_DATA);
         assert_eq!(
             parse_forwarded(&plaintext),
             Some(([3; 16], b"inner".as_slice()))
@@ -619,5 +973,8 @@ mod tests {
             Some(([4; 16], [[5; 16], [6; 16]].as_slice()))
         );
         assert_eq!(parse_ack(&ack[..ack.len() - 1]), None);
+
+        assert_eq!(parse_sync_ack(&sync_ack_plaintext(42)), Some(42));
+        assert_eq!(parse_sync_ack(&[0; 7]), None);
     }
 }

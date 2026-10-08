@@ -13,10 +13,11 @@
 
 use anyhow::{Result, anyhow};
 
-/// Size of every padded chat plaintext. Keeps a chat packet to a contact at
-/// 1158 bytes on the wire (with its admission tag) — under the 1232-byte UDP
-/// payload that crosses any IPv6 path (and practically any IPv4 one) without
-/// IP fragmentation.
+/// Size of every padded chat plaintext. Keeps a chat packet to a contact (an
+/// FEC symbol carrying part of a message, see `transport`) at 1146 bytes on
+/// the wire, with its admission tag — under the 1232-byte UDP payload that
+/// crosses any IPv6 path (and practically any IPv4 one) without IP
+/// fragmentation.
 pub const PADDED_LEN: usize = 1024;
 const LEN_PREFIX: usize = 2;
 /// Longest payload that fits in one padded block.

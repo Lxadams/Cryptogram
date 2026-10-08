@@ -136,16 +136,22 @@ Android, set up the toolchain first; see [ANDROID.md](ANDROID.md).
 4. Now that both sides have added each other, the KeyExchange goes
    through: each contact list shows the other's name ("alice", "bob" —
    nobody typed them in) and flips that contact's status from
-   "pending" to "established" — at that point you can select the contact
-   and send messages in either window. The same pattern (both sides add
-   each other) applies for any additional peers.
+   "pending" through "connecting" (they've added you, and the session is
+   being set up) to "established" — at that point you can select the
+   contact and send messages in either window. The same pattern (both
+   sides add each other) applies for any additional peers.
 
-If a contact stays "pending" after you've both added each other (say a
-packet went missing), adding them again, from either side, picks the setup
-up where it stopped. Someone who tries to connect before you've added them
+The setup carries on by itself if a packet goes missing, or if one of you
+was offline when the other added you: until a contact is established, the
+app sends them its KeyExchange again now and then (after 30 seconds, then
+twice as long each time, up to 8 times). Adding them again, from either
+side, also picks the setup up where it stopped, and starts those resends
+over. If the relay restarts, the app notices its syncs going unanswered
+and reconnects by itself within about 15 seconds. Someone who tries to connect before you've added them
 pops up as "Someone wants to connect": scanning their code accepts, "Not
 now" hides them for a day, and "Mute connection requests" stops the pop-ups
-until you unmute them in the contact list. At most 8 new ones are listed
+until you unmute them in the contact list. Just closing the pop-up only
+hides that request until the app restarts. At most 8 new ones are listed
 every 10 minutes, however many identities they come from.
 
 ## What's real vs. what's still a prototype shortcut

@@ -1,24 +1,66 @@
 //! Helpers shared by the unit-test modules (`lib.rs`, `transport`).
 
-use crate::{Client, SymmetricSessionState};
+use crate::{Client, DeliveryId, SessionId, SymmetricSessionState};
+use relay_link::{LinkEnd, LinkKeys, PacketNumber, Side};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use fec::test_util::Rng;
 
 /// What the relay does to a client's packet before forwarding it: strip
 /// the sender's link layer, the routing token and any admission tag,
 /// leaving the inner payload (the recipient's own link layer is re-added
-/// and removed symmetrically, so tests skip it).
+/// and removed symmetrically, so tests skip it). `link_key` is the key the
+/// sender seals with (its link's `to_relay`).
 pub(crate) fn strip_link(packet: &[u8], link_key: &[u8; 32]) -> Vec<u8> {
-    let (packet_type, _) = relay_link::header(packet).unwrap();
+    let header = relay_link::header(packet).unwrap();
     let plaintext = relay_link::open(link_key, packet).unwrap();
-    let (_, _, inner) = relay_link::parse_data(packet_type, &plaintext).unwrap();
+    let (_, _, inner) = relay_link::parse_data(header.packet_type, &plaintext).unwrap();
     inner.to_vec()
 }
 
 /// `strip_link` for a packet `sender` just produced.
 pub(crate) fn relay(packet: &[u8], sender: &Client) -> Vec<u8> {
-    strip_link(packet, &sender.link_master_key)
+    strip_link(packet, &sender.link.keys().to_relay)
+}
+
+/// Give `client` a link with session ID `session`, whose keys are both
+/// `key`, as if it had handshaken.
+pub(crate) fn link_with(client: &mut Client, key: u8, session: SessionId) {
+    let keys = LinkKeys {
+        to_relay: [key; 32],
+        to_client: [key; 32],
+    };
+    client.link = LinkEnd::new(Side::Client, keys, session);
+}
+
+/// A packet number the relay hasn't used on any link yet: they only go
+/// up, across every test, so none is ever taken for a replay.
+pub(crate) fn next_relay_packet_number() -> PacketNumber {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Seal `plaintext` as a `packet_type` packet the relay sends `to` on its
+/// link.
+pub(crate) fn from_relay(to: &Client, packet_type: u8, plaintext: &[u8]) -> Vec<u8> {
+    relay_link::seal(
+        &to.link.keys().to_client,
+        packet_type,
+        &to.link.session_id(),
+        next_relay_packet_number(),
+        plaintext,
+    )
+}
+
+/// Wrap an inner E2E payload the way the relay forwards it to `to`, behind
+/// `delivery_id`. Each call is a new packet, as each resend is.
+pub(crate) fn relay_forward(to: &Client, delivery_id: DeliveryId, inner: &[u8]) -> Vec<u8> {
+    from_relay(
+        to,
+        relay_link::TYPE_DATA,
+        &[delivery_id.as_slice(), inner].concat(),
+    )
 }
 
 /// A fresh client whose persistence points at a scratch path.
@@ -58,19 +100,23 @@ pub(crate) fn exchange(sender: &mut Client, receiver: &mut Client, mut packet: V
 /// its KeyExchange), then `responder` adds `initiator`, and their replies go
 /// back and forth on a clean link until neither has anything left to send.
 pub(crate) fn connect(initiator: &mut Client, responder: &mut Client) {
-    let early = initiator.add_contact(
-        responder.identity.routing_token,
-        responder.identity.ed25519_public,
-    );
+    let early = initiator
+        .add_contact(
+            responder.identity.routing_token,
+            responder.identity.ed25519_public,
+        )
+        .unwrap();
     assert_eq!(
         exchange(initiator, responder, early),
         [0x02],
         "not added back yet, so dropped"
     );
-    let kx = responder.add_contact(
-        initiator.identity.routing_token,
-        initiator.identity.ed25519_public,
-    );
+    let kx = responder
+        .add_contact(
+            initiator.identity.routing_token,
+            initiator.identity.ed25519_public,
+        )
+        .unwrap();
     exchange(responder, initiator, kx);
     assert_eq!(
         session(initiator, responder).root_key,

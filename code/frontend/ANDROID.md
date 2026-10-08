@@ -202,9 +202,10 @@ cargo tauri android build --debug --apk --target aarch64
 3. Press **Connect**. The relay's public key is already built in (step 6).
 4. Add contacts with **Scan QR code** (Android asks for camera permission
    the first time) or by pasting a routing token and Ed25519 key. You each
-   add the other; a contact stays "pending" until both have. If it stays
-   pending after that, adding them again, from either side, restarts the
-   setup where it stopped.
+   add the other; a contact stays "pending" until both have, then shows
+   "connecting" while the session is set up. The app sends its
+   KeyExchange again by itself if a packet goes missing, and adding them
+   again, from either side, restarts the setup where it stopped.
 
 ## Receiving in the background
 

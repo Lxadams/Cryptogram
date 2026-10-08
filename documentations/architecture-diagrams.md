@@ -19,9 +19,11 @@ sequenceDiagram
     Note over A, B: Identity Trusted. 
 
     Note over B, S: Phase 2: Server Link Handshake
-    B->>S: Link Handshake (Eph X25519 Pub + Ed25519 Sig)
-    S->>S: Verify Client Signature & DH
-    S->>B: Session ID + Server Ed25519 Sig (Mutual Auth)
+    B->>S: Link Handshake (Eph X25519 Pub, padded)
+    S->>S: DH, a link key per direction, pick a Session ID
+    S->>B: Session ID + Eph X25519 Pub + Server Ed25519 Sig
+    B->>S: Sync (proves Bob owns his Routing Token)
+    S->>B: Sync Ack
 
     Note over A, B: Phase 3: Deferred Key Exchange & Session Boot
     B->>B: Sign KeyExchangePayload

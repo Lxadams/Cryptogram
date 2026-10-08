@@ -537,6 +537,11 @@ button.danger {
   color: #ffc107;
 }
 
+.status-connecting {
+  background: rgba(91, 140, 255, 0.15);
+  color: var(--accent);
+}
+
 .chat-panel {
   min-height: 0;
   min-width: 0;

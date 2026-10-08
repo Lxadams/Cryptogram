@@ -2895,7 +2895,6 @@ dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
  "hkdf",
- "rand_core 0.6.4",
  "sha2 0.10.9",
  "x25519-dalek",
 ]

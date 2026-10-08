@@ -49,6 +49,39 @@ Closes issue: #40
 - **New `code/relay-link` crate.** Packet types and layouts, the handshake, link sealing and the sync proof are now shared by client and relay, instead of copied into each. CI and the Dockerfiles include it. A test also pins the client's chat packet size to the relay's dummy-packet size.
 - **Bounded test helper.** The helper that generated identities until one had a lower token, which could take any number of tries, now swaps identities instead.
 
+### Fixes from the second review
+
+**Relay**
+- **An old link can't take its token back.**
+  - **The hole:** a sync on a new link only retired the old link while the token's metadata (1,000 s) still pointed at it. A phone offline longer than that, then relaunched, left its old link alive for days. A captured sync from the old link, replayed from its address, then moved the token back and deleted the live link, cutting the phone off until it restarted.
+  - **The fix:** the relay keeps the link each token was last synced on, so a sync on a new link retires the old one however long ago it was last used.
+- **Link packets are numbered, and each number is taken in once.**
+  - **The format:** the 24-byte random nonce is replaced by an 8-byte packet number, which is also the nonce (now ChaCha20-Poly1305). Each end keeps a 1,024-packet window per lane for reordering. Packets are 16 bytes smaller.
+  - **Lanes:** a client numbers message bursts apart from everything else. Bursts are sealed at once but paced out over seconds, so acks and syncs sent meanwhile would otherwise push them out of the window. A burst is queued before the client's lock is released, so bursts leave in the order they were numbered.
+  - **What it closes:** a copy of any packet, replayed from anywhere, is refused. That covers the path-validation hole (bounce the relay's challenge to the real client, then replay its answer from your own address to move its link there), the follow-up about replayed data packets filling a queue, and replayed syncs.
+- **Each direction has its own key.** A packet the relay forwarded used to authenticate if bounced back to it, and was queued for a "recipient" that was really its delivery ID. It's refused now.
+- **The relay's tables are bounded.**
+  - **One token per link:** a link carries one token for good. Before, one link could sync any number of made-up tokens, each leaving admission tags behind for 7 days.
+  - **Link lifetimes:** a link nobody syncs on goes after a minute. A synced one goes after an hour idle, down from 7 days, now that clients reconnect by themselves.
+  - **Caps:** at most 100,000 links (handshakes past that are refused) and 100,000 recipients' admission tags (past that, a new recipient's packets share one queue, as before tags).
+  - **Tagless queues:** recipients without tags (not synced since the relay started, or tokens nobody owns) share 64 MiB of queue between them, so made-up tokens can't take the relay's memory. The sweep logs a warning while any of these is full.
+- **The handshake no longer identifies the client.** The init carried the client's Ed25519 identity key and a signature, which proved nothing (the relay accepted any key) and let the relay tie a token to an identity. It's now the ephemeral key padded with zeros, so the init stays bigger than the reply, and a handshake with someone else's address can't make the relay an amplifier.
+- **Refused packets are logged at debug level,** not as errors. Anyone can send junk to UDP 443.
+
+**Clients**
+- **They reconnect by themselves.**
+  - **How:** the relay acks every sync (new `TYPE_SYNC_ACK`). A client whose sync goes unacked for 10 s does the handshake again on the same socket, checks the reply against the pinned relay key, syncs on the new link, and resends any KeyExchanges still pending.
+  - **The result:** a relay restart (every deploy), or a link that expired while the phone slept, no longer cuts everyone off until they restart the app.
+  - **The CLI** now runs the same keepalive. It had none, so its NAT mapping lapsed.
+- **Contact setup can't stall.**
+  - **Late KeyExchanges:** a contact's KeyExchange is taken in however long it waited at the relay, since add IDs already tell an old one from a current one. Only the name in it is ignored when it's over 5 minutes old, as they may have renamed themselves. Before, if the second person added the first while the first was offline, their KeyExchange was dropped as stale, and both sides showed "Waiting for them to scan your code" forever.
+  - **Late requests:** a stranger's connection request is listed however long it waited.
+  - **Resends:** until a contact is connected, the client sends its KeyExchange again: after 30 s, then twice as long each time, up to 8 times. The count starts again when the contact replies, and resends go out straight away after reconnecting. Each step of the setup was a single UDP packet to the relay, which nothing resent.
+  - **"Connecting":** a contact who has added you back now shows "connecting" while the session is set up, instead of "Waiting for them to scan your code".
+- **Adding your own code is refused.** It started a KeyExchange loop with yourself through the relay that never ended. Packets claiming to come from you are dropped too.
+- **Nothing is promised to a contact that couldn't be saved.** An establisher doesn't offer a session it couldn't save, and a responder neither takes one in nor confirms it (it rolls back). Before, a failed save after confirming could leave the two sides on different sessions after a restart.
+- **Closing the connection-request pop-up** (the X, a click outside it, or Escape) only hides that request until the app restarts. "Not now" still hides that person for a day, as before. A stray tap used to count as "Not now".
+
 ### Changes in this PR:
 
 **Stage 2: closing the open holes**
@@ -113,13 +146,14 @@ Two phones connected fine, but adding a contact looked broken: one side showed "
 ### ⚠️ Wire format and deployment
 Everything here is breaking. **Deploy the relay and update every client together.**
 - **Wire format changes** (all defined in `code/relay-link`, apart from the E2E payloads):
-  - **Handshake:** the init no longer carries a session ID (129 bytes). The reply carries the one the relay picked, and its signature covers it.
-  - **Link packets:** the type and session ID are authenticated as AEAD associated data.
+  - **Handshake:** the init is the client's ephemeral X25519 key and 96 zero bytes (129 bytes): no session ID, identity key or signature. The reply carries the session ID the relay picked, and its signature covers it.
+  - **Keys:** the link has one key per direction, from HKDF labels `e2e-messenger/link/v2/to-relay` and `.../to-client`.
+  - **Link packets:** `[type | session ID | 8-byte packet number | ChaCha20-Poly1305]`. The packet number is the nonce and replaces the 24-byte random one. The whole header is authenticated as AEAD associated data.
   - **Syncs:** the new `TYPE_SYNC` (4) replaces the empty `TYPE_DATA` sync. It carries `token | token_pub | signature | admission tags`. An older client's syncs are rejected, so the relay never sends it anything.
-  - **New packet types:** `TYPE_ADMITTED_DATA` (5), `TYPE_PATH_CHALLENGE` (6) and `TYPE_PATH_RESPONSE` (7).
+  - **New packet types:** `TYPE_ADMITTED_DATA` (5), `TYPE_PATH_CHALLENGE` (6), `TYPE_PATH_RESPONSE` (7) and `TYPE_SYNC_ACK` (8).
   - **KeyExchange:** now 1393 bytes, up from 1384. It gains a flags byte ("have your keys", "have a session"), the sender's add ID, and the add ID its session was made for.
   - **SessionEstablish:** now 1232 bytes, up from 1224, carrying the two add IDs it was made for.
-  - **Packet sizes:** chat packets to a contact are 1158 bytes, with their admission tag, and KeyExchanges to a contact are 1463, still inside a PPPoE link's 1464.
+  - **Packet sizes:** chat packets to a contact (FEC symbols) are 1,146 bytes, with their admission tag, and KeyExchanges to a contact are 1,447 (1,439 before the tag is known), inside a PPPoE link's 1,464. Both are pinned by tests.
   - **Presence:** `PresencePayload` (`0x06`) no longer exists.
   - **Contact QR codes:** now `CG2:`. Old and new builds can't read each other's codes.
 - **Everyone has to re-add their contacts.** An identity saved before this change has a random routing token it can't prove to the relay. So on first load it gets a new token derived from a fresh token key, and its old contacts are removed, since they could only reach the old token. The log says so. Their chat history is left with no way to view it.
@@ -136,14 +170,18 @@ Everything here is breaking. **Deploy the relay and update every client together
 
   | Crate | Tests |
   |---|---|
-  | relay-link (new) | 7 |
-  | Relay | 31 |
-  | Client | 132 |
+  | relay-link (new) | 11 |
+  | Relay | 40 |
+  | Client | 141 |
   | Tauri backend | 14 |
   | Frontend | 10 |
 
+  - **From the second review** (each fails without its fix):
+    - relay: an old link can't reclaim its token after the token's metadata expired; a link syncs one token; replayed syncs and data packets are refused from any address; a replayed path response can't move a link; a forwarded packet bounced back is refused; handshakes are refused while the link table is full; the admission table is capped; tagless queues share a budget; links nobody syncs on expire in a minute
+    - relay-link: each direction has its own key; a packet is taken in once; lanes are windowed apart; the replay window's edges; the handshake init's padding
+    - client: adding your own code is refused; a late KeyExchange from a contact still carries the setup on, without its name; the setup completes when the second KeyExchange arrives late, or when the whole first round is lost; late connection requests are listed; resends back off, stop, and restart on progress; contact status goes pending, connecting, connected; unsaved sessions are neither offered nor taken in; unacked syncs lead to a new handshake that only the pinned relay can answer, then a sync and resends on the new link; unanswered handshakes are retried
   - **relay-link:**
-    - a sealed packet opens only as sealed, with its type and session ID tamper-proof
+    - a sealed packet opens only as sealed, with its type, session ID and packet number tamper-proof
     - the handshake gives both ends one key, and its reply fits only its own handshake, relay and session ID
     - a sync proves ownership on one link only
     - admission tags are bounded
@@ -181,7 +219,8 @@ Everything here is breaking. **Deploy the relay and update every client together
     - the code's size pinned at 29×29
     - `rqrr` reading back what's drawn
 - **End to end, against the real relay over real UDP:**
-  - **`lossy_link`, Alice's link at 70% loss:** 10/10 messages each way, with both ratchets in step.
+  - **`lossy_link` at 70% loss, re-run after the second review's fixes:** 10/10 messages each way with Alice's link jammed, and again with Bob's, with both ratchets in step.
+  - **Relay restart, with two CLI clients (a temporary harness, not committed):** they connect and message, adding your own code is refused, then the relay is restarted. Both notice their syncs going unacked, redo the handshake by themselves, and messages flow both ways again.
   - **A temporary harness (not committed):**
     - an attacker's handshake gets its own session
     - Bob's sync replayed from the attacker's address only gets a challenge
@@ -190,9 +229,8 @@ Everything here is breaking. **Deploy the relay and update every client together
   - **`--print-pubkey` with no identity:** fails with directions and creates nothing.
 - **`install-apk.sh`, with fake `adb` binaries simulating WSL:** the emulator goes through WSL's adb, and a USB phone through Windows'.
 - **Not re-run since the review fixes:**
-  - the CLI end-to-end checks
   - the Android builds and emulator runs
-  - the two-phone test
+  - the two-phone test (worth including adding someone while they're offline, and a relay restart)
 - **Not tested yet:**
   - the full two-phone handshake with the new pop-up
   - the camera changes (resolution, autofocus, the Samsung's `BarcodeDetector`, the decode cap) on a real phone
@@ -203,13 +241,12 @@ Everything here is breaking. **Deploy the relay and update every client together
 ### Follow-ups
 - **The pop-up needs the app open.** No Android notification is posted for connection requests.
 - **The requester's token isn't proven to the receiver.** The pop-up only prompts a scan, and the scan is the trust step.
-- **The token key doesn't hide who you are from the relay yet.** The relay still sees each client's identity Ed25519 key in the link handshake, so it can link a token to an identity. This matters if we move to per-contact tokens.
-- **Data packets can still be replayed by someone on the network path.** A sync can't be any more, but a captured data packet replayed to the relay is forwarded again.
-  - **For the recipient:** it's a duplicate, which it ignores.
-  - **For its queue:** it still counts, so someone who can watch a link could fill a contact's queue that way.
-  - **The fix:** a packet number checked against a window at the relay would close it.
 - **Contacts are trusted with your queue.** A contact's tag only proves they're a contact, so a malicious contact can still fill your contacts' queue. Contacts beyond the 64 a sync registers share the small queue for strangers.
-- **The relay's link table has no size limit.** Handshakes are cheap, so a flood of them grows it until unused links expire, after 7 days.
+- **Handshakes still cost the relay CPU.** Each is a DH and a signature for an unauthenticated packet. The caps keep memory bounded, but a flood can still use CPU, and while the link table is full, new clients can't connect. A stateless cookie, as QUIC's Retry does, or a per-address rate limit would close it.
+- **Messages sent while a link is down are lost.** That's from the relay going away until the client notices, about 25 s at most. Nothing resends a message end to end.
+- **Junk can fill the tagless budget.** Once the shared 64 MiB is full, packets for recipients who haven't synced since the relay restarted are refused until it expires, which can take up to 7 days.
+- **Packet numbers are in the clear,** so someone watching a link can count its packets (WireGuard's counters are too). QUIC's header protection hides them.
+- **The QUIC branch** replaces this link layer, so the link-layer fixes here are moot there. The client-side ones (the setup, resends, your own code, saving) need porting.
 - **Production setup.** ANDROID.md still has a TODO for the production relay address, and now its key too. Release signing is also still to do.
 - **Emulator scanning.** The emulator's camera is the laptop webcam, usually fixed-focus. Scanning a phone's code with it is hard; the phone scanning the emulator's screen works better.
 

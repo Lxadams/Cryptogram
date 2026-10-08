@@ -1,6 +1,6 @@
 use crate::{
     AddIds, Client, RecvPqInjects, SessionOffer, SessionSetup, SymmetricSessionState, UserIdentity,
-    first_add_id, routing_token_for,
+    first_add_id, routing_token_for, unlinked,
 };
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -19,7 +19,8 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 pub struct ClientStateDto {
     pub identity: UserIdentityDto,
     pub server_addr: String,
-    pub session_id: String,
+    // Older state files also carry the link's `session_id`, which is
+    // ignored: every run gets its own link from its handshake.
     pub e2e_sessions: HashMap<String, SymmetricSessionStateDto>,
     pub pending_contacts: HashMap<String, String>,
     pub peer_kyber_keys: HashMap<String, String>,
@@ -211,7 +212,6 @@ impl ClientStateDto {
         Self {
             identity,
             server_addr: client.server_addr.to_string(),
-            session_id: hex::encode(client.session_id),
             e2e_sessions,
             pending_contacts,
             peer_kyber_keys,
@@ -282,9 +282,6 @@ impl ClientStateDto {
         };
 
         let server_addr: SocketAddr = self.server_addr.parse()?;
-
-        let mut session_id = [0u8; 4];
-        hex::decode_to_slice(&self.session_id, &mut session_id)?;
 
         let mut e2e_sessions = HashMap::new();
         for (hex_tok, dto_state) in self.e2e_sessions {
@@ -426,8 +423,11 @@ impl ClientStateDto {
         Ok(Client {
             identity,
             server_addr,
-            link_master_key: [0u8; 32], // re-negotiated on boot
-            session_id,                 // can reuse the stored session id, or generate new
+            link: unlinked(), // every run handshakes for a link of its own
+            relay_public: None,
+            pending_handshake: None,
+            unacked_sync: None,
+            setup_retries: HashMap::new(), // live state, not persisted
             e2e_sessions,
             pending_contacts,
             peer_kyber_keys,

@@ -8,7 +8,8 @@ use pqcrypto_kyber::kyber768::*;
 use pqcrypto_traits::kem::SharedSecret as _;
 use rand_core::{OsRng, RngCore};
 use relay_link::{
-    AdmissionTag, TYPE_ACK, TYPE_DATA, TYPE_PATH_CHALLENGE, TYPE_PATH_RESPONSE, TYPE_SYNC,
+    AdmissionTag, Lane, LinkEnd, LinkKeys, PacketNumber, Side, TYPE_ACK, TYPE_DATA,
+    TYPE_HANDSHAKE_RESP, TYPE_PATH_CHALLENGE, TYPE_PATH_RESPONSE, TYPE_SYNC, TYPE_SYNC_ACK,
 };
 use sha2::Sha256;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -72,8 +73,25 @@ const MAX_TIMESTAMP_DRIFT: u64 = 300;
 // messages more than 100 steps ahead are rejected anyway, so this is ample.
 const MAX_PENDING_PQ_INJECTS: usize = 32;
 
-// How long `perform_handshake` waits for the relay's reply
+// How long `perform_handshake` (and a handshake `keepalive` starts) waits
+// for the relay's reply
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// A sync the relay hasn't acked in this long means our link is gone: the
+// relay restarted, or dropped the link after we were quiet too long (see
+// `Client::keepalive`). Generous next to a round trip, and shorter than
+// the 15s between keepalives, so it's noticed at the next one.
+const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+// While setting up a session with a contact, our KeyExchange is sent again
+// (see `Client::setup_resends`) after this long, then twice as long each
+// time, up to `MAX_SETUP_RETRY_DELAY`, at most `MAX_SETUP_RETRIES` times.
+// Each step of the setup is a single UDP packet to the relay, which nothing
+// resends, so this is what gets a setup past a lost one. Any progress, or a
+// new link, starts the count again.
+const FIRST_SETUP_RETRY: Duration = Duration::from_secs(30);
+const MAX_SETUP_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
+const MAX_SETUP_RETRIES: u32 = 8;
 
 // Connection requests from people who aren't contacts (see
 // `Client::connection_requests`): how long one is listed, and how many new
@@ -136,6 +154,16 @@ fn admission_tag(
 /// The first four bytes of a token, in hex: how the console names someone.
 fn short(token: &RoutingToken) -> String {
     hex::encode(&token[0..4])
+}
+
+/// Whether a payload's `timestamp` is within `MAX_TIMESTAMP_DRIFT` of our
+/// clock.
+fn within_drift(timestamp: u64) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    now.abs_diff(timestamp) <= MAX_TIMESTAMP_DRIFT
 }
 
 // Argon2id parameters for every login secret derived below (OWASP's
@@ -547,13 +575,61 @@ pub(crate) struct SessionOffer {
     pub(crate) kyber_ct: Ciphertext,
 }
 
+/// How far along we are with a contact (see `Client::contact_status`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContactStatus {
+    /// We've added them, but haven't heard from them: they haven't added
+    /// us back yet, as far as we know.
+    Pending,
+    /// They've added us too, and the session between us is being set up.
+    Connecting,
+    /// We share a session both sides have, so we can message them.
+    Connected,
+}
+
+/// When to send a contact we haven't got a session with our KeyExchange
+/// again (see `Client::setup_resends`).
+#[derive(Clone, Copy)]
+struct SetupRetry {
+    at: Instant,
+    /// The wait after that one.
+    delay: Duration,
+    left: u32,
+}
+
+impl SetupRetry {
+    /// A fresh count, starting `first` from now.
+    fn starting(now: Instant, first: Duration) -> Self {
+        Self {
+            at: now + first,
+            delay: FIRST_SETUP_RETRY,
+            left: MAX_SETUP_RETRIES,
+        }
+    }
+}
+
 pub struct Client {
     pub identity: UserIdentity,
     pub server_addr: SocketAddr,
-    pub link_master_key: [u8; 32],
-    /// Our link's ID at the relay, which the relay picks in its handshake
-    /// reply (see `complete_handshake`).
-    pub session_id: SessionId,
+    /// Our link to the relay (see `relay_link::LinkEnd`): its session ID,
+    /// which the relay picks in its handshake reply, its keys, and the
+    /// packet numbers sent and taken in on it. Replaced by every handshake
+    /// (see `complete_handshake`).
+    pub link: LinkEnd,
+    /// The relay's identity key, which its handshake replies must be signed
+    /// by: the one we connected with first (see `perform_handshake`), so a
+    /// handshake we redo ourselves (see `keepalive`) checks against it too.
+    relay_public: Option<VerifyingKey>,
+    /// A handshake we started because our link looked gone (see
+    /// `keepalive`): our ephemeral secret for it, and when we sent it.
+    /// `handle_relay_packet` finishes it when the reply comes.
+    pending_handshake: Option<(EphemeralSecret, Instant)>,
+    /// The oldest of our syncs on this link that the relay hasn't acked yet:
+    /// its packet number, and when we sent it. Live state.
+    unacked_sync: Option<(PacketNumber, Instant)>,
+    /// When to send each contact we've added, but have no session with yet,
+    /// our KeyExchange again (see `setup_resends`). Live state.
+    setup_retries: HashMap<RoutingToken, SetupRetry>,
     pub e2e_sessions: HashMap<RoutingToken, SymmetricSessionState>,
     pub pending_contacts: HashMap<RoutingToken, VerifyingKey>,
     pub peer_kyber_keys: HashMap<RoutingToken, PublicKey>,
@@ -654,14 +730,24 @@ pub(crate) fn first_add_id() -> u32 {
     1 + (OsRng.next_u32() >> 1)
 }
 
+/// A client's link before its first handshake: all zeros, so nothing it
+/// seals reaches anyone.
+pub(crate) fn unlinked() -> LinkEnd {
+    LinkEnd::new(Side::Client, LinkKeys::default(), [0; 4])
+}
+
 impl Client {
     pub fn new(server_addr: SocketAddr) -> Self {
         Self {
             identity: UserIdentity::generate(),
             server_addr,
-            link_master_key: [0u8; 32],
-            // The relay gives the link its ID in the handshake.
-            session_id: [0u8; 4],
+            // A placeholder until the handshake, which gives the link its
+            // ID and keys.
+            link: unlinked(),
+            relay_public: None,
+            pending_handshake: None,
+            unacked_sync: None,
+            setup_retries: HashMap::new(),
             e2e_sessions: HashMap::new(),
             pending_contacts: HashMap::new(),
             peer_kyber_keys: HashMap::new(),
@@ -752,6 +838,7 @@ impl Client {
         self.admission_changed |= self.peer_x25519_keys.remove(&token).is_some();
         self.contact_names.remove(&token);
         self.reassembler.forget(&token);
+        self.setup_retries.remove(&token);
         self.save();
         if let Some(history) = &self.history
             && let Err(e) = history.delete_contact(token)
@@ -764,31 +851,33 @@ impl Client {
     /// attached (the SQLCipher-encrypted path), otherwise fall back to the
     /// legacy plaintext `client_state.json` at `state_path` — mirrors how
     /// `record_message` treats `history` as optional. Failures are logged,
-    /// not propagated, same as `record_message`.
-    pub fn save(&self) {
+    /// not propagated, same as `record_message`; the result says whether it
+    /// worked, for the few callers that mustn't tell a contact about state
+    /// they couldn't save (see `offer_new_session`).
+    pub fn save(&self) -> bool {
         let result = match &self.identity_store {
             Some(store) => store.save(self),
             None => ClientStateDto::save(self, &self.state_path),
         };
-        if let Err(e) = result {
+        if let Err(e) = &result {
             tracing::error!("Failed to save state: {}", e);
         }
+        result.is_ok()
     }
 
-    /// Our opening handshake packet: a fresh X25519 key, signed with our
-    /// Ed25519 identity (see `relay_link::handshake_init`).
+    /// Our opening handshake packet: a fresh X25519 key (see
+    /// `relay_link::handshake_init`). It says nothing about who we are; our
+    /// sync proves that.
     pub fn generate_handshake_packet(&self) -> (EphemeralSecret, Vec<u8>) {
         let secret = EphemeralSecret::random_from_rng(OsRng);
-        let packet = relay_link::handshake_init(
-            &self.identity.ed25519_secret,
-            &X25519PublicKey::from(&secret),
-        );
+        let packet = relay_link::handshake_init(&X25519PublicKey::from(&secret));
         (secret, packet)
     }
 
     /// Finish the link handshake with the relay's reply: check it's signed
     /// by the relay we pinned and answers our handshake, then take the
-    /// session ID the relay gave the link and derive the link key.
+    /// session ID the relay gave the link and derive its keys. The new link
+    /// replaces whatever we had.
     pub fn complete_handshake(
         &mut self,
         client_secret: EphemeralSecret,
@@ -799,63 +888,141 @@ impl Client {
         let (session_id, relay_ephemeral) =
             relay_link::parse_handshake_resp(response, server_ed25519_pub, &client_ephemeral)
                 .map_err(|e| anyhow!("Invalid handshake response: {e}"))?;
-        self.session_id = session_id;
-        self.link_master_key =
-            relay_link::derive_link_key(client_secret.diffie_hellman(&relay_ephemeral).as_bytes());
+        let shared_secret = client_secret.diffie_hellman(&relay_ephemeral);
+        if !shared_secret.was_contributory() {
+            return Err(anyhow!("Invalid handshake response: degenerate key"));
+        }
+        let keys = relay_link::derive_link_keys(shared_secret.as_bytes());
+        self.relay_public = Some(*server_ed25519_pub);
+        self.link = LinkEnd::new(Side::Client, keys, session_id);
+        self.pending_handshake = None;
+        self.unacked_sync = None;
+        // Anything sent on the old link may never have arrived, so contacts
+        // we're still setting up with get our KeyExchange again right away.
+        let now = Instant::now();
+        for retry in self.setup_retries.values_mut() {
+            *retry = SetupRetry::starting(now, Duration::ZERO);
+        }
         Ok(())
     }
 
     /// Tells the relay our routing token lives on this link and proves it's
     /// ours (see `relay_link::Sync`), and registers the admission tags of
     /// our contacts, so their packets get our queue for contacts. Sent when
-    /// we connect and then as the keepalive.
+    /// we connect and then as the keepalive. The relay acks it, which tells
+    /// us the link is still there (see `keepalive`).
     pub fn generate_sync_packet(&mut self) -> Vec<u8> {
         self.admission_changed = false;
         let sync = relay_link::Sync::new(
             &self.identity.token_secret,
-            &self.link_master_key,
+            self.link.keys(),
             self.admission_tags_in(),
         );
-        relay_link::seal(
-            &self.link_master_key,
-            TYPE_SYNC,
-            &self.session_id,
-            &sync.to_bytes(),
-        )
+        let number = self.link.next_packet_number(Lane::Direct);
+        self.unacked_sync
+            .get_or_insert_with(|| (number, Instant::now()));
+        self.link.seal(Lane::Direct, TYPE_SYNC, &sync.to_bytes())
     }
 
     /// Tells the relay we have the packets it forwarded with delivery IDs
     /// `ids`, so it stops resending them. Only the link session we last
     /// synced from can ack our routing token's packets.
-    pub fn generate_ack_packet(&self, ids: &[DeliveryId]) -> Vec<u8> {
-        relay_link::seal(
-            &self.link_master_key,
+    pub fn generate_ack_packet(&mut self, ids: &[DeliveryId]) -> Vec<u8> {
+        self.link.seal(
+            Lane::Direct,
             TYPE_ACK,
-            &self.session_id,
             &relay_link::ack_plaintext(&self.identity.routing_token, ids),
         )
     }
 
-    fn wrap_link_encryption(&self, target_token: RoutingToken, inner_payload: &[u8]) -> Vec<u8> {
-        let tag = self.admission_tag_for(&target_token);
-        self.wrap_data(target_token, tag.as_ref(), inner_payload)
+    /// What to send the relay on a keepalive tick (every 15s, and when the
+    /// app comes back on screen): normally a fresh sync, plus any
+    /// KeyExchanges due again (see `setup_resends`).
+    ///
+    /// But if the relay hasn't acked a sync of ours for `SYNC_ACK_TIMEOUT`,
+    /// our link is gone (the relay restarted, or dropped the link while we
+    /// were quiet), and nothing sent on it arrives. So this starts a new
+    /// handshake instead, on the same socket: the receive loop's
+    /// `handle_relay_packet` finishes it, and syncs on the new link. Until
+    /// then, ticks send nothing, and one with no reply after
+    /// `HANDSHAKE_TIMEOUT` tries again. A client that hasn't done
+    /// `perform_handshake` (so has no relay key to check a reply against)
+    /// just keeps syncing.
+    pub fn keepalive(&mut self) -> Vec<Vec<u8>> {
+        let now = Instant::now();
+        if self.relay_public.is_some() {
+            let link_gone = match &self.pending_handshake {
+                Some((_, sent)) => {
+                    if now.duration_since(*sent) < HANDSHAKE_TIMEOUT {
+                        return Vec::new(); // still waiting for the reply
+                    }
+                    true
+                }
+                None => self
+                    .unacked_sync
+                    .is_some_and(|(_, sent)| now.duration_since(sent) >= SYNC_ACK_TIMEOUT),
+            };
+            if link_gone {
+                if self.pending_handshake.is_none() {
+                    println!(">> The relay stopped answering; reconnecting...");
+                }
+                let (secret, packet) = self.generate_handshake_packet();
+                self.pending_handshake = Some((secret, now));
+                return vec![packet];
+            }
+        }
+        let mut out = vec![self.generate_sync_packet()];
+        out.extend(self.setup_resends(now));
+        out
     }
 
-    /// `inner_payload` for `target_token`, link-encrypted for the relay, with
-    /// the admission tag we put on what we send them, if we have one.
+    /// The relay's reply to a handshake `keepalive` started: if it's the
+    /// reply to that handshake, signed by our relay, switch to the new link
+    /// and sync on it (with any KeyExchanges due). Anything else is
+    /// ignored.
+    fn finish_handshake(&mut self, response: &[u8]) -> Vec<Vec<u8>> {
+        let (Some((secret, _)), Some(relay_public)) = (&self.pending_handshake, self.relay_public)
+        else {
+            return Vec::new();
+        };
+        // Checked before the secret is used up, so a bogus reply can't stop
+        // the real one from completing the handshake.
+        let ours = X25519PublicKey::from(secret);
+        if relay_link::parse_handshake_resp(response, &relay_public, &ours).is_err() {
+            return Vec::new();
+        }
+        let (secret, _) = self.pending_handshake.take().expect("checked above");
+        if self
+            .complete_handshake(secret, &relay_public, response)
+            .is_err()
+        {
+            return Vec::new();
+        }
+        println!(">> Reconnected to the relay.");
+        let mut out = vec![self.generate_sync_packet()];
+        out.extend(self.setup_resends(Instant::now()));
+        out
+    }
+
+    fn wrap_link_encryption(
+        &mut self,
+        target_token: RoutingToken,
+        inner_payload: &[u8],
+    ) -> Vec<u8> {
+        let tag = self.admission_tag_for(&target_token);
+        self.wrap_data(Lane::Direct, target_token, tag.as_ref(), inner_payload)
+    }
+
+    /// `inner_payload` for `target_token`, sealed on our link in `lane`,
+    /// with the admission tag we put on what we send them, if we have one.
     fn wrap_data(
-        &self,
+        &mut self,
+        lane: Lane,
         target_token: RoutingToken,
         tag: Option<&AdmissionTag>,
         inner_payload: &[u8],
     ) -> Vec<u8> {
-        relay_link::data_packet(
-            &self.link_master_key,
-            &self.session_id,
-            &target_token,
-            tag,
-            inner_payload,
-        )
+        relay_link::data_packet(&mut self.link, lane, &target_token, tag, inner_payload)
     }
 
     /// The admission tag we put on what we send `peer`, once we have their
@@ -898,8 +1065,20 @@ impl Client {
     /// Adding someone who's already a contact sends them our KeyExchange
     /// again, which restarts the session setup from wherever it got stuck
     /// (see `handle_key_exchange`). Someone new, or removed since, gets a
-    /// new add ID (see `AddIds`).
-    pub fn add_contact(&mut self, token: RoutingToken, ed25519_public: VerifyingKey) -> Vec<u8> {
+    /// new add ID (see `AddIds`). Until the session is up, the KeyExchange
+    /// is sent again now and then (see `setup_resends`).
+    ///
+    /// Our own code is refused: we'd only ever be talking to ourselves.
+    pub fn add_contact(
+        &mut self,
+        token: RoutingToken,
+        ed25519_public: VerifyingKey,
+    ) -> Result<Vec<u8>> {
+        if token == self.identity.routing_token {
+            return Err(anyhow!(
+                "That's your own code. Add your contact with theirs."
+            ));
+        }
         if self
             .pending_contacts
             .insert(token, ed25519_public)
@@ -910,8 +1089,12 @@ impl Client {
             self.add_ids.insert(token, AddIds { mine, theirs: 0 });
         }
         self.connection_requests.retain(|(t, _)| *t != token);
+        self.setup_retries.insert(
+            token,
+            SetupRetry::starting(Instant::now(), FIRST_SETUP_RETRY),
+        );
         self.save();
-        self.create_kx_request(token)
+        Ok(self.create_kx_request(token))
     }
 
     /// Whether we can message `token`: we share a session, and if we made
@@ -923,6 +1106,66 @@ impl Client {
                 .session_setups
                 .get(token)
                 .is_none_or(|setup| setup.offer.is_none())
+    }
+
+    /// How far along we are with the contact `token`: connected (see
+    /// `is_connected`), connecting (we've heard from them, so they've added
+    /// us too), or pending (we're waiting for them to add us).
+    pub fn contact_status(&self, token: &RoutingToken) -> ContactStatus {
+        if self.is_connected(token) {
+            ContactStatus::Connected
+        } else if self.peer_kyber_keys.contains_key(token) || self.e2e_sessions.contains_key(token)
+        {
+            ContactStatus::Connecting
+        } else {
+            ContactStatus::Pending
+        }
+    }
+
+    /// Our KeyExchanges to send again (see `keepalive`), to contacts we've
+    /// added but have no session with yet, each on its own schedule (see
+    /// `FIRST_SETUP_RETRY`). Every step of a session setup is one UDP
+    /// packet to the relay, and the relay only resends what it delivers,
+    /// not what fails to reach it, so without this one lost packet would
+    /// stall the setup for good. A KeyExchange carries where we've got to,
+    /// and the other side's reply carries the setup on from there (see
+    /// `handle_key_exchange`), so sending one again is always safe.
+    fn setup_resends(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        let waiting: Vec<RoutingToken> = self
+            .pending_contacts
+            .keys()
+            .filter(|token| !self.is_connected(token))
+            .copied()
+            .collect();
+        self.setup_retries
+            .retain(|token, _| waiting.contains(token));
+        let mut due = Vec::new();
+        for token in waiting {
+            // A contact we haven't scheduled yet, like one loaded from disk
+            // at startup, is due now.
+            let retry = self
+                .setup_retries
+                .entry(token)
+                .or_insert_with(|| SetupRetry::starting(now, Duration::ZERO));
+            if retry.left == 0 || now < retry.at {
+                continue;
+            }
+            retry.left -= 1;
+            retry.at = now + retry.delay;
+            retry.delay = (retry.delay * 2).min(MAX_SETUP_RETRY_DELAY);
+            due.push(token);
+        }
+        due.into_iter()
+            .map(|token| self.create_kx_request(token))
+            .collect()
+    }
+
+    /// `peer` has sent us something that moved our setup with them on:
+    /// start the count of KeyExchange resends again (see `setup_resends`).
+    fn note_setup_progress(&mut self, peer: &RoutingToken) {
+        if let Some(retry) = self.setup_retries.get_mut(peer) {
+            *retry = SetupRetry::starting(Instant::now(), FIRST_SETUP_RETRY);
+        }
     }
 
     /// People who tried to connect but aren't contacts, in the order they
@@ -1031,7 +1274,7 @@ impl Client {
     /// Our KeyExchange for `target_token`: our keys, whether we have
     /// theirs, our add ID for them, and which session we have with them, if
     /// any.
-    pub fn create_kx_request(&self, target_token: RoutingToken) -> Vec<u8> {
+    pub fn create_kx_request(&mut self, target_token: RoutingToken) -> Vec<u8> {
         let payload = KeyExchangePayload::generate(
             &self.identity,
             target_token,
@@ -1055,13 +1298,15 @@ impl Client {
 
     /// Make a new session with `peer`, which we establish, for our current
     /// add IDs (replacing any we had), and return the SessionEstablish that
-    /// offers it. We don't use it until they confirm they have it.
+    /// offers it. We don't use it until they confirm they have it. Nothing
+    /// is offered unless it's saved: they'd start using a session we could
+    /// lose on a restart.
     fn offer_new_session(
         &mut self,
         peer: RoutingToken,
         peer_x25519: &X25519PublicKey,
         peer_kyber: &PublicKey,
-    ) -> Vec<u8> {
+    ) -> Option<Vec<u8>> {
         // 1. Classical X25519 DH
         let eph_secret = EphemeralSecret::random_from_rng(OsRng);
         let eph_x25519_pub = X25519PublicKey::from(&eph_secret);
@@ -1092,27 +1337,32 @@ impl Client {
                 }),
             },
         );
-        self.save();
         println!(">> Offered {} a new E2E session.", short(&peer));
         self.session_est_packet(&peer)
-            .expect("the session was just offered")
     }
 
     /// The SessionEstablish offering the session we made with `peer`,
-    /// freshly signed, as long as they haven't confirmed they have it.
-    /// Offering the same session again (rather than a new one each time
-    /// they ask) is what keeps both sides on one session however often the
-    /// request and the offer cross, repeat or go missing.
-    fn session_est_packet(&self, peer: &RoutingToken) -> Option<Vec<u8>> {
+    /// freshly signed, as long as they haven't confirmed they have it, and
+    /// it's saved. Offering the same session again (rather than a new one
+    /// each time they ask) is what keeps both sides on one session however
+    /// often the request and the offer cross, repeat or go missing.
+    fn session_est_packet(&mut self, peer: &RoutingToken) -> Option<Vec<u8>> {
         let setup = self.session_setups.get(peer)?;
-        let offer = setup.offer?;
+        let (offer, establisher_add_id, responder_add_id) = (
+            setup.offer?,
+            setup.establisher_add_id,
+            setup.responder_add_id,
+        );
+        if !self.save() {
+            return None;
+        }
         let est = SessionEstablishPayload::generate(
             &self.identity,
             *peer,
             offer.kyber_ct,
             offer.eph_x25519_pub,
-            setup.establisher_add_id,
-            setup.responder_add_id,
+            establisher_add_id,
+            responder_add_id,
         );
         let mut inner = vec![0x04];
         inner.extend_from_slice(&est.to_bytes());
@@ -1169,8 +1419,10 @@ impl Client {
     /// Encrypt a message for a lossy link: its chunk packets and (when due)
     /// its PQ inject travel together as one burst of sealed FEC packets,
     /// sized to survive heavy loss — see `transport`. Hand the result to a
-    /// `BurstSender`. Messages over `MAX_MESSAGE_LEN` bytes are rejected
-    /// before the ratchet moves.
+    /// `BurstSender` before anything else is (see `BurstSender::queue`):
+    /// the burst is numbered in our link's paced lane, which must go out in
+    /// the order it was numbered. Messages over `MAX_MESSAGE_LEN` bytes are
+    /// rejected before the ratchet moves.
     pub fn create_fec_packets(
         &mut self,
         target_token: RoutingToken,
@@ -1193,7 +1445,7 @@ impl Client {
         let tag = self.admission_tag_for(&target_token);
         Ok(symbols
             .iter()
-            .map(|inner| self.wrap_data(target_token, tag.as_ref(), inner))
+            .map(|inner| self.wrap_data(Lane::Paced, target_token, tag.as_ref(), inner))
             .collect())
     }
 
@@ -1300,32 +1552,21 @@ impl Client {
         Ok((e2e_payloads, pq_payload))
     }
 
-    /// The checks every signed control payload (KeyExchange,
-    /// SessionEstablish) must pass before anything else: it's
-    /// addressed to us, and its timestamp is within `MAX_TIMESTAMP_DRIFT` of
-    /// our clock. Logs and returns `false` if not.
-    fn accepts_payload(&self, what: &str, target_token: &RoutingToken, timestamp: u64) -> bool {
-        self.is_addressed_to_us(what, target_token) && self.is_fresh(what, timestamp)
-    }
-
-    /// The second of `accepts_payload`'s checks, on its own.
+    /// Whether a signed control payload's timestamp is within
+    /// `MAX_TIMESTAMP_DRIFT` of our clock. Logs and returns `false` if not.
     fn is_fresh(&self, what: &str, timestamp: u64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        if now.abs_diff(timestamp) > MAX_TIMESTAMP_DRIFT {
+        if !within_drift(timestamp) {
             println!(">> [SECURITY ALERT] Dropped {what}! Timestamp is stale or from the future.");
             return false;
         }
         true
     }
 
-    /// The first of `accepts_payload`'s checks, on its own for PQInject: a
-    /// refresh can legitimately arrive long after it was sent (queued at the
-    /// relay while we were offline, or resent), and its `applies_at`
-    /// position already makes a replayed copy harmless, so it skips the
-    /// timestamp check.
+    /// The check every signed control payload must pass before anything
+    /// else: it's addressed to us. (Not all of them must be fresh too: a
+    /// KeyExchange or a PQ refresh can arrive long after it was sent, queued
+    /// at the relay while we were offline, and add IDs or its `applies_at`
+    /// position already make a replayed copy harmless.)
     fn is_addressed_to_us(&self, what: &str, target_token: &RoutingToken) -> bool {
         if target_token.ct_eq(&self.identity.routing_token).unwrap_u8() == 0 {
             println!(">> [SECURITY ALERT] Dropped {what}! It was bound to a different target.");
@@ -1335,45 +1576,24 @@ impl Client {
     }
 
     /// Strip the relay's link layer off a received UDP packet: checks it's a
-    /// data packet for our link session, decrypts it with the link key, and
-    /// drops the leading delivery ID. Returns the inner E2E payload (ready
-    /// for `handle_incoming_packet`), or `None` for anything else. Receive
-    /// loops should use `handle_relay_packet` instead, which also acks.
-    pub fn open_link_packet(&self, packet: &[u8]) -> Option<Vec<u8>> {
+    /// data packet for our link that we haven't taken in before, decrypts
+    /// it, and drops the leading delivery ID. Returns the inner E2E payload
+    /// (ready for `handle_incoming_packet`), or `None` for anything else.
+    /// Receive loops should use `handle_relay_packet` instead, which also
+    /// acks.
+    pub fn open_link_packet(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
         self.open_relay_packet(packet).map(|(_, payload)| payload)
     }
 
     /// `open_link_packet`, plus the delivery ID from the packet's 16-byte
     /// prefix.
-    pub fn open_relay_packet(&self, packet: &[u8]) -> Option<(DeliveryId, Vec<u8>)> {
-        if relay_link::header(packet)? != (TYPE_DATA, self.session_id) {
+    pub fn open_relay_packet(&mut self, packet: &[u8]) -> Option<(DeliveryId, Vec<u8>)> {
+        let (header, plaintext) = self.link.open(packet).ok()?;
+        if header.packet_type != TYPE_DATA {
             return None;
         }
-        let plaintext = relay_link::open(&self.link_master_key, packet)?;
         let (delivery_id, inner) = relay_link::parse_forwarded(&plaintext)?;
         Some((delivery_id, inner.to_vec()))
-    }
-
-    /// If `packet` is the relay asking whether we're really at the address
-    /// our last sync came from (see `relay_link::TYPE_PATH_CHALLENGE`; it
-    /// asks when that address is new to it, say after our NAT mapping
-    /// changed), our answer: the challenge back, then a fresh sync, which the
-    /// relay takes in once the answer has shown we're there.
-    fn answer_path_challenge(&mut self, packet: &[u8]) -> Option<Vec<Vec<u8>>> {
-        if relay_link::header(packet)? != (TYPE_PATH_CHALLENGE, self.session_id) {
-            return None;
-        }
-        let challenge =
-            relay_link::parse_challenge(&relay_link::open(&self.link_master_key, packet)?)?;
-        Some(vec![
-            relay_link::seal(
-                &self.link_master_key,
-                TYPE_PATH_RESPONSE,
-                &self.session_id,
-                &challenge,
-            ),
-            self.generate_sync_packet(),
-        ])
     }
 
     /// Everything a receive loop does with one UDP packet from the relay:
@@ -1382,20 +1602,52 @@ impl Client {
     /// to send back to the relay, in order: any protocol reply (e.g. a
     /// KeyExchange response), a fresh sync if a contact's admission tag has
     /// just turned up (so the relay knows it now, not at the next
-    /// keepalive), then the ack. A path challenge gets its answer (see
-    /// `answer_path_challenge`). Packets that aren't for us return nothing.
+    /// keepalive), then the ack. Packets that aren't for us return nothing.
+    ///
+    /// The relay's other packets are handled here too: the reply to a
+    /// handshake `keepalive` started (see `finish_handshake`), its acks of
+    /// our syncs, and its path challenges, which ask whether we're really at
+    /// the address our last sync came from (it asks when that address is
+    /// new to it, say after our NAT mapping changed). We answer those with
+    /// the challenge back, then a fresh sync, which the relay takes in once
+    /// the answer has shown we're there.
     ///
     /// The ack goes out after the packet is handled (and its effects
     /// saved), so a crash in between means a resend rather than a lost
     /// message. A packet that fails to handle is acked anyway: resending it
     /// wouldn't change the outcome.
     pub fn handle_relay_packet(&mut self, packet: &[u8]) -> Vec<Vec<u8>> {
-        if let Some(answer) = self.answer_path_challenge(packet) {
-            return answer;
+        if packet.first() == Some(&TYPE_HANDSHAKE_RESP) {
+            return self.finish_handshake(packet);
         }
-        let Some((delivery_id, payload)) = self.open_relay_packet(packet) else {
+        let Ok((header, plaintext)) = self.link.open(packet) else {
             return Vec::new();
         };
+        match header.packet_type {
+            TYPE_DATA => {}
+            TYPE_SYNC_ACK => {
+                // Acks a sync from no earlier than our oldest unacked one.
+                if let (Some(acked), Some((oldest, _))) =
+                    (relay_link::parse_sync_ack(&plaintext), self.unacked_sync)
+                    && acked >= oldest
+                {
+                    self.unacked_sync = None;
+                }
+                return Vec::new();
+            }
+            TYPE_PATH_CHALLENGE => {
+                let Some(challenge) = relay_link::parse_challenge(&plaintext) else {
+                    return Vec::new();
+                };
+                let answer = self.link.seal(Lane::Direct, TYPE_PATH_RESPONSE, &challenge);
+                return vec![answer, self.generate_sync_packet()];
+            }
+            _ => return Vec::new(),
+        }
+        let Some((delivery_id, inner)) = relay_link::parse_forwarded(&plaintext) else {
+            return Vec::new();
+        };
+        let payload = inner.to_vec();
         let needs_ack = delivery_id != [0u8; 16];
         let mut out = Vec::new();
         if (!needs_ack || self.recent_deliveries.first_time(delivery_id))
@@ -1418,6 +1670,13 @@ impl Client {
         }
         let pkt_type = payload[0];
         let pkt_data = &payload[1..];
+        // Every payload names its sender right after its type byte, and
+        // none comes from us: we never message ourselves, and can't add
+        // ourselves as a contact (see `add_contact`).
+        if pkt_type != 0x00 && pkt_data.get(..16) == Some(&self.identity.routing_token[..]) {
+            println!(">> Dropped a packet claiming to be from you.");
+            return Ok(None);
+        }
 
         match pkt_type {
             0x01 => {
@@ -1439,7 +1698,10 @@ impl Client {
                     println!(">> Received KeyExchange with invalid signature.");
                     return Ok(None);
                 }
-                if !self.accepts_payload("KeyExchange", &kx.target_token, kx.timestamp) {
+                // However old: one that waited at the relay while we were
+                // offline still asks to connect, and from a contact still
+                // carries the setup on (see `handle_key_exchange`).
+                if !self.is_addressed_to_us("KeyExchange", &kx.target_token) {
                     return Ok(None);
                 }
                 let peer_token = kx.routing_token;
@@ -1464,7 +1726,8 @@ impl Client {
                     );
                     return Ok(None);
                 }
-                Ok(self.handle_key_exchange(&kx))
+                let fresh = within_drift(kx.timestamp);
+                Ok(self.handle_key_exchange(&kx, fresh))
             }
             0x04 => {
                 // SessionEstablish
@@ -1630,7 +1893,12 @@ impl Client {
     /// setup up wherever it stopped. Add IDs (see `AddIds`) tell an old
     /// message from a current one, and a session the other side has lost
     /// from one it just hasn't received yet.
-    fn handle_key_exchange(&mut self, kx: &KeyExchangePayload) -> Option<Vec<u8>> {
+    ///
+    /// That makes a KeyExchange good however long it waited at the relay,
+    /// so one that isn't `fresh` (past `MAX_TIMESTAMP_DRIFT`) is taken in
+    /// too: dropping it would stall the setup, with both sides waiting.
+    /// Only its name isn't, as they may have changed it since.
+    fn handle_key_exchange(&mut self, kx: &KeyExchangePayload, fresh: bool) -> Option<Vec<u8>> {
         let peer = kx.routing_token;
         let theirs = self.add_ids(&peer).theirs;
         if kx.add_id < theirs {
@@ -1643,6 +1911,7 @@ impl Client {
         if kx.add_id > theirs {
             self.set_their_add_id(peer, kx.add_id);
         }
+        self.note_setup_progress(&peer);
 
         // Keep the peer's keys: Kyber for our PQ injections (into a session
         // that was made before we had it, too), X25519 for the admission
@@ -1656,11 +1925,14 @@ impl Client {
         }
         // Learn the peer's self-chosen name (if any) the moment their
         // KeyExchange arrives, so it shows up for pending AND established
-        // contacts.
-        if kx.name.is_empty() {
-            self.contact_names.remove(&peer);
-        } else {
-            self.contact_names.insert(peer, kx.name.clone());
+        // contacts. Not from one that waited at the relay, though: they
+        // may have renamed themselves since.
+        if fresh {
+            if kx.name.is_empty() {
+                self.contact_names.remove(&peer);
+            } else {
+                self.contact_names.insert(peer, kx.name.clone());
+            }
         }
         self.save();
 
@@ -1687,7 +1959,7 @@ impl Client {
             None if have_session => self.session_est_packet(&peer),
             None => {
                 println!(">> Verified keys against QR code!");
-                Some(self.offer_new_session(peer, &kx.x25519_public, &kx.kyber_public))
+                self.offer_new_session(peer, &kx.x25519_public, &kx.kyber_public)
             }
             // They have the session we offered them.
             Some(add_id) if add_id == mine && have_session => {
@@ -1708,8 +1980,11 @@ impl Client {
     /// confirmation may have gone missing. One held up so long (say at the
     /// relay while we were offline) that it fails the timestamp check is
     /// answered with a fresh request for it instead, if we're still waiting.
+    /// A session we can't save isn't taken in or confirmed: they'd start
+    /// using it, and we could lose it on a restart.
     fn handle_session_establish(&mut self, est: &SessionEstablishPayload) -> Option<Vec<u8>> {
         let peer = est.routing_token;
+        self.note_setup_progress(&peer);
         if !self.is_fresh("SessionEstablish", est.timestamp) {
             return (!self.e2e_sessions.contains_key(&peer)).then(|| self.create_kx_request(peer));
         }
@@ -1730,8 +2005,8 @@ impl Client {
             .get(&peer)
             .is_some_and(|ours| ours.root_key == session.root_key);
         if !have_it {
-            self.e2e_sessions.insert(peer, session);
-            self.session_setups.insert(
+            let previous_session = self.e2e_sessions.insert(peer, session);
+            let previous_setup = self.session_setups.insert(
                 peer,
                 SessionSetup {
                     establisher_add_id: est.establisher_add_id,
@@ -1739,7 +2014,17 @@ impl Client {
                     offer: None,
                 },
             );
-            self.save();
+            if !self.save() {
+                match previous_session {
+                    Some(session) => self.e2e_sessions.insert(peer, session),
+                    None => self.e2e_sessions.remove(&peer),
+                };
+                match previous_setup {
+                    Some(setup) => self.session_setups.insert(peer, setup),
+                    None => self.session_setups.remove(&peer),
+                };
+                return None;
+            }
             println!(">> E2E Session established with {}!", short(&peer));
         }
         Some(self.create_kx_request(peer))
@@ -1896,8 +2181,9 @@ pub async fn perform_handshake(
 mod tests {
     use super::*;
     use crate::test_support::{
-        cleanup, connect, connected_pair, establisher_and_responder, exchange, inbox_texts,
-        new_client, relay, session, strip_link,
+        cleanup, connect, connected_pair, establisher_and_responder, exchange, from_relay,
+        inbox_texts, link_with, new_client, next_relay_packet_number, relay, relay_forward,
+        session, strip_link,
     };
     use pqcrypto_traits::kem::PublicKey as _;
 
@@ -2018,7 +2304,7 @@ mod tests {
         let (msg_packet, _) = bob
             .create_encrypted_packets(alice.identity.routing_token, b"incoming")
             .unwrap();
-        let inner_msg = strip_link(&msg_packet[0], &bob.link_master_key);
+        let inner_msg = strip_link(&msg_packet[0], &bob.link.keys().to_relay);
         alice.handle_incoming_packet(&inner_msg).unwrap();
         let (_, _, live_incoming_id) = alice.drain_inbox().pop().unwrap();
         let fetched = alice.history_for_contact(bob.identity.routing_token, 10);
@@ -2325,7 +2611,7 @@ mod tests {
         let (packet, _pq) = alice
             .create_encrypted_packets(bob.identity.routing_token, b"Hello Bob!")
             .unwrap();
-        let inner = strip_link(&packet[0], &alice.link_master_key);
+        let inner = strip_link(&packet[0], &alice.link.keys().to_relay);
         bob.handle_incoming_packet(&inner).unwrap();
         let a_ck = alice
             .e2e_sessions
@@ -2482,12 +2768,12 @@ mod tests {
                 .unwrap();
 
             // Bob receives the message
-            let inner = strip_link(&msg_pkt[0], &alice.link_master_key);
+            let inner = strip_link(&msg_pkt[0], &alice.link.keys().to_relay);
             bob.handle_incoming_packet(&inner).unwrap();
 
             // If PQ inject was generated, Bob processes it too
             if let Some(pq) = pq_pkt {
-                let pq_inner = strip_link(&pq, &alice.link_master_key);
+                let pq_inner = strip_link(&pq, &alice.link.keys().to_relay);
                 bob.handle_incoming_packet(&pq_inner).unwrap();
             }
         }
@@ -2612,9 +2898,13 @@ mod tests {
     /// keys, and the responder asks for a session. Returns the offer, not
     /// yet delivered.
     fn up_to_the_offer(e: &mut Client, r: &mut Client) -> Vec<u8> {
-        let early = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+        let early = e
+            .add_contact(r.identity.routing_token, r.identity.ed25519_public)
+            .unwrap();
         assert_eq!(exchange(e, r, early), [0x02], "dropped");
-        let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+        let kx = r
+            .add_contact(e.identity.routing_token, e.identity.ed25519_public)
+            .unwrap();
         let keys = hand(r, e, &kx).unwrap();
         let request = hand(e, r, &keys).unwrap();
         let offer = hand(r, e, &request).unwrap();
@@ -2661,11 +2951,15 @@ mod tests {
     #[test]
     fn test_handshake_when_establisher_adds_first() {
         let (mut e, mut r) = establisher_and_responder();
-        let early = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+        let early = e
+            .add_contact(r.identity.routing_token, r.identity.ed25519_public)
+            .unwrap();
         assert_eq!(exchange(&mut e, &mut r, early), [0x02], "dropped");
         assert!(r.peer_kyber_keys.is_empty() && r.contact_names.is_empty());
 
-        let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+        let kx = r
+            .add_contact(e.identity.routing_token, e.identity.ed25519_public)
+            .unwrap();
         assert_eq!(exchange(&mut r, &mut e, kx), [0x02, 0x02, 0x02, 0x04, 0x02]);
         assert_one_session_with_pq_keys(&e, &r);
         cleanup(&[&e, &r]);
@@ -2674,10 +2968,14 @@ mod tests {
     #[test]
     fn test_handshake_when_responder_adds_first() {
         let (mut e, mut r) = establisher_and_responder();
-        let early = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+        let early = r
+            .add_contact(e.identity.routing_token, e.identity.ed25519_public)
+            .unwrap();
         assert_eq!(exchange(&mut r, &mut e, early), [0x02], "dropped");
 
-        let kx = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+        let kx = e
+            .add_contact(r.identity.routing_token, r.identity.ed25519_public)
+            .unwrap();
         assert_eq!(exchange(&mut e, &mut r, kx), [0x02, 0x02, 0x04, 0x02]);
         assert_one_session_with_pq_keys(&e, &r);
         cleanup(&[&e, &r]);
@@ -2689,8 +2987,12 @@ mod tests {
     #[test]
     fn test_handshake_when_both_add_before_hearing_back() {
         let (mut e, mut r) = establisher_and_responder();
-        let kx_e = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
-        let kx_r = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+        let kx_e = e
+            .add_contact(r.identity.routing_token, r.identity.ed25519_public)
+            .unwrap();
+        let kx_r = r
+            .add_contact(e.identity.routing_token, e.identity.ed25519_public)
+            .unwrap();
         let r_reply = hand(&e, &mut r, &kx_e).unwrap();
         let e_reply = hand(&r, &mut e, &kx_r).unwrap();
 
@@ -2718,10 +3020,14 @@ mod tests {
             assert!(!r.e2e_sessions.contains_key(&e.identity.routing_token));
 
             if re_adder_establishes {
-                let kx = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+                let kx = e
+                    .add_contact(r.identity.routing_token, r.identity.ed25519_public)
+                    .unwrap();
                 assert_eq!(exchange(&mut e, &mut r, kx), [0x02, 0x02, 0x04, 0x02]);
             } else {
-                let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+                let kx = r
+                    .add_contact(e.identity.routing_token, e.identity.ed25519_public)
+                    .unwrap();
                 assert_eq!(exchange(&mut r, &mut e, kx), [0x02, 0x04, 0x02]);
             }
             assert_one_session_with_pq_keys(&e, &r);
@@ -2748,10 +3054,14 @@ mod tests {
             );
 
             if re_adder_establishes {
-                let kx = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+                let kx = e
+                    .add_contact(r.identity.routing_token, r.identity.ed25519_public)
+                    .unwrap();
                 assert_eq!(exchange(&mut e, &mut r, kx), [0x02, 0x02]);
             } else {
-                let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+                let kx = r
+                    .add_contact(e.identity.routing_token, e.identity.ed25519_public)
+                    .unwrap();
                 assert_eq!(exchange(&mut r, &mut e, kx), [0x02]);
             }
             assert_one_session_with_pq_keys(&e, &r);
@@ -2783,9 +3093,13 @@ mod tests {
     #[test]
     fn test_repeated_requests_get_the_same_session_whatever_the_order() {
         let (mut e, mut r) = establisher_and_responder();
-        let early = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
+        let early = e
+            .add_contact(r.identity.routing_token, r.identity.ed25519_public)
+            .unwrap();
         exchange(&mut e, &mut r, early);
-        let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+        let kx = r
+            .add_contact(e.identity.routing_token, e.identity.ed25519_public)
+            .unwrap();
         let keys = hand(&r, &mut e, &kx).unwrap();
         let request = hand(&e, &mut r, &keys).unwrap();
         let first = hand(&r, &mut e, &request).unwrap();
@@ -2846,8 +3160,9 @@ mod tests {
             };
             remover.forget_contact(other.identity.routing_token);
 
-            let kx =
-                remover.add_contact(other.identity.routing_token, other.identity.ed25519_public);
+            let kx = remover
+                .add_contact(other.identity.routing_token, other.identity.ed25519_public)
+                .unwrap();
             exchange(remover, other, kx);
             assert_one_session_with_pq_keys(&e, &r);
             assert_ne!(session(&e, &r).root_key, old_root, "a new session");
@@ -2872,8 +3187,12 @@ mod tests {
                     } else {
                         r.forget_contact(e.identity.routing_token);
                     }
-                    let kx_e = e.add_contact(r.identity.routing_token, r.identity.ed25519_public);
-                    let kx_r = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+                    let kx_e = e
+                        .add_contact(r.identity.routing_token, r.identity.ed25519_public)
+                        .unwrap();
+                    let kx_r = r
+                        .add_contact(e.identity.routing_token, e.identity.ed25519_public)
+                        .unwrap();
                     settle(
                         &mut e,
                         &mut r,
@@ -2910,7 +3229,9 @@ mod tests {
         let mut old_offer = [vec![0x04], old_offer.to_bytes()].concat();
 
         r.forget_contact(e.identity.routing_token);
-        let kx = r.add_contact(e.identity.routing_token, e.identity.ed25519_public);
+        let kx = r
+            .add_contact(e.identity.routing_token, e.identity.ed25519_public)
+            .unwrap();
         exchange(&mut r, &mut e, kx);
         let current = session(&e, &r).root_key;
 
@@ -2951,7 +3272,9 @@ mod tests {
     #[test]
     fn test_adding_a_contact_is_saved_straight_away() {
         let (mut alice, mut bob) = (new_client(), new_client());
-        alice.add_contact(bob.identity.routing_token, bob.identity.ed25519_public);
+        alice
+            .add_contact(bob.identity.routing_token, bob.identity.ed25519_public)
+            .unwrap();
         let mut restarted = ClientStateDto::load(&alice.state_path).unwrap();
         assert!(
             restarted
@@ -2959,7 +3282,9 @@ mod tests {
                 .contains_key(&bob.identity.routing_token)
         );
 
-        let kx = bob.add_contact(alice.identity.routing_token, alice.identity.ed25519_public);
+        let kx = bob
+            .add_contact(alice.identity.routing_token, alice.identity.ed25519_public)
+            .unwrap();
         exchange(&mut bob, &mut restarted, kx);
         assert!(restarted.connection_requests().is_empty());
         assert_one_session_with_pq_keys(&restarted, &bob);
@@ -2996,7 +3321,9 @@ mod tests {
     fn test_connection_requests_listed_until_added_or_dismissed() {
         let (mut alice, mut bob, mut carol) = (new_client(), new_client(), new_client());
         let request = |from: &mut Client, to: &mut Client| {
-            let kx = from.add_contact(to.identity.routing_token, to.identity.ed25519_public);
+            let kx = from
+                .add_contact(to.identity.routing_token, to.identity.ed25519_public)
+                .unwrap();
             assert_eq!(exchange(from, to, kx), [0x02], "dropped");
         };
         request(&mut alice, &mut bob);
@@ -3017,7 +3344,9 @@ mod tests {
         );
 
         // Scanning Alice back accepts: no longer a request, and connected.
-        let kx = bob.add_contact(alice.identity.routing_token, alice.identity.ed25519_public);
+        let kx = bob
+            .add_contact(alice.identity.routing_token, alice.identity.ed25519_public)
+            .unwrap();
         assert!(bob.connection_requests().is_empty());
         exchange(&mut bob, &mut alice, kx);
         assert!(bob.is_connected(&alice.identity.routing_token));
@@ -3112,16 +3441,20 @@ mod tests {
     #[test]
     fn test_sync_packet_proves_routing_token_ownership() {
         let mut client = new_client();
-        client.link_master_key = [7u8; 32];
-        client.session_id = [1, 2, 3, 4];
+        link_with(&mut client, 7, [1, 2, 3, 4]);
         let packet = client.generate_sync_packet();
-        assert_eq!(relay_link::header(&packet), Some((TYPE_SYNC, [1, 2, 3, 4])));
+        let header = relay_link::header(&packet).unwrap();
+        assert_eq!(
+            (header.packet_type, header.session_id),
+            (TYPE_SYNC, [1, 2, 3, 4])
+        );
         let sync =
             relay_link::Sync::from_bytes(&relay_link::open(&[7u8; 32], &packet).unwrap()).unwrap();
         assert_eq!(sync.token, client.identity.routing_token);
-        assert!(sync.verify(&[7u8; 32]).is_ok());
+        assert!(sync.verify(client.link.keys()).is_ok());
         assert!(
-            sync.verify(&[8u8; 32]).is_err(),
+            sync.verify(&relay_link::derive_link_keys(&[8u8; 32]))
+                .is_err(),
             "only proves anything on this link"
         );
     }
@@ -3141,10 +3474,10 @@ mod tests {
                 &relay_ephemeral,
                 &session_id,
             );
-            let link_key = relay_link::derive_link_key(
+            let link_keys = relay_link::derive_link_keys(
                 relay_secret.diffie_hellman(&client_ephemeral).as_bytes(),
             );
-            (resp, link_key)
+            (resp, link_keys)
         };
         let mut client = new_client();
 
@@ -3161,12 +3494,12 @@ mod tests {
         );
 
         let (secret, init) = client.generate_handshake_packet();
-        let (resp, link_key) = reply(&init, [5, 6, 7, 8]);
+        let (resp, link_keys) = reply(&init, [5, 6, 7, 8]);
         client
             .complete_handshake(secret, &relay_identity.verifying_key(), &resp)
             .unwrap();
-        assert_eq!(client.session_id, [5, 6, 7, 8]);
-        assert_eq!(client.link_master_key, link_key);
+        assert_eq!(client.link.session_id(), [5, 6, 7, 8]);
+        assert_eq!(client.link.keys(), &link_keys);
     }
 
     /// The relay's path challenge is answered with the same challenge, then
@@ -3175,20 +3508,30 @@ mod tests {
     #[test]
     fn test_path_challenge_is_answered_then_synced() {
         let mut client = new_client();
-        client.link_master_key = [4; 32];
-        client.session_id = [1, 2, 3, 4];
+        link_with(&mut client, 4, [1, 2, 3, 4]);
         let challenge = [9u8; 16];
-        let packet = relay_link::seal(&[4; 32], TYPE_PATH_CHALLENGE, &[1, 2, 3, 4], &challenge);
+        let packet = from_relay(&client, TYPE_PATH_CHALLENGE, &challenge);
         let answer = client.handle_relay_packet(&packet);
         assert_eq!(answer.len(), 2);
+        let header = relay_link::header(&answer[0]).unwrap();
         assert_eq!(
-            relay_link::header(&answer[0]),
-            Some((TYPE_PATH_RESPONSE, [1, 2, 3, 4]))
+            (header.packet_type, header.session_id),
+            (TYPE_PATH_RESPONSE, [1, 2, 3, 4])
         );
         assert_eq!(relay_link::open(&[4; 32], &answer[0]).unwrap(), challenge);
         assert_eq!(answer[1][0], TYPE_SYNC);
 
-        let forged = relay_link::seal(&[5; 32], TYPE_PATH_CHALLENGE, &[1, 2, 3, 4], &challenge);
+        assert!(
+            client.handle_relay_packet(&packet).is_empty(),
+            "a copy is ignored"
+        );
+        let forged = relay_link::seal(
+            &[5; 32],
+            TYPE_PATH_CHALLENGE,
+            &[1, 2, 3, 4],
+            next_relay_packet_number(),
+            &challenge,
+        );
         assert!(client.handle_relay_packet(&forged).is_empty());
     }
 
@@ -3217,15 +3560,16 @@ mod tests {
             Some(alice_to_bob)
         );
 
+        let sync_packet = bob.generate_sync_packet();
         let sync = relay_link::Sync::from_bytes(
-            &relay_link::open(&[0u8; 32], &bob.generate_sync_packet()).unwrap(),
+            &relay_link::open(&bob.link.keys().to_relay, &sync_packet).unwrap(),
         )
         .unwrap();
         assert_eq!(sync.admission, [alice_to_bob]);
         let packet = alice.create_fec_packets(b, b"hi").unwrap().remove(0);
-        let (packet_type, _) = relay_link::header(&packet).unwrap();
-        let plaintext = relay_link::open(&alice.link_master_key, &packet).unwrap();
-        let (_, tag, _) = relay_link::parse_data(packet_type, &plaintext).unwrap();
+        let header = relay_link::header(&packet).unwrap();
+        let plaintext = relay_link::open(&alice.link.keys().to_relay, &packet).unwrap();
+        let (_, tag, _) = relay_link::parse_data(header.packet_type, &plaintext).unwrap();
         assert_eq!(tag, Some(alice_to_bob));
 
         bob.forget_contact(a);
@@ -3251,7 +3595,7 @@ mod tests {
         let (msg_to_bob, _) = alice1
             .create_encrypted_packets(bob.identity.routing_token, b"hi bob, it's alice")
             .unwrap();
-        let inner_msg = strip_link(&msg_to_bob[0], &alice1.link_master_key);
+        let inner_msg = strip_link(&msg_to_bob[0], &alice1.link.keys().to_relay);
         bob.handle_incoming_packet(&inner_msg).unwrap();
         assert_eq!(bob.inbox.last().unwrap().1, b"hi bob, it's alice");
 
@@ -3294,14 +3638,14 @@ mod tests {
         let (msg_to_bob2, _) = alice2
             .create_encrypted_packets(bob.identity.routing_token, b"hi bob, it's the new alice")
             .unwrap();
-        let inner_msg2 = strip_link(&msg_to_bob2[0], &alice2.link_master_key);
+        let inner_msg2 = strip_link(&msg_to_bob2[0], &alice2.link.keys().to_relay);
         bob.handle_incoming_packet(&inner_msg2).unwrap();
         assert_eq!(bob.inbox.last().unwrap().1, b"hi bob, it's the new alice");
 
         let (msg_to_alice2, _) = bob
             .create_encrypted_packets(alice2.identity.routing_token, b"hi new alice, it's bob")
             .unwrap();
-        let inner_msg3 = strip_link(&msg_to_alice2[0], &bob.link_master_key);
+        let inner_msg3 = strip_link(&msg_to_alice2[0], &bob.link.keys().to_relay);
         alice2.handle_incoming_packet(&inner_msg3).unwrap();
         assert_eq!(alice2.inbox.last().unwrap().1, b"hi new alice, it's bob");
 
@@ -3360,11 +3704,11 @@ mod tests {
                     format!("Hello {}", i + 1).as_bytes(),
                 )
                 .unwrap();
-            let msg_inner = strip_link(&msg_pkt[0], &alice.link_master_key);
+            let msg_inner = strip_link(&msg_pkt[0], &alice.link.keys().to_relay);
             bob.handle_incoming_packet(&msg_inner).unwrap();
             if let Some(pq) = pq_pkt {
                 assert_eq!(i, 4, "PQ inject must only trigger at message 5");
-                let pq_inner = strip_link(&pq, &alice.link_master_key);
+                let pq_inner = strip_link(&pq, &alice.link.keys().to_relay);
                 bob.handle_incoming_packet(&pq_inner).unwrap();
             }
         }
@@ -3386,7 +3730,7 @@ mod tests {
         let (msg6, _) = alice
             .create_encrypted_packets(bob.identity.routing_token, b"Post-PQ message")
             .unwrap();
-        let msg6_inner = strip_link(&msg6[0], &alice.link_master_key);
+        let msg6_inner = strip_link(&msg6[0], &alice.link.keys().to_relay);
         bob.handle_incoming_packet(&msg6_inner).unwrap();
 
         let a_ck2 = alice
@@ -3705,50 +4049,37 @@ mod tests {
         assert!(dup.is_none(), "Duplicate message must be rejected");
     }
 
+    /// A KeyExchange that waited at the relay past `MAX_TIMESTAMP_DRIFT`
+    /// (Bob was offline when Alice added him) still carries the setup on:
+    /// Bob takes in Alice's keys and answers, so neither is left waiting.
+    /// Only the name it carries isn't taken, as she may have renamed
+    /// herself since. One addressed to someone else is still dropped.
     #[test]
-    fn test_edge_case_timestamp_rejection_via_handler() {
-        // Sends a stale-timestamp KeyExchange through handle_incoming_packet
-        // and verifies it is rejected (fixes incomplete test from review)
-        let server_addr: SocketAddr = "127.0.0.1:4430".parse().unwrap();
-        let mut bob = Client::new(server_addr);
+    fn test_stale_key_exchange_from_a_contact_still_carries_the_setup_on() {
+        let mut bob = new_client();
         let alice_id = UserIdentity::generate();
-        bob.pending_contacts
-            .insert(alice_id.routing_token, alice_id.ed25519_public);
+        bob.add_contact(alice_id.routing_token, alice_id.ed25519_public)
+            .unwrap();
 
-        // Generate a valid payload, then manually set a stale timestamp and re-sign
-        let mut payload =
-            KeyExchangePayload::generate(&alice_id, bob.identity.routing_token, "", false, 0, None);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        payload.timestamp = now - 600; // 10 minutes in the past
-        // Re-sign with the stale timestamp
-        use ed25519_dalek::Signer;
-        let mut msg = Vec::new();
-        msg.extend_from_slice(&payload.routing_token);
-        msg.extend_from_slice(&payload.target_token);
-        msg.extend_from_slice(&payload.timestamp.to_be_bytes());
-        msg.extend_from_slice(payload.ed25519_public.as_bytes());
-        msg.extend_from_slice(payload.x25519_public.as_bytes());
-        msg.extend_from_slice(payload.kyber_public.as_bytes());
-        msg.extend_from_slice(&[0u8; 32]); // empty name
-        msg.push(0); // flags: no peer keys, no session
-        msg.extend_from_slice(&[0u8; 8]); // add IDs
-        payload.signature = alice_id.ed25519_secret.sign(&msg);
-        assert!(payload.verify(&alice_id.ed25519_public).is_ok());
+        let to_someone_else = stale_key_exchange(&alice_id, [0x99; 16], "alice", false, 1);
+        assert!(
+            bob.handle_incoming_packet(&to_someone_else)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!bob.peer_kyber_keys.contains_key(&alice_id.routing_token));
 
-        let mut packet = vec![0x02];
-        packet.extend_from_slice(&payload.to_bytes());
-        let result = bob.handle_incoming_packet(&packet).unwrap();
-        assert!(
-            result.is_none(),
-            "Stale timestamp must cause packet to be dropped"
+        let stale = stale_key_exchange(&alice_id, bob.identity.routing_token, "alice", false, 1);
+        let reply = bob.handle_incoming_packet(&stale).unwrap();
+        assert_eq!(reply.map(|packet| relay(&packet, &bob)[0]), Some(0x02));
+        assert!(bob.peer_kyber_keys.contains_key(&alice_id.routing_token));
+        assert_eq!(bob.add_ids[&alice_id.routing_token].theirs, 1);
+        assert!(!bob.contact_names.contains_key(&alice_id.routing_token));
+        assert_eq!(
+            bob.contact_status(&alice_id.routing_token),
+            ContactStatus::Connecting
         );
-        assert!(
-            !bob.peer_kyber_keys.contains_key(&alice_id.routing_token),
-            "Stale KX must not be taken in"
-        );
+        cleanup(&[&bob]);
     }
 
     #[test]
@@ -4062,7 +4393,7 @@ mod tests {
                         format!("m{i}").as_bytes(),
                     )
                     .unwrap();
-                let key = alice.link_master_key;
+                let key = alice.link.keys().to_relay;
                 (strip_link(&pkts[0], &key), pq.map(|p| strip_link(&p, &key)))
             })
             .collect()
@@ -4203,10 +4534,10 @@ mod tests {
             assert_eq!(pkts.len(), 1);
             assert_eq!(
                 pkts[0].len(),
-                1158,
+                1142,
                 "chat packet size must not depend on message length"
             );
-            let inner = strip_link(&pkts[0], &alice.link_master_key);
+            let inner = strip_link(&pkts[0], &alice.link.keys().to_relay);
             bob.handle_incoming_packet(&inner).unwrap();
             let inbox = bob.drain_inbox();
             assert_eq!(inbox.len(), 1);
@@ -4227,17 +4558,17 @@ mod tests {
             .create_encrypted_packets(bob.identity.routing_token, text.as_bytes())
             .unwrap();
         assert_eq!(pkts.len(), 3);
-        assert!(pkts.iter().all(|p| p.len() == 1158));
+        assert!(pkts.iter().all(|p| p.len() == 1142));
 
         for pkt in pkts.iter().rev().take(2) {
-            let inner = strip_link(pkt, &alice.link_master_key);
+            let inner = strip_link(pkt, &alice.link.keys().to_relay);
             bob.handle_incoming_packet(&inner).unwrap();
             assert!(
                 bob.drain_inbox().is_empty(),
                 "nothing reaches the inbox until every chunk is in"
             );
         }
-        let inner = strip_link(&pkts[0], &alice.link_master_key);
+        let inner = strip_link(&pkts[0], &alice.link.keys().to_relay);
         bob.handle_incoming_packet(&inner).unwrap();
         let inbox = bob.drain_inbox();
         assert_eq!(inbox.len(), 1);
@@ -4257,7 +4588,7 @@ mod tests {
         assert_eq!(pkts.len(), 3);
         assert!(pq.is_none());
         for pkt in &pkts {
-            bob.handle_incoming_packet(&strip_link(pkt, &alice.link_master_key))
+            bob.handle_incoming_packet(&strip_link(pkt, &alice.link.keys().to_relay))
                 .unwrap();
         }
 
@@ -4268,7 +4599,7 @@ mod tests {
         assert_eq!(pkts.len(), 12);
         let pq = pq.expect("crossing an interval must produce a PQ inject");
         for pkt in pkts.iter().chain([&pq]) {
-            bob.handle_incoming_packet(&strip_link(pkt, &alice.link_master_key))
+            bob.handle_incoming_packet(&strip_link(pkt, &alice.link.keys().to_relay))
                 .unwrap();
         }
         let inbox = bob.drain_inbox();
@@ -4281,7 +4612,7 @@ mod tests {
             "chain keys must stay in sync across a chunked message and its inject"
         );
         let (next, _) = alice.create_encrypted_packets(bob_token, b"after").unwrap();
-        bob.handle_incoming_packet(&strip_link(&next[0], &alice.link_master_key))
+        bob.handle_incoming_packet(&strip_link(&next[0], &alice.link.keys().to_relay))
             .unwrap();
         assert_eq!(bob.drain_inbox()[0].1, b"after");
     }
@@ -4334,7 +4665,7 @@ mod tests {
         // Bob's ratchet still advanced past it, so the next padded message
         // decrypts normally.
         let (next, _) = alice.create_encrypted_packets(bob_token, b"hi").unwrap();
-        let inner = strip_link(&next[0], &alice.link_master_key);
+        let inner = strip_link(&next[0], &alice.link.keys().to_relay);
         bob.handle_incoming_packet(&inner).unwrap();
         let inbox = bob.drain_inbox();
         assert_eq!(inbox.len(), 1);
@@ -4351,18 +4682,13 @@ mod tests {
         assert!(bob.drain_inbox().is_empty());
     }
 
-    /// Helper: wrap an inner E2E payload the way the relay forwards it to
-    /// `to`, behind `delivery_id`.
-    fn relay_forward(to: &Client, delivery_id: DeliveryId, inner: &[u8]) -> Vec<u8> {
-        relay_link::forwarded_packet(&to.link_master_key, &to.session_id, &delivery_id, inner)
-    }
-
     #[test]
     fn test_relay_packet_is_acked_and_resend_handled_once() {
         let alice = new_client();
         let mut bob = new_client();
-        bob.link_master_key = [7u8; 32];
-        bob.add_contact(alice.identity.routing_token, alice.identity.ed25519_public);
+        link_with(&mut bob, 7, [1, 2, 3, 4]);
+        bob.add_contact(alice.identity.routing_token, alice.identity.ed25519_public)
+            .unwrap();
 
         let kx = KeyExchangePayload::generate(
             &alice.identity,
@@ -4385,12 +4711,21 @@ mod tests {
             "KeyExchange reply (which now carries Alice's admission tag), a sync registering \
              the one she'll use, then the ack"
         );
-        let resend = bob.handle_relay_packet(&packet);
+        assert!(
+            bob.handle_relay_packet(&packet).is_empty(),
+            "a copy of the very same packet isn't taken in at all"
+        );
+        // The relay seals each resend afresh.
+        let resend = bob.handle_relay_packet(&relay_forward(&bob, delivery_id, &kx_inner));
         assert_eq!(resend.len(), 1, "a resend is only acked again");
 
         let ack = &resend[0];
-        assert_eq!(relay_link::header(ack), Some((TYPE_ACK, bob.session_id)));
-        let plaintext = relay_link::open(&bob.link_master_key, ack).unwrap();
+        let header = relay_link::header(ack).unwrap();
+        assert_eq!(
+            (header.packet_type, header.session_id),
+            (TYPE_ACK, bob.link.session_id())
+        );
+        let plaintext = relay_link::open(&bob.link.keys().to_relay, ack).unwrap();
         assert_eq!(
             relay_link::parse_ack(&plaintext),
             Some((bob.identity.routing_token, [delivery_id].as_slice()))
@@ -4448,5 +4783,350 @@ mod tests {
             alice.peer_kyber_keys[&bob.routing_token].as_bytes(),
             bob.kyber_public.as_bytes()
         );
+    }
+
+    // ==========================================
+    // Setups that can't stall, yourself, and reconnecting
+    // ==========================================
+
+    /// A KeyExchange from `from` to `target`, as it arrives after waiting at
+    /// the relay longer than `MAX_TIMESTAMP_DRIFT`: the 0x02 payload
+    /// `handle_incoming_packet` takes.
+    fn stale_key_exchange(
+        from: &UserIdentity,
+        target: RoutingToken,
+        name: &str,
+        has_peer_keys: bool,
+        add_id: u32,
+    ) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        let mut kx = KeyExchangePayload::generate(from, target, name, has_peer_keys, add_id, None);
+        kx.timestamp -= MAX_TIMESTAMP_DRIFT + 300;
+        let bytes = kx.to_bytes();
+        kx.signature = from.ed25519_secret.sign(&bytes[..bytes.len() - 64]);
+        [vec![0x02], kx.to_bytes()].concat()
+    }
+
+    /// A state file path nothing can be saved to.
+    fn unsaveable_path() -> String {
+        std::env::temp_dir()
+            .join(format!("e2e-no-such-dir-{}", std::process::id()))
+            .join("state.json")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Your own code is refused, so you can't start a KeyExchange with
+    /// yourself, which would go round through the relay for good. Anything
+    /// claiming to come from you is dropped too.
+    #[test]
+    fn test_adding_your_own_code_is_refused() {
+        let mut me = new_client();
+        let (token, key) = (me.identity.routing_token, me.identity.ed25519_public);
+        assert!(me.add_contact(token, key).is_err());
+        assert!(me.pending_contacts.is_empty());
+
+        // Even if we had somehow trusted our own key as a contact's.
+        me.pending_contacts.insert(token, key);
+        let kx = KeyExchangePayload::generate(&me.identity, token, "", false, 1, None);
+        let packet = [vec![0x02], kx.to_bytes()].concat();
+        assert!(me.handle_incoming_packet(&packet).unwrap().is_none());
+        assert!(me.connection_requests().is_empty());
+        assert!(!me.peer_kyber_keys.contains_key(&token));
+        cleanup(&[&me]);
+    }
+
+    /// The second person adds the first while the first is offline, so
+    /// their KeyExchange is old by the time it's delivered. It's taken in
+    /// all the same, and the setup completes.
+    #[test]
+    fn test_setup_completes_when_the_second_key_exchange_arrives_late() {
+        let (mut a, mut b) = (new_client(), new_client());
+        let (ta, tb) = (a.identity.routing_token, b.identity.routing_token);
+        let early = a.add_contact(tb, b.identity.ed25519_public).unwrap();
+        assert_eq!(
+            exchange(&mut a, &mut b, early),
+            [0x02],
+            "not added back yet"
+        );
+        b.add_contact(ta, a.identity.ed25519_public).unwrap();
+        let late = stale_key_exchange(&b.identity, ta, "", false, b.add_ids[&ta].mine);
+        let reply = a.handle_incoming_packet(&late).unwrap().expect("answered");
+        exchange(&mut a, &mut b, reply);
+        assert!(a.is_connected(&tb) && b.is_connected(&ta));
+        assert_eq!(session(&a, &b).root_key, session(&b, &a).root_key);
+        cleanup(&[&a, &b]);
+    }
+
+    /// A connection request that waited at the relay while we were offline
+    /// is still listed: they still want to connect, and only the token is
+    /// kept anyway.
+    #[test]
+    fn test_late_connection_request_is_still_listed() {
+        let mut me = new_client();
+        let stranger = UserIdentity::generate();
+        let late = stale_key_exchange(&stranger, me.identity.routing_token, "", false, 1);
+        assert!(me.handle_incoming_packet(&late).unwrap().is_none());
+        assert_eq!(me.connection_requests(), [stranger.routing_token]);
+        cleanup(&[&me]);
+    }
+
+    /// Our KeyExchange goes to a contact we have no session with again,
+    /// after `FIRST_SETUP_RETRY`, then twice as long each time, at most
+    /// `MAX_SETUP_RETRIES` times, unless something from them moves the
+    /// setup on, which starts the count again.
+    #[test]
+    fn test_key_exchange_resends_back_off_and_restart_on_progress() {
+        let (mut a, mut b) = (new_client(), new_client());
+        let (ta, tb) = (a.identity.routing_token, b.identity.routing_token);
+        a.add_contact(tb, b.identity.ed25519_public).unwrap();
+        assert!(a.setup_resends(Instant::now()).is_empty(), "just sent");
+
+        let (mut at, mut delay) = (a.setup_retries[&tb].at, FIRST_SETUP_RETRY);
+        assert!(at > Instant::now() + FIRST_SETUP_RETRY - Duration::from_secs(1));
+        for _ in 0..MAX_SETUP_RETRIES {
+            assert!(a.setup_resends(at - Duration::from_millis(1)).is_empty());
+            let resent = a.setup_resends(at);
+            assert_eq!(resent.len(), 1);
+            assert_eq!(relay(&resent[0], &a)[0], 0x02);
+            at += delay;
+            delay = (delay * 2).min(MAX_SETUP_RETRY_DELAY);
+        }
+        assert!(
+            a.setup_resends(at + MAX_SETUP_RETRY_DELAY).is_empty(),
+            "gave up"
+        );
+
+        // B adds A at last, and their KeyExchange reaches A: that's progress.
+        let kx = b.add_contact(ta, a.identity.ed25519_public).unwrap();
+        a.handle_incoming_packet(&relay(&kx, &b)).unwrap();
+        assert!(!a.is_connected(&tb));
+        assert_eq!(a.setup_resends(Instant::now() + FIRST_SETUP_RETRY).len(), 1);
+        cleanup(&[&a, &b]);
+    }
+
+    /// Here every KeyExchange from the first round is lost on its way to
+    /// the relay: the resends alone bring the session up, and stop once it
+    /// is.
+    #[test]
+    fn test_resent_key_exchange_gets_past_lost_packets() {
+        let (mut a, mut b) = (new_client(), new_client());
+        let (ta, tb) = (a.identity.routing_token, b.identity.routing_token);
+        let _lost = a.add_contact(tb, b.identity.ed25519_public).unwrap();
+        let _lost = b.add_contact(ta, a.identity.ed25519_public).unwrap();
+        let mut resent = a.setup_resends(Instant::now() + FIRST_SETUP_RETRY);
+        assert_eq!(resent.len(), 1);
+        exchange(&mut a, &mut b, resent.remove(0));
+        assert!(a.is_connected(&tb) && b.is_connected(&ta));
+        let later = Instant::now() + MAX_SETUP_RETRY_DELAY;
+        assert!(a.setup_resends(later).is_empty() && b.setup_resends(later).is_empty());
+        cleanup(&[&a, &b]);
+    }
+
+    #[test]
+    fn test_contact_status_follows_the_setup() {
+        let (mut a, mut b) = (new_client(), new_client());
+        let (ta, tb) = (a.identity.routing_token, b.identity.routing_token);
+        let early = a.add_contact(tb, b.identity.ed25519_public).unwrap();
+        assert_eq!(a.contact_status(&tb), ContactStatus::Pending);
+        // Without an admission tag yet: A doesn't have B's X25519 key.
+        assert_eq!(early.len(), 1439);
+        exchange(&mut a, &mut b, early);
+        assert_eq!(a.contact_status(&tb), ContactStatus::Pending);
+
+        // B's KeyExchange reaches A, so B has added A: they're connecting.
+        let kx = b.add_contact(ta, a.identity.ed25519_public).unwrap();
+        let reply = a.handle_incoming_packet(&relay(&kx, &b)).unwrap().unwrap();
+        assert_eq!(a.contact_status(&tb), ContactStatus::Connecting);
+        // With its admission tag, a KeyExchange still fits a PPPoE link's
+        // 1464-byte UDP payload.
+        assert_eq!(reply.len(), 1447);
+        exchange(&mut a, &mut b, reply);
+        assert_eq!(a.contact_status(&tb), ContactStatus::Connected);
+        assert_eq!(b.contact_status(&ta), ContactStatus::Connected);
+        cleanup(&[&a, &b]);
+    }
+
+    /// Nothing about a session is promised to a contact unless it's saved:
+    /// with saving broken, the establisher doesn't offer the session it
+    /// made, and the responder neither takes an offer in nor confirms it.
+    /// Once saving works again, the same session goes through.
+    #[test]
+    fn test_unsaved_sessions_are_neither_offered_nor_taken_in() {
+        let (mut e, mut r) = establisher_and_responder();
+        let (te, tr) = (e.identity.routing_token, r.identity.routing_token);
+        let early = e.add_contact(tr, r.identity.ed25519_public).unwrap();
+        exchange(&mut e, &mut r, early);
+        let kx = r.add_contact(te, e.identity.ed25519_public).unwrap();
+        let reply = e.handle_incoming_packet(&relay(&kx, &r)).unwrap().unwrap();
+        let ask = r
+            .handle_incoming_packet(&relay(&reply, &e))
+            .unwrap()
+            .unwrap();
+
+        let e_path = std::mem::replace(&mut e.state_path, unsaveable_path());
+        assert!(
+            e.handle_incoming_packet(&relay(&ask, &r))
+                .unwrap()
+                .is_none()
+        );
+        e.state_path = e_path;
+        let offer = e
+            .handle_incoming_packet(&relay(&ask, &r))
+            .unwrap()
+            .expect("offered once it's saved");
+        assert_eq!(relay(&offer, &e)[0], 0x04);
+
+        let r_path = std::mem::replace(&mut r.state_path, unsaveable_path());
+        assert!(
+            r.handle_incoming_packet(&relay(&offer, &e))
+                .unwrap()
+                .is_none()
+        );
+        assert!(r.e2e_sessions.is_empty() && r.session_setups.is_empty());
+        r.state_path = r_path;
+        let confirm = r
+            .handle_incoming_packet(&relay(&offer, &e))
+            .unwrap()
+            .unwrap();
+        exchange(&mut r, &mut e, confirm);
+        assert!(e.is_connected(&tr) && r.is_connected(&te));
+        assert_eq!(session(&e, &r).root_key, session(&r, &e).root_key);
+        cleanup(&[&e, &r]);
+    }
+
+    /// The relay acks each sync. While it does, a keepalive is just a sync.
+    /// Once one has gone unacked for `SYNC_ACK_TIMEOUT`, the link is
+    /// presumed gone, and the keepalive starts a new handshake instead.
+    /// Only our relay's reply to it finishes it: a new link, synced on at
+    /// once, with KeyExchanges for contacts we're still setting up with.
+    #[test]
+    fn test_keepalive_redoes_the_handshake_once_syncs_go_unacked() {
+        let relay_identity = SigningKey::from_bytes(&[7; 32]);
+        let mut client = new_client();
+        link_with(&mut client, 4, [1, 2, 3, 4]);
+        client.relay_public = Some(relay_identity.verifying_key());
+        let contact = UserIdentity::generate();
+        client
+            .add_contact(contact.routing_token, contact.ed25519_public)
+            .unwrap();
+
+        let sync = client.keepalive();
+        assert_eq!(sync.len(), 1, "a sync, and the KeyExchange isn't due yet");
+        let number = relay_link::header(&sync[0]).unwrap().packet_number;
+        let ack = from_relay(
+            &client,
+            TYPE_SYNC_ACK,
+            &relay_link::sync_ack_plaintext(number),
+        );
+        assert!(client.handle_relay_packet(&ack).is_empty());
+        assert!(client.unacked_sync.is_none());
+
+        client.keepalive();
+        let (number, sent) = client.unacked_sync.unwrap();
+        client.unacked_sync = Some((number, sent - SYNC_ACK_TIMEOUT));
+        let init = client.keepalive();
+        assert_eq!(init.len(), 1);
+        let client_ephemeral = relay_link::parse_handshake_init(&init[0]).unwrap();
+        assert!(client.keepalive().is_empty(), "waiting for the reply");
+
+        let relay_secret = EphemeralSecret::random_from_rng(OsRng);
+        let relay_ephemeral = X25519PublicKey::from(&relay_secret);
+        let impostor = SigningKey::from_bytes(&[8; 32]);
+        let forged = relay_link::handshake_resp(
+            &impostor,
+            &client_ephemeral,
+            &relay_ephemeral,
+            &[6, 6, 6, 6],
+        );
+        assert!(client.handle_relay_packet(&forged).is_empty());
+        assert_eq!(client.link.session_id(), [1, 2, 3, 4]);
+
+        let reply = relay_link::handshake_resp(
+            &relay_identity,
+            &client_ephemeral,
+            &relay_ephemeral,
+            &[5, 6, 7, 8],
+        );
+        let out = client.handle_relay_packet(&reply);
+        assert_eq!(client.link.session_id(), [5, 6, 7, 8]);
+        assert_eq!(
+            client.link.keys(),
+            &relay_link::derive_link_keys(
+                relay_secret.diffie_hellman(&client_ephemeral).as_bytes()
+            )
+        );
+        let types: Vec<_> = out
+            .iter()
+            .map(|packet| {
+                let header = relay_link::header(packet).unwrap();
+                assert_eq!(header.session_id, [5, 6, 7, 8]);
+                header.packet_type
+            })
+            .collect();
+        assert_eq!(
+            types,
+            [TYPE_SYNC, TYPE_DATA],
+            "a sync, then the KeyExchange"
+        );
+        assert!(client.handle_relay_packet(&reply).is_empty(), "taken once");
+        cleanup(&[&client]);
+    }
+
+    /// A handshake that gets no reply is tried again with a fresh key, and
+    /// a reply nobody asked for, or an ack for a sync older than the oldest
+    /// unacked one, changes nothing.
+    #[test]
+    fn test_unanswered_handshakes_are_retried_and_strays_ignored() {
+        let relay_identity = SigningKey::from_bytes(&[7; 32]);
+        let mut client = new_client();
+        link_with(&mut client, 4, [1, 2, 3, 4]);
+
+        let stray = relay_link::handshake_resp(
+            &relay_identity,
+            &X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng)),
+            &X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng)),
+            &[5, 6, 7, 8],
+        );
+        assert!(client.handle_relay_packet(&stray).is_empty());
+        assert_eq!(client.link.session_id(), [1, 2, 3, 4]);
+
+        let first_sync = client.keepalive().remove(0);
+        let acked = relay_link::header(&first_sync).unwrap().packet_number;
+        let ack = from_relay(
+            &client,
+            TYPE_SYNC_ACK,
+            &relay_link::sync_ack_plaintext(acked),
+        );
+        client.handle_relay_packet(&ack);
+
+        // Without the relay's key (no `perform_handshake` yet), a client
+        // can only keep syncing.
+        client.keepalive();
+        let (oldest, sent) = client.unacked_sync.unwrap();
+        assert!(oldest > acked);
+        client.unacked_sync = Some((oldest, sent - SYNC_ACK_TIMEOUT));
+        let synced = client.keepalive();
+        assert_eq!(
+            relay_link::header(&synced[0]).unwrap().packet_type,
+            TYPE_SYNC
+        );
+
+        client.relay_public = Some(relay_identity.verifying_key());
+        let first = client.keepalive();
+        let started = client.pending_handshake.as_ref().unwrap().1;
+        client.pending_handshake.as_mut().unwrap().1 = started - HANDSHAKE_TIMEOUT;
+        let second = client.keepalive();
+        assert_eq!(second.len(), 1);
+        assert_ne!(first, second, "a fresh ephemeral key");
+
+        let behind = from_relay(
+            &client,
+            TYPE_SYNC_ACK,
+            &relay_link::sync_ack_plaintext(acked),
+        );
+        client.handle_relay_packet(&behind);
+        assert!(client.unacked_sync.is_some());
+        cleanup(&[&client]);
     }
 }

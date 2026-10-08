@@ -12,7 +12,7 @@
 // split keeps one implementation of the protocol logic instead of forking
 // it between two front ends.
 use anyhow::{Result, anyhow};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{io::AsyncBufReadExt, net::UdpSocket, sync::Mutex};
 
 use client::{
@@ -63,15 +63,16 @@ async fn main() -> Result<()> {
     // Message bursts go out one at a time, in order, paced on their own task.
     let bursts = BurstSender::spawn(Arc::clone(&socket), server_addr);
 
-    // Link-layer handshake with the relay (X25519 DH + Ed25519 mutual auth),
-    // then announce ourselves so the relay can route to our current IP.
+    // Link-layer handshake with the relay (X25519 DH, the relay's reply
+    // signed with the key we were given), then a sync proving our routing
+    // token is ours, so the relay can route to our current IP.
     // (perform_handshake lives in lib.rs — shared with any other front end.)
     {
         let mut c = client.lock().await;
         perform_handshake(&mut c, &socket, &server_pub).await?;
         println!(
             "Completed Server Link Handshake! Session ID: {}",
-            hex::encode(c.session_id)
+            hex::encode(c.link.session_id())
         );
         c.save();
 
@@ -98,6 +99,25 @@ async fn main() -> Result<()> {
                 for packet in c.handle_relay_packet(&buf[..len]) {
                     let _ = socket_clone.send_to(&packet, c.server_addr).await;
                 }
+            }
+        }
+    });
+
+    // Background task: the keepalive (see `Client::keepalive`). A sync
+    // every 15s keeps our NAT mapping (and the relay's record of where we
+    // are) alive, and sends contacts we're still setting up with our
+    // KeyExchange again when due. If the relay stops acking our syncs (it
+    // restarted, say), this redoes the handshake instead.
+    let keepalive_socket = Arc::clone(&socket);
+    let keepalive_client = Arc::clone(&client);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        ticker.tick().await; // the first tick is immediate; we just synced
+        loop {
+            ticker.tick().await;
+            let mut c = keepalive_client.lock().await;
+            for packet in c.keepalive() {
+                let _ = keepalive_socket.send_to(&packet, c.server_addr).await;
             }
         }
     });
@@ -132,9 +152,13 @@ async fn main() -> Result<()> {
                 let mut c = client.lock().await;
                 // Trust is asserted here from the (assumed) QR-scanned key;
                 // the reply's signature is checked against this on receipt.
-                let req_packet = c.add_contact(token, bob_ed25519);
-                socket.send_to(&req_packet, server_addr).await.unwrap();
-                println!("Sent connection request! They need to connect to you too.");
+                match c.add_contact(token, bob_ed25519) {
+                    Ok(req_packet) => {
+                        socket.send_to(&req_packet, server_addr).await.unwrap();
+                        println!("Sent connection request! They need to connect to you too.");
+                    }
+                    Err(e) => println!("Error: {e}"),
+                }
             }
             "msg" => {
                 if parts.len() < 3 {
@@ -150,16 +174,16 @@ async fn main() -> Result<()> {
                 };
                 let text = parts[2..].join(" ");
                 // One burst of FEC packets (with any PQ ratchet injection
-                // bundled inside). The lock is released before sending so the
-                // receive loop isn't locked out while the burst drains.
-                let packets = client
-                    .lock()
-                    .await
-                    .create_fec_packets(token, text.as_bytes());
-                match packets {
+                // bundled inside), queued before the lock is released (see
+                // `BurstSender::queue`), but waited for after, so the receive
+                // loop isn't locked out while the burst drains.
+                let mut c = client.lock().await;
+                match c.create_fec_packets(token, text.as_bytes()) {
                     Ok(packets) => {
                         let count = packets.len();
-                        match bursts.send(packets).await {
+                        let first_sent = bursts.queue(packets);
+                        drop(c);
+                        match first_sent.await {
                             Ok(()) => println!("Sending msg as a burst of {count} packets..."),
                             Err(e) => println!("Error: msg not sent: {e}"),
                         }

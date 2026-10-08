@@ -8,7 +8,8 @@ use crate::background;
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use client::{
     derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
-    BurstSender, ChatHistory, Client, ClientStateDto, IdentityStateStore, RoutingToken,
+    BurstSender, ChatHistory, Client, ClientStateDto, ContactStatus, IdentityStateStore,
+    RoutingToken,
 };
 use serde::Serialize;
 use std::{
@@ -761,8 +762,10 @@ mod tests {
 pub struct ContactDto {
     pub token: String,
     /// "established" once both sides have the session and messages can be
-    /// sent (see `Client::is_connected`), otherwise "pending" (added,
-    /// waiting for them to add us back and the handshake to finish).
+    /// sent (see `Client::is_connected`), "connecting" once they've added us
+    /// too and the session is being set up, otherwise "pending" (we've
+    /// added them, and are waiting for them to add us back). See
+    /// `Client::contact_status`.
     pub status: String,
     /// The display name this contact chose for themselves, learned from
     /// their KeyExchange (see `Client::contact_names`), if they set one.
@@ -908,21 +911,27 @@ async fn end_session(state: &AppState) {
     }
 }
 
-/// Background task: periodically resend a (signed) `sync` packet to the relay
-/// (the same packet type `perform_handshake` sends once at bootstrap).
+/// Background task: the keepalive (see `Client::keepalive`). Every 15s it
+/// resends a (signed) `sync` packet to the relay (the same packet type
+/// `perform_handshake` sends once at bootstrap), along with any KeyExchange
+/// due again to a contact we're still setting up a session with.
 ///
-/// This only matters once the relay and client are on different machines.
-/// The relay learns/refreshes our real `ip:port` purely from the source
-/// address of our packets, and its own record has a long TTL (see
-/// `METADATA_TTL` in `code/server/src/stores.rs`) — but that's irrelevant if
-/// our *own* NAT/router UDP mapping expires first, which home/campus
-/// routers typically do within 30-60s of silence. Without this, bootstrap
-/// (an immediate round trip on a fresh mapping) succeeds, but any peer
-/// packet routed to us minutes later gets silently dropped by our own
-/// router before it ever reaches this process. Resending well under that
-/// window keeps the mapping (and the relay's record) alive for as long as
-/// the app runs. Purely client-side — the relay already handles a resent
-/// sync packet identically to the first one.
+/// The sync only matters once the relay and client are on different
+/// machines. The relay learns/refreshes our real `ip:port` from where our
+/// syncs come from, and its own record has a long TTL (see `METADATA_TTL`
+/// in `code/server/src/main.rs`) — but that's irrelevant if our *own*
+/// NAT/router UDP mapping expires first, which home/campus routers
+/// typically do within 30-60s of silence. Without this, bootstrap (an
+/// immediate round trip on a fresh mapping) succeeds, but any peer packet
+/// routed to us minutes later gets silently dropped by our own router
+/// before it ever reaches this process. Resending well under that window
+/// keeps the mapping (and the relay's record) alive for as long as the app
+/// runs.
+///
+/// The relay acks every sync. If it stops (it restarted for a deploy, or
+/// forgot our link while the phone slept), `keepalive` redoes the handshake
+/// on this socket instead, and the receive loop finishes it, so the app
+/// reconnects by itself.
 fn spawn_keepalive_loop(
     app: AppHandle,
     socket: Arc<UdpSocket>,
@@ -942,10 +951,12 @@ fn spawn_keepalive_loop(
             let Some(rt) = guard.as_mut() else {
                 continue;
             };
-            let sync_packet = rt.client.generate_sync_packet();
+            let packets = rt.client.keepalive();
             let server_addr = rt.client.server_addr;
             drop(guard);
-            let _ = socket.send_to(&sync_packet, server_addr).await;
+            for packet in packets {
+                let _ = socket.send_to(&packet, server_addr).await;
+            }
         }
     })
 }
@@ -1004,8 +1015,8 @@ fn contact_label(client: &Client, token: &RoutingToken) -> String {
 
 /// Union of `pending_contacts` (KeyExchange in flight) and `e2e_sessions`
 /// — everyone the UI should show in the contact list, with a status badge
-/// for which stage they're at: "established" only once both sides have the
-/// session (see `Client::is_connected`).
+/// for which stage they're at (see `ContactDto::status`): "established"
+/// only once both sides have the session (see `Client::is_connected`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>, String> {
     let guard = state.runtime.lock().await;
@@ -1019,18 +1030,15 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
         .collect();
     let mut contacts: Vec<ContactDto> = tokens
         .into_iter()
-        .map(|token| {
-            let established = client.is_connected(token);
-            ContactDto {
-                token: hex::encode(token),
-                status: if established {
-                    "established"
-                } else {
-                    "pending"
-                }
-                .to_string(),
-                name: client.contact_names.get(token).cloned(),
+        .map(|token| ContactDto {
+            token: hex::encode(token),
+            status: match client.contact_status(token) {
+                ContactStatus::Connected => "established",
+                ContactStatus::Connecting => "connecting",
+                ContactStatus::Pending => "pending",
             }
+            .to_string(),
+            name: client.contact_names.get(token).cloned(),
         })
         .collect();
     // A stable order (by name, then token) so the list doesn't reshuffle
@@ -1059,7 +1067,10 @@ pub async fn connect_to_peer(
 
     let peer_ed25519 = parse_verifying_key(&ed25519_hex).map_err(|e| e.to_string())?;
 
-    let req_packet = rt.client.add_contact(token, peer_ed25519);
+    let req_packet = rt
+        .client
+        .add_contact(token, peer_ed25519)
+        .map_err(|e| e.to_string())?;
     rt.socket
         .send_to(&req_packet, rt.client.server_addr)
         .await
@@ -1172,13 +1183,14 @@ pub async fn send_message(
         .map_err(|e| e.to_string())?;
     let history_id = rt.client.last_recorded_id;
 
-    // The burst is paced out over a few hundred ms behind any earlier ones,
-    // so wait for it without holding the runtime lock (the receive loop
-    // needs it). Resolves once its first packet is out.
-    let bursts = rt.bursts.clone();
+    // Queued while we still hold the runtime lock, so bursts go out in the
+    // order they were made (see `BurstSender::queue`). It's paced out over a
+    // few hundred ms behind any earlier ones, so wait for it without holding
+    // the lock (the receive loop needs it). Resolves once its first packet
+    // is out.
+    let first_sent = rt.bursts.queue(packets);
     drop(guard);
-    bursts
-        .send(packets)
+    first_sent
         .await
         .map_err(|e| format!("Message not sent: {e}"))?;
 

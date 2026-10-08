@@ -227,7 +227,11 @@ async fn main() -> Result<()> {
     // Contact exchange on a clean link (QR codes in the real app; out of
     // scope for the lossy part). Each adds the other.
     for (me, them) in [(&alice, &bob), (&bob, &alice)] {
-        let kx = me.client.lock().await.add_contact(them.token, them.ed25519);
+        let kx = me
+            .client
+            .lock()
+            .await
+            .add_contact(them.token, them.ed25519)?;
         me.socket.send_to(&kx, me.proxy.addr).await?;
     }
     let deadline = Instant::now() + Duration::from_secs(10);
