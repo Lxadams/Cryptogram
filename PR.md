@@ -94,10 +94,11 @@ Phase 0 of the new [Stage 3 roadmap](documentations/stage-3-roadmap.md), apart f
   - **The result:** at 70% loss each way, one attempt gets through about half the time, up from 9%.
 - **Reconnecting waits for two minutes of silence** (see "They reconnect by themselves" above). Before, one unacked sync was enough, and heavy loss alone often caused that.
 - **Sent messages show whether the relay got them, and every message shows its time.**
-  - **✓ and !:** a sent message gets a check mark once the relay has enough of it to deliver (one more symbol than its source symbols, enough to rebuild it 9,999 times in 10,000), or a red exclamation mark if that isn't confirmed within 30 s. The mark means the relay has it, not that the recipient does; the relay goes on resending until they do.
+  - **✓ and !:** a sent message gets a check mark once the relay has enough of it to deliver (its source symbols, enough to rebuild it 99 times in 100: requiring one more, for 9,999 in 10,000, showed the red mark on messages that arrived), or a red exclamation mark if that isn't confirmed within 30 s. The mark means the relay has it, not that the recipient does; the relay goes on resending until they do.
   - **How the client knows:** the relay never answered message packets. Now the client asks (`TYPE_RECEIPT_REQUEST`, three copies, every 2 s while anything's unconfirmed), and the relay answers with its replay window for the client's message lane (`TYPE_RECEIPT`, three copies, only to the link's own address), which says packet by packet what it took in (`client/src/confirmations.rs`).
   - **Saved:** each status is saved in the chat history, so the marks are still there after a restart. A message still unconfirmed when the app closes is marked failed.
   - **Times:** the time it was sent or arrived (from the chat history, which already kept it), with the date for anything before today.
+- **Messages waiting for a PQ refresh are no longer dropped.** On two phones at 70% loss each way, the burst carrying a refresh took over five minutes to arrive. The 7 messages after it arrived meanwhile and were parked, already acked to the relay, then dropped after 60 s. 5 of them showed a check mark on the sender. Parked messages now wait up to 7 days (as long as the relay holds a message), up to 100 per contact, and are saved with the session, so a restart doesn't lose them either.
 - **Messages are shown in the order they were sent.** From two phones at 75% loss: under loss they finished arriving out of order, and were shown that way.
   - **How:** a message's chunks carry their ratchet positions, so one that arrives ahead of an earlier message is held until that one arrives, then both go out in order: to the chat, the history and notifications (`client/src/ordering.rs`).
   - **The limit:** a message that never arrives holds the rest up for at most 10 s (`REORDER_WAIT`), long enough for the relay's first two resends. One that turns up later still goes out, late.
@@ -228,7 +229,7 @@ Everything here is breaking. **Deploy the relay and update every client together
   |---|---|
   | relay-link (new) | 12 |
   | Relay | 45 |
-  | Client | 163 |
+  | Client | 164 |
   | Tauri backend | 15 |
   | Frontend | 10 |
 
@@ -236,7 +237,8 @@ Everything here is breaking. **Deploy the relay and update every client together
     - relay: copies of a handshake init get one link; handshakes from one address are rate-limited; sync acks go out several times; the identity file is private
     - relay-link: the three replies together are smaller than the init
     - client: a handshake gets through a lost attempt (over real UDP); ML-KEM keys round-trip and malformed ones are refused; the notification setting is saved
-    - send confirmations: a message is sent once a receipt shows the relay has one more symbol than its source symbols, and not before; a receipt from another link confirms nothing; an unconfirmed one fails after 30 s; requests go out once its burst has, then every 2 s; the status is saved in the history, and one cut short by a restart has failed; a database from before statuses gains them; the relay's receipt is right packet by packet, goes out three times, and only to the link's address; incoming messages carry the time their history row has
+    - a message parked for a PQ refresh still gets through after ten minutes and an app restart (it failed with the old 60 s limit, as on the phones)
+    - send confirmations: a message is sent once a receipt shows the relay has its source symbols, and not before; a receipt from another link confirms nothing; an unconfirmed one fails after 30 s; requests go out once its burst has, then every 2 s; the status is saved in the history, and one cut short by a restart has failed; a database from before statuses gains them; the relay's receipt is right packet by packet, goes out three times, and only to the link's address; incoming messages carry the time their history row has
     - client, delivery order: messages (one of them three chunks) that arrive ahead of the first are held, then handed over in the order sent; a lost one holds the rest up only for `REORDER_WAIT`, and still gets through late; a dropped payload holds nothing up; held messages survive a save and load; sessions saved before ordering resume at their next message
     - Tauri backend: notifications name senders only once that's turned on
 

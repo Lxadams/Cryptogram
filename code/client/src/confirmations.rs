@@ -7,10 +7,10 @@
 // unconfirmed). The relay's receipt, sent several times too, says packet by
 // packet.
 //
-// A message is sent once the relay has `needed` of its symbols: one more
-// than its source symbols, enough for the recipient to rebuild it all but
-// certainly (it fails 1 time in 10,000, the rate bursts are sized for). The
-// relay then delivers it, resending until the recipient has it. A message
+// A message is sent once the relay has `needed` of its symbols: its source
+// symbols, enough for the recipient to rebuild it 99 times in 100 (see
+// `transport::symbols_needed`). The relay then delivers it, resending until
+// the recipient has it. A message
 // not confirmed within `CONFIRM_TIMEOUT` has failed: too little of it got
 // to the relay, or the link went down first.
 

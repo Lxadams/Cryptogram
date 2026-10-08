@@ -296,7 +296,7 @@ With `jammed=alice`, Alice→Bob exercises a jammed **sender** and Bob→Alice a
 | `MESSAGE_MAX_FAILURE` / `PQ_MESSAGE_MAX_FAILURE` | same | 1e-4 / 1e-6 |
 | `FEC_PACKET_SPACING` | same | 10 ms |
 | `MAX_MESSAGE_LEN` (chunk limit, PR #35) | `client/src/chunks.rs` | 16,176 bytes |
-| `DEFER_TTL` / `MAX_DEFERRED_PER_PEER` | same | 60 s / 32 |
+| `DEFER_TTL` / `MAX_DEFERRED_PER_PEER` | same | 7 days / 100 (saved with the session: a parked message is already acked to the relay) |
 | `MAX_SYMBOL_SIZE`, `MAX_OBJECT_LEN` | `fec/src/lib.rs` | 1,024 B / 64 KiB |
 | `fec::Limits` (pending/completed bounds and TTLs) | same | 128 / 32 per source / 120 s; 4,096 / 600 s |
 | `RELAY_PACKET_SPACING` | `server/src/main.rs` | 5 ms |

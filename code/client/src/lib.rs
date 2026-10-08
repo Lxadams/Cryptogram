@@ -391,6 +391,9 @@ pub struct SymmetricSessionState {
     /// Puts the peer's messages back in the order they were sent, however
     /// they arrived (see `ordering`).
     pub delivery: DeliveryOrder,
+    /// The peer's chat payloads that can't be decrypted until a PQ inject
+    /// still on its way arrives (see `ParkedPayloads`).
+    pub parked: transport::ParkedPayloads,
 }
 
 /// PQ refreshes received from the peer, tracked by the position the sender
@@ -452,6 +455,7 @@ impl SymmetricSessionState {
             skip_dict: HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         }
     }
 
@@ -2028,8 +2032,9 @@ impl Client {
                         // The seal already proved who sent it, so a message
                         // that can't be decrypted yet may be held back.
                         0x01 => {
-                            delivered |=
-                                self.receive_message(part, Some(Instant::now()))?.is_some();
+                            delivered |= self
+                                .receive_message(part, Some(ordering::now_ms()))?
+                                .is_some();
                         }
                         0x05 => {
                             self.handle_incoming_packet(part)?;
@@ -2215,7 +2220,7 @@ impl Client {
     fn receive_message(
         &mut self,
         payload: &[u8],
-        park: Option<Instant>,
+        park: Option<u64>,
     ) -> Result<Option<RoutingToken>> {
         let pkt_data = &payload[1..];
         if pkt_data.len() < 16 + 8 + 24 {
@@ -2246,13 +2251,12 @@ impl Client {
                         ">> Holding message {seq_no} from {}: not decryptable yet (PQ ratchet update in flight?).",
                         hex::encode(&sender_token[0..4])
                     );
-                    self.fec_rx.defer(
-                        sender_token,
-                        seq_no,
-                        payload.to_vec(),
-                        parked_at,
-                        Instant::now(),
-                    );
+                    session
+                        .parked
+                        .park(seq_no, payload.to_vec(), parked_at, ordering::now_ms());
+                    // Saved: it has been acked to the relay, so this is
+                    // the only copy.
+                    self.save();
                 }
                 _ => println!(
                     ">> Received packet from {} but decryption failed (out of sync?).",
@@ -2382,9 +2386,17 @@ impl Client {
     /// decryptable, now that a PQ inject or an earlier chunk has moved
     /// their receive chain on.
     fn retry_deferred(&mut self, sender: RoutingToken) -> Result<()> {
-        for (parked_at, payload) in self.fec_rx.take_deferred(&sender, Instant::now()) {
-            self.receive_message(&payload, Some(parked_at))?;
+        let Some(session) = self.e2e_sessions.get_mut(&sender) else {
+            return Ok(());
+        };
+        let parked = session.parked.take(ordering::now_ms());
+        if parked.is_empty() {
+            return Ok(());
         }
+        for parked in parked {
+            self.receive_message(&parked.payload, Some(parked.parked_at_ms))?;
+        }
+        self.save();
         Ok(())
     }
 }
@@ -2828,6 +2840,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -2839,6 +2852,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
         for i in 0..10 {
             let alice_mk = alice_state.symmetric_ratchet();
@@ -2860,6 +2874,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
         let mut seen_keys = std::collections::HashSet::new();
         for _ in 0..100 {
@@ -2886,6 +2901,7 @@ mod tests {
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
+                parked: Default::default(),
             },
         );
         bob.e2e_sessions.insert(
@@ -2900,6 +2916,7 @@ mod tests {
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
+                parked: Default::default(),
             },
         );
         let (packet, _pq) = alice
@@ -2941,6 +2958,7 @@ mod tests {
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
+                parked: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -2998,6 +3016,7 @@ mod tests {
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
+                parked: Default::default(),
                 peer_kyber_pub: None, // No Kyber key!
             },
         );
@@ -3035,6 +3054,7 @@ mod tests {
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
+                parked: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -3049,6 +3069,7 @@ mod tests {
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
+                parked: Default::default(),
                 peer_kyber_pub: Some(alice_kyber_copy),
             },
         );
@@ -3110,6 +3131,7 @@ mod tests {
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
+                parked: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -3156,6 +3178,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
         for _ in 0..5 {
             no_pq_state.symmetric_ratchet();
@@ -4137,6 +4160,7 @@ mod tests {
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
+                parked: Default::default(),
             },
         );
         let chain_before = bob.e2e_sessions[&alice_id.routing_token].recv_chain_key;
@@ -4185,6 +4209,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4196,6 +4221,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
 
         let mk1 = alice_state.symmetric_ratchet();
@@ -4241,6 +4267,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4252,6 +4279,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
 
         // Receive packet with seq_no 150 (exceeds MAX_SKIP_DICT_ENTRIES of 100)
@@ -4320,6 +4348,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4331,6 +4360,7 @@ mod tests {
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
 
         let mk0 = alice_state.symmetric_ratchet();
@@ -4498,6 +4528,13 @@ mod tests {
                         },
                     )]),
                 },
+                parked: transport::ParkedPayloads(BTreeMap::from([(
+                    4,
+                    transport::Parked {
+                        payload: vec![0x01, 2, 3],
+                        parked_at_ms: 5678,
+                    },
+                )])),
             },
         );
         original
@@ -4568,6 +4605,10 @@ mod tests {
             load_sess.delivery, orig_sess.delivery,
             "a message held for an earlier one must survive the app closing"
         );
+        assert_eq!(
+            load_sess.parked, orig_sess.parked,
+            "a payload waiting for a PQ inject was acked to the relay: it must survive too"
+        );
 
         // Verify pending contacts
         assert!(loaded.pending_contacts.contains_key(&peer_token));
@@ -4609,6 +4650,7 @@ mod tests {
                 skip_dict: HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
+                parked: Default::default(),
             },
         );
 
@@ -4624,6 +4666,7 @@ mod tests {
                 skip_dict: HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
+                parked: Default::default(),
             },
         );
 
@@ -4637,6 +4680,7 @@ mod tests {
             skip_dict: HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
 
         let mut charlie_sender = SymmetricSessionState {
@@ -4649,6 +4693,7 @@ mod tests {
             skip_dict: HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
+            parked: Default::default(),
         };
 
         let mut bob_pkts = vec![];

@@ -1,5 +1,6 @@
 use crate::ordering::{DeliveryOrder, HeldMessage};
 use crate::pq::{Ciphertext, PublicKey, SecretKey};
+use crate::transport::{Parked, ParkedPayloads};
 use crate::{
     AddIds, Client, RecvPqInjects, SessionOffer, SessionSetup, SymmetricSessionState, UserIdentity,
     first_add_id, routing_token_for, unlinked,
@@ -112,6 +113,18 @@ pub struct SymmetricSessionStateDto {
     pub delivery_next: Option<u64>,
     #[serde(default)]
     pub held_messages: Vec<HeldMessageDto>,
+    // The peer's payloads waiting for a PQ inject (see `ParkedPayloads`).
+    // Older state files predate them.
+    #[serde(default)]
+    pub parked_payloads: Vec<ParkedDto>,
+}
+
+/// A `Parked` payload, by its seq number.
+#[derive(Serialize, Deserialize)]
+pub struct ParkedDto {
+    pub seq: u64,
+    pub payload: String,
+    pub parked_at_ms: u64,
 }
 
 /// A `HeldMessage`, by the ratchet position of its first chunk.
@@ -185,6 +198,16 @@ impl ClientStateDto {
                             last: held.last,
                             text: held.text.as_ref().map(hex::encode),
                             held_at_ms: held.held_at_ms,
+                        })
+                        .collect(),
+                    parked_payloads: state
+                        .parked
+                        .0
+                        .iter()
+                        .map(|(&seq, parked)| ParkedDto {
+                            seq,
+                            payload: hex::encode(&parked.payload),
+                            parked_at_ms: parked.parked_at_ms,
                         })
                         .collect(),
                 },
@@ -370,6 +393,17 @@ impl ClientStateDto {
                 );
             }
 
+            let mut parked = ParkedPayloads::default();
+            for dto in dto_state.parked_payloads {
+                parked.0.insert(
+                    dto.seq,
+                    Parked {
+                        payload: hex::decode(&dto.payload)?,
+                        parked_at_ms: dto.parked_at_ms,
+                    },
+                );
+            }
+
             e2e_sessions.insert(
                 tok,
                 SymmetricSessionState {
@@ -385,6 +419,7 @@ impl ClientStateDto {
                         applied_through: dto_state.pq_applied_through,
                     },
                     delivery,
+                    parked,
                 },
             );
         }
