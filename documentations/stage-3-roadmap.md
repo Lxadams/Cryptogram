@@ -45,6 +45,8 @@ Items are ordered by how much they buy for the effort. The constant-rate tunnel 
 
 ## Phase 0: quick wins (week 1)
 
+**Status:** done on `Logan/Bug-Fixes` (8 October 2026), apart from pinning the toolchain (0.7). Each item ends with what was built, where that differs from the plan.
+
 ### 0.1 Retry and repeat the handshake
 
 **The problem:** `perform_handshake` sends one init and gives up after 5 s. At 70% loss each way that fails 91% of the time, and the user has to press Connect again.
@@ -57,14 +59,24 @@ Items are ordered by how much they buy for the effort. The constant-rate tunnel 
 
 - **Where:** `perform_handshake` (`code/client/src/lib.rs`), `handle_request` (`code/server/src/main.rs`).
 - **Done when:** `lossy_link` connects at 70% loss.
+- **Done:**
+  - **As planned:** the client retries for a minute. The relay reuses its reply for as long as the link it opened is waiting for a sync (a minute).
+  - **Reconnecting:** a client now reconnects after two minutes without hearing from the relay, not after one unanswered sync, which heavy loss alone often caused.
+  - **Result:** `lossy_link` connects through 70% loss, in 0.4 to 6.4 s in the runs so far.
 
 ### 0.2 Block screenshots
 
 Set `FLAG_SECURE` in `MainActivity.onCreate`. That blocks screenshots and screen recording, and blanks the app's thumbnail in recent apps.
 
+**Done.** It blocks screenshots of your own QR code too, so that has to be shown in person.
+
 ### 0.3 Notifications without names
 
 New-message notifications say "From <name>" on the lock screen (`message_notification_text`). Show just "New message" by default, and make showing names a setting.
+
+**Done:**
+- **The setting:** "Say who each message is from in notifications", under Settings on the identity card, adds "From <name>". It's off by default, and saved with the identity.
+- **Where it shows:** only on Android, the one platform that posts notifications.
 
 ### 0.4 Make the README match the code
 
@@ -74,11 +86,15 @@ New-message notifications say "From <name>" on the lock screen (`message_notific
 
 **Why it matters:** a security reviewer who spots one overclaim stops trusting the rest. Say what's built, and link this roadmap for what isn't.
 
+**Done.**
+
 ### 0.5 Relay hygiene
 
 - **Key file permissions:** write `server_identity.json` with mode 0600. `fs::write` uses the default, which is usually world-readable.
 - **Non-root:** run the container as a non-root user (`USER` in `code/server/Dockerfile`) with a read-only root filesystem (`--read-only` in `deploy.yml`).
 - **No core dumps:** turn them off (`--ulimit core=0`), so a crash can't write queued messages or the relay key to disk. The relay is meant to keep everything in RAM.
+
+**Done:** all three. The relay also turns core dumps off itself at startup, for when it's run outside Docker. On Linux, it also stops other processes run by its user from reading its memory.
 
 ### 0.6 ML-KEM instead of round-3 Kyber
 
@@ -86,13 +102,30 @@ New-message notifications say "From <name>" on the lock screen (`message_notific
 - **The fix:** switch to `ml-kem` (RustCrypto) or `pqcrypto-mlkem`.
 - **What changes on the wire:** ML-KEM-768's keys and ciphertexts are the same sizes, so no packet changes size. The two don't interoperate, though, so clients update together, as with Stage 2.
 
+**Done:**
+- **The library:** `libcrux-ml-kem`, Cryspen's formally verified implementation, behind `code/client/src/pq.rs`.
+- **Why not `pqcrypto-mlkem`:** it's flagged unmaintained (RUSTSEC-2026-0161).
+- **Saved identities:** ones with Kyber keys load as ML-KEM keys, as the layouts match.
+
 ### 0.7 Dependency checks in CI
 
 Add `cargo deny check` (advisories, licences, banned and duplicate crates) and `cargo audit` to `pr_build.yml`. Pin the toolchain in `rust-toolchain.toml`.
 
+**Done:**
+- **The check:** `pr_build.yml` runs `cargo deny check` for every crate, with the rules in `code/deny.toml`.
+- **No `cargo audit`:** cargo-deny reads the same RustSec database, so it would add nothing.
+- **Duplicate crates are allowed:** Tauri brings in dozens, which would bury anything that matters.
+
+**Not done:** the toolchain pin. The Docker image (`rust:1-slim`), CI and the Android build would all have to follow it, so it waits until a new Rust release actually breaks a build.
+
 ### 0.8 Handshake rate limit
 
 Each handshake costs the relay a key agreement and a signature, and anyone can send them. Stage 2 bounds the memory this takes, but not the CPU. Add a token bucket per source address (or per /24), so no one sender can take up the relay's CPU.
+
+**Done:**
+- **The limit:** per address, with an IPv6 address counted by its /64: a burst of 20, then one a second.
+- **What's free:** copies of an init already answered don't count.
+- **What's left:** someone spoofing many addresses still gets through. A stateless cookie, as QUIC's Retry does, would stop that.
 
 ### 0.9 Stronger passcode hashing
 
@@ -100,9 +133,13 @@ Each handshake costs the relay a key agreement and a signature, and anyone can s
 - **The fix:** raise the cost, to 64 MiB and three passes say, after timing it on the slowest phone you support. The parameters are stored with each hash, so existing identities still unlock.
 - **It's a stopgap:** 2.4 is the real fix.
 
+**Done:** 64 MiB and three passes, about 0.1 s per login on a laptop. **Still to do:** time it on the slowest phone you support.
+
 ### 0.10 No Google Play services by default
 
 On Android, the QR scanner's `BarcodeDetector` is Google's ML Kit, running through Play services. Turn it off by default and keep `rqrr`. A setting can turn it back on for anyone who wants its better scanning.
+
+**Done:** the scanner uses `rqrr` alone unless "Also use this device's own scanner" is ticked. The choice is remembered on that device.
 
 ## Phase 1: the constant-rate tunnel
 

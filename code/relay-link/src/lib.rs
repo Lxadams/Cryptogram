@@ -851,10 +851,7 @@ mod tests {
         let relay_secret = EphemeralSecret::random_from_rng(OsRng);
         let relay_ephemeral = X25519PublicKey::from(&relay_secret);
         let resp = handshake_resp(&relay, &client_ephemeral, &relay_ephemeral, &[9, 9, 9, 9]);
-        assert!(
-            REPLY_COPIES * resp.len() < init.len(),
-            "never an amplifier"
-        );
+        assert!(REPLY_COPIES * resp.len() < init.len(), "never an amplifier");
         let (session_id, got_ephemeral) =
             parse_handshake_resp(&resp, &relay.verifying_key(), &client_ephemeral).unwrap();
         assert_eq!(session_id, [9, 9, 9, 9]);

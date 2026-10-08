@@ -26,6 +26,8 @@ pub fn run() {
             commands::connection_requests,
             commands::set_connection_requests_muted,
             commands::dismiss_connection_request,
+            commands::notification_settings,
+            commands::set_notify_with_names,
             commands::send_message,
             commands::poll_inbox,
             commands::chat_history,

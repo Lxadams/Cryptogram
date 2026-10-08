@@ -421,6 +421,13 @@ button.danger {
   margin: 0.5rem 0 0;
 }
 
+.identity-details .setting {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
 .copy-btn.copied {
   color: var(--ok);
   border-color: var(--ok);

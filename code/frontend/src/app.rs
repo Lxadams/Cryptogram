@@ -836,7 +836,9 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
 /// automatically as part of the KeyExchange once you connect to someone,
 /// so peers see "alice" in their contact list without typing anything
 /// themselves (see `Client::local_name` / `contact_names` in
-/// code/client/src/lib.rs).
+/// code/client/src/lib.rs). Settings fold away under it too, where there
+/// are any: so far just whether notifications name senders, on devices
+/// that post them.
 #[component]
 fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
     let show_qr = RwSignal::new(false);
@@ -844,6 +846,12 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
         contact_code::encode(&identity.routing_token, &identity.ed25519_public)
             .and_then(|code| qr::svg_for(&code)),
     );
+    let notifications = RwSignal::new(None::<api::NotificationSettingsDto>);
+    leptos::task::spawn_local(async move {
+        if let Ok(settings) = api::notification_settings().await {
+            notifications.try_set(Some(settings));
+        }
+    });
 
     view! {
         <div class="identity-card">
@@ -876,6 +884,29 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
                     <CopyButton value=identity.ed25519_public />
                 </p>
             </details>
+            // Read once it's loaded, then left to the checkbox: setting the
+            // signal again would redraw the panel and fold it shut.
+            {move || notifications.get().filter(|n| n.posted).map(|n| view! {
+                <details class="identity-details">
+                    <summary>"Settings"</summary>
+                    <label class="setting">
+                        <input
+                            type="checkbox"
+                            prop:checked=n.with_names
+                            on:change=move |ev| {
+                                let on = event_target_checked(&ev);
+                                leptos::task::spawn_local(async move {
+                                    let _ = api::set_notify_with_names(on).await;
+                                });
+                            }
+                        />
+                        "Say who each message is from in notifications"
+                    </label>
+                    <p class="hint">
+                        "Off by default: notifications can show on the lock screen, where anyone holding your phone can read them."
+                    </p>
+                </details>
+            })}
             <Show when=move || show_qr.get()>
                 <Modal title="Your QR code" on_close=Callback::new(move |()| show_qr.set(false))>
                     {match qr_svg.get_value() {

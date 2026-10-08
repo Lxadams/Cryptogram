@@ -756,6 +756,26 @@ mod tests {
         let names = list_pseudonyms_sync(&root);
         assert_eq!(names, vec!["dave".to_string(), "erin".to_string()]);
     }
+
+    #[test]
+    fn test_notifications_name_senders_only_once_allowed() {
+        let root = scratch_dir("notification_sender");
+        let mut client = Client::new(test_addr());
+        client.state_path = root.join("state.json").to_string_lossy().into_owned();
+        let named = [1u8; 16];
+        let unnamed = [0xab; 16];
+        client.contact_names.insert(named, "bob".to_string());
+
+        assert_eq!(notification_sender(&client, &named), None);
+        assert_eq!(notification_sender(&client, &unnamed), None);
+
+        client.set_notify_with_names(true);
+        assert_eq!(notification_sender(&client, &named).as_deref(), Some("bob"));
+        assert_eq!(
+            notification_sender(&client, &unnamed).as_deref(),
+            Some("abababab")
+        );
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -993,13 +1013,27 @@ fn spawn_receive_loop(
             };
             let inbox_before = rt.client.inbox.len();
             let replies = rt.client.handle_relay_packet(&buf[..len]);
-            for _ in inbox_before..rt.client.inbox.len() {
-                background::message_received();
+            for (from, _, _) in &rt.client.inbox[inbox_before..] {
+                background::message_received(notification_sender(&rt.client, from).as_deref());
             }
             for packet in replies {
                 let _ = socket.send_to(&packet, rt.client.server_addr).await;
             }
         }
+    })
+}
+
+/// Who a new-message notification says a message is from: nobody, unless
+/// the user lets notifications name senders (see
+/// `Client::notify_with_names`). Then it's the contact's name, or failing
+/// that the start of their routing token.
+fn notification_sender(client: &Client, from: &RoutingToken) -> Option<String> {
+    client.notify_with_names().then(|| {
+        client
+            .contact_names
+            .get(from)
+            .cloned()
+            .unwrap_or_else(|| hex::encode(&from[..4]))
     })
 }
 
@@ -1109,6 +1143,39 @@ pub async fn set_connection_requests_muted(
     let mut guard = state.runtime.lock().await;
     let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
     rt.client.set_requests_muted(muted);
+    Ok(())
+}
+
+/// What `notification_settings` reports.
+#[derive(Serialize, Clone)]
+pub struct NotificationSettingsDto {
+    /// Whether this device posts new-message notifications at all. Only
+    /// Android does (see `background`).
+    pub posted: bool,
+    /// Whether they say who each message is from.
+    pub with_names: bool,
+}
+
+/// How new-message notifications work here (see `NotificationSettingsDto`).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn notification_settings(
+    state: State<'_, AppState>,
+) -> Result<NotificationSettingsDto, String> {
+    let guard = state.runtime.lock().await;
+    let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
+    Ok(NotificationSettingsDto {
+        posted: cfg!(target_os = "android"),
+        with_names: rt.client.notify_with_names(),
+    })
+}
+
+/// Let new-message notifications say who each message is from, or not (see
+/// `Client::set_notify_with_names`). Saved with the identity.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_notify_with_names(state: State<'_, AppState>, on: bool) -> Result<(), String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    rt.client.set_notify_with_names(on);
     Ok(())
 }
 

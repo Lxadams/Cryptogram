@@ -233,6 +233,32 @@ pub async fn dismiss_connection_request(token_hex: &str) -> Result<(), String> {
     .await
 }
 
+/// Mirrors `NotificationSettingsDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct NotificationSettingsDto {
+    /// Whether this device posts new-message notifications at all (only
+    /// Android does).
+    pub posted: bool,
+    /// Whether they say who each message is from.
+    pub with_names: bool,
+}
+
+/// How new-message notifications work on this device.
+pub async fn notification_settings() -> Result<NotificationSettingsDto, String> {
+    call("notification_settings", &()).await
+}
+
+#[derive(Serialize)]
+struct NotifyWithNamesArgs {
+    on: bool,
+}
+
+/// Let new-message notifications say who each message is from, or not.
+/// Saved with the identity.
+pub async fn set_notify_with_names(on: bool) -> Result<(), String> {
+    call("set_notify_with_names", &NotifyWithNamesArgs { on }).await
+}
+
 #[derive(Serialize)]
 struct SendMessageArgs<'a> {
     token_hex: &'a str,

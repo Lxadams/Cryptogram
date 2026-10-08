@@ -18,7 +18,7 @@ Because ML-KEM-768 public keys are 1184 bytes (far too large for a reliable QR c
 1.  **Local Key Generation** (`UserIdentity::generate()`): The Rust core generates three long-term keypairs:
     *   **Ed25519** (`ed25519-dalek`): For identity signing and payload authentication.
     *   **X25519** (`x25519-dalek`): For classical Diffie-Hellman key exchange.
-    *   **ML-KEM-768** (FIPS 203, `pqcrypto-mlkem`): For post-quantum key encapsulation.
+    *   **ML-KEM-768** (FIPS 203, Cryspen's formally verified `libcrux-ml-kem`): For post-quantum key encapsulation.
     *   A random 16-byte **Routing Token** is also generated to identify this client on the relay.
 2.  **Micro-QR Code Display**: The UI displays a QR code containing only the 16-byte `RoutingToken` + 32-byte `Ed25519 VerifyingKey`. Total: **48 bytes**.
 3.  **Scanning & Trust**: Alice scans Bob's QR code. She now has a cryptographically authenticated binding between Bob's Routing Token and his Ed25519 identity.

@@ -1,9 +1,10 @@
 //! Real-network check of the FEC transport: two clients (Alice and Bob,
 //! in this one process) talk through the real relay over real UDP. Each
-//! client sits behind a tiny proxy that can drop packets; once their E2E
-//! session is up, the jammed peer's proxy loses `loss` of everything it
-//! carries in both directions — so Alice -> Bob exercises a jammed sender
-//! and Bob -> Alice a jammed receiver (with the default `jammed=alice`).
+//! client sits behind a tiny proxy that can drop packets. The jammed peer's
+//! proxy loses `loss` of everything it carries in both directions while
+//! that peer connects to the relay (the handshake), and again once their
+//! E2E session is up — so Alice -> Bob exercises a jammed sender and
+//! Bob -> Alice a jammed receiver (with the default `jammed=alice`).
 //!
 //!   cargo run --example lossy_link -- <relay_pubkey_hex> [loss] [jammed] [messages]
 //!
@@ -19,6 +20,7 @@ use anyhow::{Result, anyhow, bail};
 use client::{Client, RoutingToken, parse_verifying_key, perform_handshake, send_burst};
 use ed25519_dalek::VerifyingKey;
 use rand_core::{OsRng, RngCore};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -120,7 +122,14 @@ struct Peer {
 }
 
 impl Peer {
-    async fn start(name: &str, relay: SocketAddr, relay_pub: &VerifyingKey) -> Result<Self> {
+    /// A client behind a proxy of its own, connected to the relay through
+    /// `connect_loss` loss each way.
+    async fn start(
+        name: &str,
+        relay: SocketAddr,
+        relay_pub: &VerifyingKey,
+        connect_loss: f64,
+    ) -> Result<Self> {
         let proxy = LossyProxy::start(relay).await?;
         let mut client = Client::new(proxy.addr);
         client.local_name = name.to_string();
@@ -129,7 +138,23 @@ impl Peer {
             .to_string_lossy()
             .into_owned();
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        proxy.jam(connect_loss);
+        let started = Instant::now();
         perform_handshake(&mut client, &socket, relay_pub).await?;
+        let (dropped, carried) = proxy.take_counts();
+        println!(
+            "{name}: connected in {:.1}s through {:.0}% loss ({dropped}/{} packets dropped)",
+            started.elapsed().as_secs_f64(),
+            connect_loss * 100.0,
+            dropped + carried,
+        );
+        proxy.jam(0.0);
+        // The syncs `perform_handshake` ends with may have been lost too,
+        // leaving the relay not knowing where we are. The app's next
+        // keepalive tick syncs again; this is that tick, on a clean link.
+        for packet in client.keepalive() {
+            socket.send_to(&packet, proxy.addr).await?;
+        }
         let (token, ed25519) = (
             client.identity.routing_token,
             client.identity.ed25519_public,
@@ -161,8 +186,15 @@ impl Peer {
     }
 }
 
-/// Send `count` messages from `from` to `to` as paced FEC bursts, give
-/// stragglers a moment, then check what arrived. Returns how many arrived.
+/// How long after the last burst `one_way` waits for everything to arrive.
+/// The relay sends each recipient's packets 5 ms apart, so 30 messages'
+/// symbols take about 6 s to leave it, and it resends anything not acked:
+/// 2 s later, then backing off.
+const DELIVERY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Send `count` messages from `from` to `to` as paced FEC bursts, then wait
+/// until they've all arrived, or `DELIVERY_DEADLINE` passes. Returns how
+/// many arrived.
 async fn one_way(from: &Peer, to: &Peer, count: usize, label: &str) -> Result<usize> {
     let _ = to.client.lock().await.drain_inbox(); // start from an empty inbox
     from.proxy.take_counts();
@@ -179,25 +211,29 @@ async fn one_way(from: &Peer, to: &Peer, count: usize, label: &str) -> Result<us
         send_burst(&from.socket, server_addr, &packets).await?;
         sent.push(text);
     }
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let mut got: Vec<String> = to
-        .client
-        .lock()
-        .await
-        .drain_inbox()
-        .into_iter()
-        .map(|(_, pt, _)| String::from_utf8_lossy(&pt).into_owned())
-        .collect();
-    got.sort();
-    sent.sort();
-    let delivered = sent.iter().filter(|s| got.binary_search(s).is_ok()).count();
+    let last_sent = Instant::now();
+    let mut got = HashSet::new();
+    while sent.iter().any(|s| !got.contains(s)) && last_sent.elapsed() < DELIVERY_DEADLINE {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        got.extend(
+            to.client
+                .lock()
+                .await
+                .drain_inbox()
+                .into_iter()
+                .map(|(_, pt, _)| String::from_utf8_lossy(&pt).into_owned()),
+        );
+    }
+    let waited = last_sent.elapsed();
+    let delivered = sent.iter().filter(|s| got.contains(*s)).count();
 
     let (a_dropped, a_carried) = from.proxy.take_counts();
     let (b_dropped, b_carried) = to.proxy.take_counts();
     let pct = |d: usize, c: usize| 100.0 * d as f64 / (d + c).max(1) as f64;
     println!(
-        "{label}: {delivered}/{count} delivered | sender's link dropped {a_dropped}/{} ({:.1}%), receiver's link dropped {b_dropped}/{} ({:.1}%)",
+        "{label}: {delivered}/{count} delivered, {:.1}s after the last was sent | sender's link dropped {a_dropped}/{} ({:.1}%), receiver's link dropped {b_dropped}/{} ({:.1}%)",
+        waited.as_secs_f64(),
         a_dropped + a_carried,
         pct(a_dropped, a_carried),
         b_dropped + b_carried,
@@ -221,8 +257,16 @@ async fn main() -> Result<()> {
         .next()
         .ok_or_else(|| anyhow!("can't resolve {relay_raw}"))?;
 
-    let alice = Peer::start("alice", relay, &relay_pub).await?;
-    let bob = Peer::start("bob", relay, &relay_pub).await?;
+    let loss_for = |peer: &str| {
+        if jammed == peer || jammed == "both" {
+            loss
+        } else {
+            0.0
+        }
+    };
+    let (alice_loss, bob_loss) = (loss_for("alice"), loss_for("bob"));
+    let alice = Peer::start("alice", relay, &relay_pub, alice_loss).await?;
+    let bob = Peer::start("bob", relay, &relay_pub, bob_loss).await?;
 
     // Contact exchange on a clean link (QR codes in the real app; out of
     // scope for the lossy part). Each adds the other.
@@ -246,12 +290,8 @@ async fn main() -> Result<()> {
         loss * 100.0
     );
 
-    if matches!(jammed.as_str(), "alice" | "both") {
-        alice.proxy.jam(loss);
-    }
-    if matches!(jammed.as_str(), "bob" | "both") {
-        bob.proxy.jam(loss);
-    }
+    alice.proxy.jam(alice_loss);
+    bob.proxy.jam(bob_loss);
 
     let to_bob = one_way(&alice, &bob, messages, "alice->bob").await?;
     let to_alice = one_way(&bob, &alice, messages, "bob->alice").await?;

@@ -79,11 +79,12 @@ class MessageService : Service() {
         }
 
         /**
-         * Shows (or updates) the new-message notification. It says only how
-         * many messages came, never who sent them or what they say, so the
-         * lock screen gives nothing away.
+         * Shows (or updates) the new-message notification. It says how many
+         * messages came, never what they say. It says who the latest is
+         * [from] only if the user turned that on: by default the lock screen
+         * gives nothing away.
          */
-        fun notifyMessage(context: Context) {
+        fun notifyMessage(context: Context, from: String?) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                 ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED
@@ -100,6 +101,7 @@ class MessageService : Service() {
             val notification = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
                 .setSmallIcon(R.drawable.ic_stat_message)
                 .setContentTitle(title)
+                .setContentText(from?.let { context.getString(R.string.message_notification_text, it) })
                 .setContentIntent(openAppIntent(context))
                 .setAutoCancel(true)
                 .setCategory(NotificationCompat.CATEGORY_MESSAGE)

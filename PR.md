@@ -1,4 +1,4 @@
-Logan - Bug Fixes: close the open holes, plus easier contact adding and QR scanning
+Logan - Bug Fixes: close the open holes, easier contact adding and QR scanning, and the Stage 3 quick wins
 
 Closes issue: #40
 
@@ -82,6 +82,49 @@ Closes issue: #40
 - **Nothing is promised to a contact that couldn't be saved.** An establisher doesn't offer a session it couldn't save, and a responder neither takes one in nor confirms it (it rolls back). Before, a failed save after confirming could leave the two sides on different sessions after a restart.
 - **Closing the connection-request pop-up** (the X, a click outside it, or Escape) only hides that request until the app restarts. "Not now" still hides that person for a day, as before. A stray tap used to count as "Not now".
 
+### Stage 3 quick wins
+
+Phase 0 of the new [Stage 3 roadmap](documentations/stage-3-roadmap.md), apart from pinning the toolchain.
+
+**Transport and relay**
+- **Handshakes get through heavy loss.**
+  - **Client:** it sends each init three times, 200 ms apart, and tries again with the same init every 3 s, for up to a minute.
+  - **Relay:** it sends its reply three times. A copy of an init it answered in the last minute gets the same reply, so the copies don't open extra links.
+  - **No amplification:** the init is padded to 320 bytes, which is still more than the three replies together.
+  - **The result:** at 70% loss each way, one attempt gets through about half the time, up from 9%.
+- **Reconnecting waits for two minutes of silence** (see "They reconnect by themselves" above). Before, one unacked sync was enough, and heavy loss alone often caused that.
+- **Handshakes are rate-limited per address:** a burst of 20, then one a second, with an IPv6 address counted by its /64. Each handshake costs the relay a key agreement and a signature.
+- **Relay hygiene:**
+  - **Identity file:** written readable by the relay's own user only (0600).
+  - **Container:** the Docker image runs the relay as a non-root user. `deploy.yml` and `docker-compose.yml` add a read-only filesystem, no capabilities and no core dumps.
+  - **Core dumps:** the relay also turns them off itself at startup.
+
+**Crypto**
+- **ML-KEM-768 (FIPS 203) replaces round-3 Kyber.**
+  - **The library:** Cryspen's formally verified `libcrux-ml-kem`, behind `client/src/pq.rs`.
+  - **Why:** `pqcrypto-kyber` implements round 3, not the standard, and `pqcrypto-mlkem` is flagged unmaintained.
+  - **Compatibility:** the sizes are unchanged, and saved Kyber keys load as ML-KEM keys.
+- **Passcode hashing costs more.**
+  - **Parameters:** Argon2id at 64 MiB and three passes, up from 19 MiB and two. That's about 0.1 s per login on a laptop.
+  - **Existing identities** still unlock, as the parameters are stored with each hash.
+
+**Android**
+- **No screenshots** (`FLAG_SECURE`). Screenshots and screen recording are blocked, and the app is blank in recent apps. That includes your own QR code.
+- **Notifications don't name anyone by default.**
+  - **What they say:** "New message", or how many.
+  - **The setting:** "Say who each message is from in notifications", under Settings on the identity card, adds "From <name>". It's saved with the identity.
+  - **New Tauri commands:** `notification_settings` and `set_notify_with_names`.
+- **Google's scanner is opt-in.** The QR scanner decodes with `rqrr` alone unless "Also use this device's own scanner" is ticked, which is remembered per device. On Android, that scanner is Google Play services' ML Kit.
+
+**Tooling and docs**
+- **`cargo deny check` runs in CI for every crate.**
+  - **What it checks:** known vulnerabilities, unmaintained or yanked crates, licences, and crates.io as the only source.
+  - **The rules** are in `code/deny.toml`, and all six crates pass.
+- **`lossy_link`** jams the handshake too. It now waits up to 60 s for every message, instead of counting what arrived within 2 s: the relay sends a recipient's packets 5 ms apart, so 30 messages take about 6 s to leave it.
+- **Docs:**
+  - **The README** says what's built (a hash ratchet with PQ refreshes, no cover traffic yet), and links the roadmap for the rest.
+  - **Also updated:** the relay's README, ANDROID.md and the crypto flow.
+
 ### Changes in this PR:
 
 **Stage 2: closing the open holes**
@@ -156,6 +199,7 @@ Everything here is breaking. **Deploy the relay and update every client together
   - **Packet sizes:** chat packets to a contact (FEC symbols) are 1,146 bytes, with their admission tag, and KeyExchanges to a contact are 1,447 (1,439 before the tag is known), inside a PPPoE link's 1,464. Both are pinned by tests.
   - **Presence:** `PresencePayload` (`0x06`) no longer exists.
   - **Contact QR codes:** now `CG2:`. Old and new builds can't read each other's codes.
+  - **ML-KEM:** keys and ciphertexts keep their sizes, but ML-KEM and round-3 Kyber derive different secrets, so an old and a new client can't set up a session.
 - **Everyone has to re-add their contacts.** An identity saved before this change has a random routing token it can't prove to the relay. So on first load it gets a new token derived from a fresh token key, and its old contacts are removed, since they could only reach the old token. The log says so. Their chat history is left with no way to view it.
 - **Every build needs `SERVER_PUBKEY`.** Without it, Connect fails with an error explaining what's missing.
   - Desktop: `runpeer.sh` sets it for a local relay.
@@ -171,15 +215,21 @@ Everything here is breaking. **Deploy the relay and update every client together
   | Crate | Tests |
   |---|---|
   | relay-link (new) | 11 |
-  | Relay | 40 |
-  | Client | 141 |
-  | Tauri backend | 14 |
+  | Relay | 44 |
+  | Client | 144 |
+  | Tauri backend | 15 |
   | Frontend | 10 |
+
+  - **From the quick wins:**
+    - relay: copies of a handshake init get one link; handshakes from one address are rate-limited; sync acks go out several times; the identity file is private
+    - relay-link: the three replies together are smaller than the init
+    - client: a handshake gets through a lost attempt (over real UDP); ML-KEM keys round-trip and malformed ones are refused; the notification setting is saved
+    - Tauri backend: notifications name senders only once that's turned on
 
   - **From the second review** (each fails without its fix):
     - relay: an old link can't reclaim its token after the token's metadata expired; a link syncs one token; replayed syncs and data packets are refused from any address; a replayed path response can't move a link; a forwarded packet bounced back is refused; handshakes are refused while the link table is full; the admission table is capped; tagless queues share a budget; links nobody syncs on expire in a minute
     - relay-link: each direction has its own key; a packet is taken in once; lanes are windowed apart; the replay window's edges; the handshake init's padding
-    - client: adding your own code is refused; a late KeyExchange from a contact still carries the setup on, without its name; the setup completes when the second KeyExchange arrives late, or when the whole first round is lost; late connection requests are listed; resends back off, stop, and restart on progress; contact status goes pending, connecting, connected; unsaved sessions are neither offered nor taken in; unacked syncs lead to a new handshake that only the pinned relay can answer, then a sync and resends on the new link; unanswered handshakes are retried
+    - client: adding your own code is refused; a late KeyExchange from a contact still carries the setup on, without its name; the setup completes when the second KeyExchange arrives late, or when the whole first round is lost; late connection requests are listed; resends back off, stop, and restart on progress; contact status goes pending, connecting, connected; unsaved sessions are neither offered nor taken in; two minutes without hearing from the relay lead to a new handshake that only the pinned relay can answer, then a sync and resends on the new link; unanswered handshakes are retried, and stray packets ignored
   - **relay-link:**
     - a sealed packet opens only as sealed, with its type, session ID and packet number tamper-proof
     - the handshake gives both ends one key, and its reply fits only its own handshake, relay and session ID
@@ -212,15 +262,19 @@ Everything here is breaking. **Deploy the relay and update every client together
     - the handshake takes the relay's session ID and refuses an impostor's reply
     - path challenges are answered
     - an old identity migrates to a provable token and loses its contacts
-  - **Tauri backend: 14.** The trust-on-first-use pinning tests are removed with the feature.
+  - **Tauri backend: 15.** The trust-on-first-use pinning tests are removed with the feature.
   - **Frontend: 10:**
     - RFC 9285's Base45 examples, round trips and damaged codes
     - the old-version message
     - the code's size pinned at 29×29
     - `rqrr` reading back what's drawn
 - **End to end, against the real relay over real UDP:**
-  - **`lossy_link` at 70% loss, re-run after the second review's fixes:** 10/10 messages each way with Alice's link jammed, and again with Bob's, with both ratchets in step.
-  - **Relay restart, with two CLI clients (a temporary harness, not committed):** they connect and message, adding your own code is refused, then the relay is restarted. Both notice their syncs going unacked, redo the handshake by themselves, and messages flow both ways again.
+  - **`lossy_link` at 70% loss, re-run after the quick wins:** with Alice's link jammed, and again with Bob's.
+    - **Connecting:** the jammed side connects through the loss: Alice in 0.4 s, Bob in 6.4 s after two lost attempts.
+    - **Messages:** 30/30 each way, with both ratchets in step. The direction with the jammed receiver completes about 7 s after the last send.
+  - **Relay restart, with two CLI clients (a temporary harness, not committed), re-run after the quick wins:**
+    - **Before the restart:** they connect and message, and adding your own code is refused.
+    - **After it:** both notice the relay has gone quiet and redo the handshake by themselves, about two minutes later. Messages then flow both ways again.
   - **A temporary harness (not committed):**
     - an attacker's handshake gets its own session
     - Bob's sync replayed from the attacker's address only gets a challenge
@@ -228,11 +282,13 @@ Everything here is breaking. **Deploy the relay and update every client together
     - when Bob moves to a new socket, he answers the challenge and his messages follow him
   - **`--print-pubkey` with no identity:** fails with directions and creates nothing.
 - **`install-apk.sh`, with fake `adb` binaries simulating WSL:** the emulator goes through WSL's adb, and a USB phone through Windows'.
+- **Android, after the quick wins:** the app's Rust library cross-compiles for arm64, and its Kotlin compiles.
 - **Not re-run since the review fixes:**
-  - the Android builds and emulator runs
+  - building and running an APK, on the emulator or a phone
   - the two-phone test (worth including adding someone while they're offline, and a relay restart)
 - **Not tested yet:**
   - the full two-phone handshake with the new pop-up
+  - on a real phone: notifications with and without names, and the screenshot block
   - the camera changes (resolution, autofocus, the Samsung's `BarcodeDetector`, the decode cap) on a real phone
   - Connect from the emulator to the relay
   - clicking through the desktop app
@@ -242,8 +298,11 @@ Everything here is breaking. **Deploy the relay and update every client together
 - **The pop-up needs the app open.** No Android notification is posted for connection requests.
 - **The requester's token isn't proven to the receiver.** The pop-up only prompts a scan, and the scan is the trust step.
 - **Contacts are trusted with your queue.** A contact's tag only proves they're a contact, so a malicious contact can still fill your contacts' queue. Contacts beyond the 64 a sync registers share the small queue for strangers.
-- **Handshakes still cost the relay CPU.** Each is a DH and a signature for an unauthenticated packet. The caps keep memory bounded, but a flood can still use CPU, and while the link table is full, new clients can't connect. A stateless cookie, as QUIC's Retry does, or a per-address rate limit would close it.
-- **Messages sent while a link is down are lost.** That's from the relay going away until the client notices, about 25 s at most. Nothing resends a message end to end.
+- **Handshakes from many addresses still cost the relay CPU.** Each is a DH and a signature for an unauthenticated packet.
+  - **What's covered:** the caps keep memory bounded, and handshakes are now rate-limited per address.
+  - **What isn't:** someone spoofing many addresses gets round the limit, and while the link table is full, new clients can't connect.
+  - **The fix:** a stateless cookie, as QUIC's Retry does.
+- **Messages sent while a link is down are lost.** That's from the relay going away until the client notices: up to about two and a quarter minutes now (two minutes of silence, then the next 15 s tick). Nothing resends a message end to end. The constant-rate tunnel (Phase 1 of the roadmap) queues them instead.
 - **Junk can fill the tagless budget.** Once the shared 64 MiB is full, packets for recipients who haven't synced since the relay restarted are refused until it expires, which can take up to 7 days.
 - **Packet numbers are in the clear,** so someone watching a link can count its packets (WireGuard's counters are too). QUIC's header protection hides them.
 - **The QUIC branch** replaces this link layer, so the link-layer fixes here are moot there. The client-side ones (the setup, resends, your own code, saving) need porting.

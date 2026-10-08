@@ -13,7 +13,7 @@ sequenceDiagram
     participant S as Relay Server
 
     Note over A, B: Phase 1: Physical Trust Exchange
-    A->>A: Generate Identity, DH, & Kyber Keys
+    A->>A: Generate Identity, DH, & ML-KEM Keys
     A->>B: Display QR Code (Routing Token + Ed25519 PubKey)
     B-->>A: Scan QR Code (Out-of-band)
     Note over A, B: Identity Trusted. 
@@ -34,11 +34,11 @@ sequenceDiagram
     A->>S: Encrypted 0x02 to Bob's Routing Token
     S->>B: Forward Packet
     B->>B: Verify Sig, TOFU Accept
-    B->>B: Encapsulate Kyber + DH Handshake
+    B->>B: Encapsulate ML-KEM + DH Handshake
     B->>B: Sign SessionEstablishPayload (0x04)
     B->>S: Encrypted 0x04 to Alice's Routing Token
     S->>A: Forward Packet
-    A->>A: Decapsulate Kyber & DH
+    A->>A: Decapsulate ML-KEM & DH
     Note over A, B: Derives identical Session Master Key! Secure E2E Session Established.
 ```
 
@@ -67,12 +67,12 @@ sequenceDiagram
     B->>B: Permanently Destroy Message Key (Forward Secrecy)
 
     Note over A, B: After 5 messages, PQ Injection occurs
-    A->>A: Encapsulate new secret against Bob's Kyber Key
+    A->>A: Encapsulate new secret against Bob's ML-KEM Key
     A->>A: Mix new PQ Secret into send_chain_key via HKDF
     A->>A: Sign PQInjectPayload
     A->>S: Link-Encrypted [0x05 | PQInjectPayload]
     S->>B: Forwards Packet
-    B->>B: Verify Sig, Decapsulate Kyber
+    B->>B: Verify Sig, Decapsulate ML-KEM
     B->>B: Mix new PQ Secret into recv_chain_key via HKDF
     Note over A, B: Chain Keys perfectly synchronized with refreshed Post-Quantum Secrecy!
 ```
@@ -151,7 +151,7 @@ graph TD
         subgraph Backend [Rust Core]
             TauriAPI[Tauri IPC Handlers]
             LibRS[lib.rs Cryptographic Core]
-            Crypto[Kyber & XChaCha20 Engine]
+            Crypto[ML-KEM & XChaCha20 Engine]
             Net[UDP Socket Manager]
             Storage[(Local JSON State)]
         end

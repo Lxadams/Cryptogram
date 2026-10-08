@@ -1,10 +1,10 @@
+use crate::pq::{Ciphertext, PublicKey, SecretKey};
 use crate::{
     AddIds, Client, RecvPqInjects, SessionOffer, SessionSetup, SymmetricSessionState, UserIdentity,
     first_add_id, routing_token_for, unlinked,
 };
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use crate::pq::{Ciphertext, PublicKey, SecretKey};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -28,8 +28,8 @@ pub struct ClientStateDto {
     #[serde(default)]
     pub contact_names: HashMap<String, String>,
     // Contacts' X25519 keys, add IDs, how each session came about, the
-    // add-ID counter and whether connection requests are muted (see
-    // `Client`). Older state files predate all of them, and may still carry
+    // add-ID counter, whether connection requests are muted and whether
+    // notifications may name senders (see `Client`). Older state files predate all of them, and may still carry
     // the `seen_session_keys` they replaced, which is ignored.
     #[serde(default)]
     pub peer_x25519_keys: HashMap<String, String>,
@@ -41,6 +41,8 @@ pub struct ClientStateDto {
     pub next_add_id: u32,
     #[serde(default)]
     pub requests_muted: bool,
+    #[serde(default)]
+    pub notify_with_names: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -220,6 +222,7 @@ impl ClientStateDto {
             session_setups,
             next_add_id: client.next_add_id,
             requests_muted: client.requests_muted,
+            notify_with_names: client.notify_with_names,
         }
     }
 
@@ -449,6 +452,7 @@ impl ClientStateDto {
             recent_deliveries: Default::default(), // live state, not persisted
             admission_changed: false, // live state, not persisted
             requests_muted: self.requests_muted,
+            notify_with_names: self.notify_with_names,
             connection_requests: Vec::new(), // live state, not persisted
             listed_requests: Default::default(), // live state, not persisted
             dismissed_requests: HashMap::new(), // live state, not persisted

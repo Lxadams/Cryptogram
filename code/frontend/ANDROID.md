@@ -214,8 +214,10 @@ that keeps it connected to the relay when it's not on screen. Android
 shows this as an ongoing "Connected" notification.
 
 - A message that arrives while the app is in the background shows a "New
-  message" notification. It never says who it's from, or shows the text.
-  Opening the app clears it.
+  message" notification. It never shows the text. It says who the message
+  is from only if you turn that on, under **Settings** on your identity
+  card, since notifications can show on the lock screen. Opening the app
+  clears it.
 - Swiping the app away from the recent-apps screen doesn't log you out. The
   app keeps receiving, and reopening it goes straight back to your chats.
 - **Log out** stops the service and the notification.
@@ -238,6 +240,13 @@ shows this as an ongoing "Connected" notification.
   delete the identity you're logged into.
 - **No backups.** Android's cloud backup and phone-to-phone transfer are
   switched off for this app, so identities never leave the phone.
+- **No screenshots.** The app blocks screenshots and screen recording, and
+  shows as blank on the recent-apps screen, so no other app can capture
+  your chats. That includes your QR code: show it to people in person.
+- **No Google scanner unless you want it.** The QR scanner decodes with the
+  app's own code. Ticking "Also use this device's own scanner" adds
+  Android's (Google Play services' ML Kit), which copes better with blur
+  and glare.
 
 ## Updating the app
 

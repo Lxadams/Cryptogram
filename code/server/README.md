@@ -8,7 +8,7 @@
 Storage-engine agnostic: for now using in-memory hashmaps; Redis can be considered for later if needed.
 
 ## Server Identity
-The server persists its Ed25519 identity to `server_identity.json` on first run. On subsequent boots, the same key is loaded automatically — clients do not need to update their server pubkey after restarts.
+The server persists its Ed25519 identity to `server_identity.json` on first run, readable by its own user only (mode 0600). On subsequent boots, the same key is loaded automatically — clients do not need to update their server pubkey after restarts.
 
 `server --print-pubkey` prints the key and exits. It never creates an identity: if there's none in the current directory yet, it says so and exits with an error, rather than making up a key no running relay has (which would be baked into every client built with it). Start the relay once to create one.
 
@@ -18,7 +18,17 @@ The packet formats, the handshake and the sync proof live in `code/relay-link`, 
 ```
 on_request(request):
     If a 'Handshake' request is received (type 0: client ephemeral X25519, then zero
-    padding, so the request is bigger than its reply and the relay is never an amplifier):
+    padding to 320 bytes, so the request is bigger than all the copies of its reply
+    put together, and the relay is never an amplifier):
+        If it's a copy of one answered in the last minute (the same client ephemeral
+        key) and that link is still there, send the same reply again. Clients send
+        every init several times, and the copies mustn't open more links.
+        Refuse it if its address has run out of handshakes: each address gets a burst
+        of 20, then one a second (an IPv6 address counts by its /64). A handshake
+        costs a key agreement and a signature, so no one sender can take up the CPU.
+        Up to MAX_HANDSHAKE_SOURCES (65,536) addresses are tracked; past that, a new
+        one isn't limited (MAX_LINKS still bounds what it can take), and the sweep
+        forgets addresses whose burst has refilled.
         Perform DH(ServerEph, ClientEph), derive a link key for each direction via
         HKDF-SHA256. (The handshake doesn't say who the client is: its sync proves that.)
         If the link table is full (MAX_LINKS, 100,000), refuse it.
@@ -27,7 +37,8 @@ on_request(request):
         session ID is in the clear on every packet, so it's the relay's to pick: nobody
         who sees one can take that link over by handshaking with it.)
         Sign (label || ClientPub || ServerPub || SessionId) with server Ed25519 identity.
-        Return handshake response (type 2: session ID + server ephemeral + signature).
+        Return handshake response (type 2: session ID + server ephemeral + signature),
+        three times (REPLY_COPIES), so one is likely to get through heavy loss.
     Every other request is a link packet: [type | session ID | packet number | AEAD],
     sealed with the client-to-relay key, the whole header authenticated too. Refuse it
     unless it's for a link we have, authenticates, and has a packet number not taken in
@@ -54,25 +65,10 @@ on_request(request):
         Replace the token's admission tags (kept 7 days, so they still protect it
         offline), unless it has none yet and the table is full (MAX_ADMISSION_ENTRIES,
         100,000): then its packets share one queue, as before tags existed.
-        Reply with a sync ack (type 8: the sync's packet number), so the client knows
-        its link is still here. A client whose syncs stop being acked (the relay
-        restarted, or its link expired) does the handshake again.
-        Wake the outbound task.
-    If a 'Sync' request is received (type 4: routing token + token public key + signature
-    + up to 64 8-byte admission tags):
-        Reject it unless the token is the hash of the public key and the signature, by
-        that key, covers a value derived from this link's key (so only the token's
-        owner can sync it, and only on its own link).
-        If it came from an address other than the link's, don't believe it yet (it may
-        be a copy someone captured and replayed from elsewhere): reply with a path
-        challenge (type 6) to that address, sealed with the link key, and change nothing.
-        Otherwise:
-        If the token was on another link before, delete that link, so nothing from it
-        (a replayed sync, say) can move the token back.
-        Update the 'Metadata' table with (routing_token, incoming IP, incoming port, expiry_timestamp).
-        If the address changed, or this token was silent for over 30 s (asleep), make
-        everything still queued for it due now, so it's resent straight away.
-        Replace the token's admission tags (kept 7 days, so they still protect it offline).
+        Reply with a sync ack (type 8: the sync's packet number), three times, so the
+        client hears from its link even through heavy loss. A client that hears
+        nothing from the relay for 2 minutes (it restarted, or the link expired) does
+        the handshake again.
         Wake the outbound task.
     If a 'Path Response' request is received (type 7: the challenge, echoed):
         If it answers a challenge for this link at the address it came from (from the
@@ -140,3 +136,5 @@ main():
 - Server has zero knowledge of user IDs or E2E keys
 - Refused packets (unknown links, forgeries, replays, malformed or rejected requests) are only logged at debug level, as anyone can send junk
 - All message payloads are stored encrypted in RAM only
+- At startup it turns off core dumps, and (on Linux) stops other processes of the same user from reading its memory, so a crash can't write link keys, queued messages or its identity key to disk
+- The Docker image runs it as an unprivileged user, and `deploy.yml` and `docker-compose.yml` give it a read-only filesystem (apart from `/data`, where its identity lives), no capabilities and no core dumps

@@ -139,10 +139,7 @@ mod tests {
 
         // Another key pair gets a different secret from the same ciphertext.
         let (_, other) = keypair();
-        assert_ne!(
-            decapsulate(&ciphertext, &other).as_bytes(),
-            sent.as_bytes()
-        );
+        assert_ne!(decapsulate(&ciphertext, &other).as_bytes(), sent.as_bytes());
     }
 
     #[test]

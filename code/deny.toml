@@ -1,0 +1,61 @@
+# cargo-deny's checks, shared by every crate under code/ (each is its own
+# project, not a workspace). CI runs them for each one:
+#
+#   cargo deny --config ../deny.toml check     (from code/<crate>)
+#
+# They cover what `cargo audit` does too: advisories come from the same
+# RustSec database.
+
+[advisories]
+version = 2
+# Every vulnerability fails the check. So does a crate we depend on directly
+# going unmaintained (deep in Tauri's tree, there are several we can't
+# replace), or a yanked release.
+yanked = "deny"
+unmaintained = "workspace"
+# Advisories accepted for now, each with its reason.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licences, and MPL-2.0 (file-level copyleft: it only binds
+# changes to the files themselves). It's on cssparser and selectors, which
+# Tauri parses HTML with, and option-ext.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+# One list serves every crate, so each crate uses only some of it.
+unused-allowed-license = "allow"
+
+# Our own crates aren't published (`publish = false`), so they need no
+# licence.
+[licenses.private]
+ignore = true
+
+[bans]
+# Tauri's tree has dozens of crates in two versions that we can't do
+# anything about, and warning on them would bury anything that matters.
+multiple-versions = "allow"
+# No `*` versions, except between our own crates (path dependencies).
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: nothing from another registry or straight from git.
+unknown-registry = "deny"
+unknown-git = "deny"

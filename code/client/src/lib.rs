@@ -23,11 +23,11 @@ use zeroize::Zeroizing;
 
 pub mod packets;
 use packets::*;
-pub mod pq;
 mod chunks;
 mod deliveries;
 mod history;
 mod padding;
+pub mod pq;
 mod storage;
 mod transport;
 pub use chunks::MAX_MESSAGE_LEN;
@@ -78,11 +78,12 @@ const MAX_PENDING_PQ_INJECTS: usize = 32;
 // `relay_link::REPLY_COPIES`) until `HANDSHAKE_ATTEMPT` is up.
 // `perform_handshake` tries again, with the same init, until
 // `HANDSHAKE_GIVE_UP`. At 70% loss each way, one init and one reply get
-// through 9% of the time; three of each, about half.
+// through 9% of the time; three of each, about half. So a minute of
+// attempts almost never fails, even at that loss.
 const HANDSHAKE_COPIES: usize = 3;
 const HANDSHAKE_COPY_SPACING: Duration = Duration::from_millis(200);
 const HANDSHAKE_ATTEMPT: Duration = Duration::from_secs(3);
-const HANDSHAKE_GIVE_UP: Duration = Duration::from_secs(30);
+const HANDSHAKE_GIVE_UP: Duration = Duration::from_secs(60);
 
 // Syncs sent on each keepalive tick (see `Client::keepalive`), each acked
 // several times by the relay, so a link in heavy loss still hears from the
@@ -726,6 +727,11 @@ pub struct Client {
     /// Whether connection requests are muted: none are listed (see
     /// `connection_requests`). Saved with the identity.
     pub(crate) requests_muted: bool,
+    /// Whether a front end's new-message notifications may say who each
+    /// message is from. Off unless the user turns it on, as a notification
+    /// can show on a locked screen. The client itself posts none. Saved
+    /// with the identity.
+    pub(crate) notify_with_names: bool,
     /// Recent KeyExchanges from people who aren't contacts, in the order
     /// they first arrived, so a front end can prompt the user to add them
     /// back (see `connection_requests`). Just the token and when: nothing
@@ -784,6 +790,7 @@ impl Client {
             recent_deliveries: Default::default(),
             admission_changed: false,
             requests_muted: false,
+            notify_with_names: false,
             connection_requests: Vec::new(),
             listed_requests: VecDeque::new(),
             dismissed_requests: HashMap::new(),
@@ -1223,6 +1230,19 @@ impl Client {
         if muted {
             self.connection_requests.clear();
         }
+        self.save();
+    }
+
+    /// Whether notifications may name who a message is from (see
+    /// `notify_with_names`).
+    pub fn notify_with_names(&self) -> bool {
+        self.notify_with_names
+    }
+
+    /// Let notifications name who each message is from, or not. Saved with
+    /// the identity.
+    pub fn set_notify_with_names(&mut self, on: bool) {
+        self.notify_with_names = on;
         self.save();
     }
 
@@ -4258,6 +4278,7 @@ mod tests {
             },
         );
         original.requests_muted = true;
+        original.notify_with_names = true;
 
         // Save to a temp file
         let tmp_path = "test_roundtrip_state.json";
@@ -4312,6 +4333,7 @@ mod tests {
         assert_eq!(offer.eph_x25519_pub, peer_id.x25519_public);
         assert_eq!(offer.kyber_ct.as_bytes(), kyber_ct.as_bytes());
         assert!(loaded.requests_muted());
+        assert!(loaded.notify_with_names());
 
         // Clean up
         let _ = std::fs::remove_file(tmp_path);
