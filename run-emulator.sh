@@ -44,16 +44,17 @@ if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
 fi
 
 # The APK has to include the emulator's x86_64 code.
-apk="$(find "$APK_DIR" -name '*debug*.apk' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
+# (find fails if no APK was ever built; pipefail would end the script here.)
+apk="$({ find "$APK_DIR" -name '*debug*.apk' -printf '%T@ %p\n' 2>/dev/null || true; } | sort -n | tail -1 | cut -d' ' -f2-)"
 if [ -z "$apk" ] || ! unzip -Z1 "$apk" 'lib/x86_64/*' >/dev/null 2>&1; then
   echo "error: no APK that runs on the emulator. Build one with ./build-apk.sh --emulator" >&2
   exit 1
 fi
 
-# One-time setup: the emulator and its system image, then the device.
-if [ ! -x "$EMULATOR" ] || [ ! -d "$ANDROID_HOME/system-images/android-35/google_apis/x86_64" ]; then
+# One-time setup: the emulator, its system image and adb, then the device.
+if [ ! -x "$EMULATOR" ] || [ ! -x "$ADB" ] || [ ! -d "$ANDROID_HOME/system-images/android-35/google_apis/x86_64" ]; then
   echo "Downloading the Android emulator (about 1.5 GB, once)..."
-  "$SDKMANAGER" --install emulator "$IMAGE"
+  "$SDKMANAGER" --install emulator platform-tools "$IMAGE"
 fi
 if ! grep -qx "$AVD" <<<"$("$EMULATOR" -list-avds)"; then
   echo no | "$AVDMANAGER" create avd -n "$AVD" -k "$IMAGE" -d pixel_6

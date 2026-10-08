@@ -506,6 +506,7 @@ impl ClientStateDto {
             relay_public: None,
             pending_handshake: None,
             last_heard: std::time::Instant::now(),
+            last_heard_ms: crate::ordering::now_ms(),
             setup_retries: HashMap::new(), // live state, not persisted
             e2e_sessions,
             pending_contacts,

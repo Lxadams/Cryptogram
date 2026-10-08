@@ -1,4 +1,7 @@
-FROM rust:1-slim AS builder
+# Bookworm, as the runtime image below: a newer glibc in the builder would
+# leave the binary needing symbols bookworm lacks (any bundled C code picks
+# up glibc 2.38's __isoc23_strtol, as the client's SQLCipher does).
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 # Path dependency of the server (the client <-> relay link protocol), resolved
 # as ../relay-link.

@@ -38,7 +38,7 @@ done
 
 # The APK: the one given, or the newest debug build.
 if [ -z "$apk" ]; then
-  apk="$(find "$APK_DIR" -name '*debug*.apk' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
+  apk="$({ find "$APK_DIR" -name '*debug*.apk' -printf '%T@ %p\n' 2>/dev/null || true; } | sort -n | tail -1 | cut -d' ' -f2-)"
   if [ -z "$apk" ]; then
     echo "error: no APK under $APK_DIR. Build one first: ./runpeer-lan.sh --mobile" >&2
     exit 1

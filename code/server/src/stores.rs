@@ -1,7 +1,7 @@
 use rand_core::{OsRng, RngCore};
 use relay_link::{
-    AdmissionTag, DeliveryId, Header, Lane, LinkEnd, LinkError, LinkKeys, RoutingToken, SessionId,
-    Side,
+    AdmissionTag, DeliveryId, Header, Lane, LinkEnd, LinkError, LinkKeys, PacketNumber, Receipt,
+    RoutingToken, SessionId, Side,
 };
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
@@ -110,6 +110,10 @@ pub struct Link {
     /// The routing token synced on this link, if any yet. A link only ever
     /// carries one (see `Tables::apply_sync`).
     token: Option<RoutingToken>,
+    /// The paced-lane packets the relay queued, which is what a receipt
+    /// tells the client it has: not every one it opened, as a full queue
+    /// drops some (see `Tables::receipt_for`).
+    queued: Receipt,
 }
 
 impl Link {
@@ -223,9 +227,12 @@ impl HandshakeBudget {
 }
 
 /// Which handshake budget a source address draws on: the address itself
-/// for IPv4, and its /64 for IPv6, as one host can have a whole /64.
+/// for IPv4, and its /64 for IPv6, as one host can have a whole /64. An
+/// IPv4 address a dual-stack socket reports as IPv4-mapped IPv6 is still
+/// IPv4: otherwise every IPv4 client would share the one /64 they all fall
+/// in (`::ffff:0:0/96`), and so one budget.
 fn handshake_source(ip: IpAddr) -> [u8; 16] {
-    match ip {
+    match ip.to_canonical() {
         IpAddr::V4(ip) => ip.to_ipv6_mapped().octets(),
         IpAddr::V6(ip) => {
             let mut prefix = [0u8; 16];
@@ -277,13 +284,17 @@ impl Tables {
     }
 
     /// The reply the relay sent a handshake init with the ephemeral key
-    /// `client_ephemeral` lately, if its link is still unused or in use:
-    /// what a copy of that init gets, rather than a new link.
-    pub fn recent_handshake_reply(&self, client_ephemeral: &[u8; 32]) -> Option<Vec<u8>> {
+    /// `client_ephemeral` lately, and the link it gave, if that link is
+    /// still unused or in use: what a copy of that init gets, rather than a
+    /// new link, but only at the link's own address (the caller checks).
+    pub fn recent_handshake_reply(
+        &self,
+        client_ephemeral: &[u8; 32],
+    ) -> Option<(SessionId, Vec<u8>)> {
         let recent = self.recent_handshakes.get(client_ephemeral)?;
         (recent.at.elapsed() < RECENT_HANDSHAKE_TTL
             && self.active_links.contains_key(&recent.session_id))
-        .then(|| recent.reply.clone())
+        .then(|| (recent.session_id, recent.reply.clone()))
     }
 
     /// Remember `reply`, to the init with `client_ephemeral`, which gave
@@ -351,6 +362,7 @@ impl Tables {
                     expiry: Instant::now() + UNSYNCED_LINK_TTL,
                     addr,
                     token: None,
+                    queued: Receipt::default(),
                 });
                 return Some(session_id);
             }
@@ -403,11 +415,21 @@ impl Tables {
         Some(link.end.seal(Lane::Direct, packet_type, plaintext))
     }
 
+    /// Note that the relay queued paced-lane packet `packet_number` from
+    /// link `session_id`, so its receipts say so (see `receipt_for`).
+    pub fn record_queued(&mut self, session_id: &SessionId, packet_number: PacketNumber) {
+        if let Some(link) = self.active_links.get_mut(session_id) {
+            link.queued.record(packet_number);
+        }
+    }
+
     /// A `TYPE_RECEIPT` for link `session_id`: which of its paced-lane
-    /// packets (its messages) it has taken in.
+    /// packets (its messages) the relay has queued. Not just taken in: one
+    /// dropped as its recipient's queue was full mustn't count as
+    /// delivered to the relay.
     pub fn receipt_for(&mut self, session_id: &SessionId) -> Option<Vec<u8>> {
         let link = self.active_links.get_mut(session_id)?;
-        let receipt = link.end.paced_receipt().to_bytes();
+        let receipt = link.queued.to_bytes();
         Some(
             link.end
                 .seal(Lane::Direct, relay_link::TYPE_RECEIPT, &receipt),
@@ -1128,6 +1150,25 @@ mod tests {
             !tables.message_queues[&TOKEN].packets[0].admitted,
             "its contacts are still known"
         );
+    }
+
+    /// A relay bound to `[::]` sees IPv4 clients as IPv4-mapped IPv6
+    /// addresses: each still gets a budget of its own, not one shared /64.
+    #[test]
+    fn ipv4_mapped_addresses_get_their_own_handshake_budget() {
+        let v4 = |last: u8| IpAddr::from([192, 0, 2, last]);
+        let mapped =
+            |last: u8| IpAddr::from(std::net::Ipv4Addr::from([192, 0, 2, last]).to_ipv6_mapped());
+        assert_eq!(handshake_source(mapped(1)), handshake_source(v4(1)));
+        assert_ne!(handshake_source(mapped(1)), handshake_source(mapped(2)));
+
+        let mut tables = Tables::new();
+        while tables.allow_handshake(mapped(1)) {}
+        assert!(tables.allow_handshake(mapped(2)), "another IPv4 client");
+        // An IPv6 /64 is still one budget.
+        let v6 = |last: u16| IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, last]);
+        while tables.allow_handshake(v6(1)) {}
+        assert!(!tables.allow_handshake(v6(2)));
     }
 
     #[test]

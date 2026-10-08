@@ -70,6 +70,7 @@ fn load_identity(path: &str) -> Result<Option<SigningKey>> {
 /// and save it there if there isn't one yet.
 fn load_or_create_identity(path: &str) -> Result<SigningKey> {
     if let Some(identity) = load_identity(path)? {
+        make_private(path);
         return Ok(identity);
     }
     info!("No existing server identity found. Generating new Ed25519 keypair...");
@@ -90,6 +91,28 @@ fn write_private(path: &str, contents: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     io::Write::write_all(&mut options.open(path)?, contents)
+}
+
+/// Make an existing identity file only its owner can read, if it isn't
+/// already: relays before 0600 identity files wrote it readable by every
+/// user. Best effort, as the relay may not own it (a root-run relay made it
+/// in a volume this one now runs on as its own user, say).
+fn make_private(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        if metadata.permissions().mode() & 0o077 == 0 {
+            return;
+        }
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            warn!(
+                "The identity file is readable by other users, and couldn't be made private: {e}"
+            );
+        }
+    }
 }
 
 /// Keep the relay's memory (link keys, queued messages, its identity key)
@@ -242,8 +265,18 @@ fn handle_request(
         {
             let mut tables = tables.lock().unwrap();
             // A copy of an init answered lately: the same reply, the same
-            // link. Clients send each init several times over.
-            if let Some(reply) = tables.recent_handshake_reply(client_ephemeral.as_bytes()) {
+            // link. Clients send each init several times over. Only to the
+            // link's own address, though: the reply is what proves a link
+            // is at the address it handshook from. Sent anywhere else, an
+            // init from someone else's address (whose reply went there)
+            // would hand its sender a link to that address, and everything
+            // the relay sends it, receipts and forwarded packets included.
+            if let Some((session_id, reply)) =
+                tables.recent_handshake_reply(client_ephemeral.as_bytes())
+            {
+                if tables.link_addr(&session_id) != Some(socket_address) {
+                    return Err(anyhow!("A copy of an init answered at another address"));
+                }
                 return Ok(Some(reply));
             }
             if !tables.allow_handshake(socket_address.ip()) {
@@ -295,6 +328,9 @@ fn handle_request(
                 .is_none()
             {
                 debug!("A recipient's queue is full; dropped a packet");
+            } else {
+                // So a receipt says the relay has it (and not if dropped).
+                tables.record_queued(&session_id, opened.header.packet_number);
             }
         }
         TYPE_SYNC => {
@@ -734,13 +770,10 @@ mod tests {
         let first = handle_request(&tables, &keys, addr(50000), &init)
             .unwrap()
             .unwrap();
-        let replayed = handle_request(&tables, &keys, addr(50001), &init)
-            .unwrap()
-            .unwrap();
-        // A copy gets the reply the first one got (it's what a client's own
-        // copies get), which is no use without the client's ephemeral
-        // secret, and doesn't move that link to the copy's address.
-        assert_eq!(first, replayed);
+        // A copy from another address gets nothing (see
+        // `test_a_copy_of_an_init_is_answered_only_where_its_link_is`), and
+        // doesn't move that link to the copy's address.
+        assert!(handle_request(&tables, &keys, addr(50001), &init).is_err());
         assert_ne!(first[1..5], victim.session());
         let session: SessionId = first[1..5].try_into().unwrap();
         assert_eq!(
@@ -1446,6 +1479,72 @@ mod tests {
         assert_ne!(again[1..5], replies[0][1..5]);
     }
 
+    /// Someone can send an init with someone else's source address, whose
+    /// reply goes there. A copy of it from their own address must not get
+    /// them that reply: with it, they'd have the keys to a link the relay
+    /// thinks is at the victim's address, and could have it send receipts
+    /// (three for each small request) and forwarded packets there.
+    #[test]
+    fn test_a_copy_of_an_init_is_answered_only_where_its_link_is() {
+        let (tables, keys) = relay();
+        let (victim, attacker) = (host(1), host(2));
+        let client_secret = EphemeralSecret::random_from_rng(OsRng);
+        let client_ephemeral = X25519PublicKey::from(&client_secret);
+        let init = relay_link::handshake_init(&client_ephemeral);
+        let to_victim = handle_request(&tables, &keys, victim, &init)
+            .unwrap()
+            .unwrap();
+        let err = handle_request(&tables, &keys, attacker, &init).unwrap_err();
+        assert!(err.to_string().contains("another address"), "{err}");
+        assert_eq!(tables.lock().unwrap().link_count(), 1, "no second link");
+
+        // Had it got the reply, the attacker could ask for receipts as the
+        // victim. (Its own copies still get it where it is.)
+        let (session, relay_ephemeral) = relay_link::parse_handshake_resp(
+            &to_victim,
+            &keys.identity.verifying_key(),
+            &client_ephemeral,
+        )
+        .unwrap();
+        let link_keys =
+            relay_link::derive_link_keys(client_secret.diffie_hellman(&relay_ephemeral).as_bytes());
+        let mut stolen = LinkEnd::new(Side::Client, link_keys, session);
+        let request = stolen.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]);
+        assert!(
+            handle_request(&tables, &keys, victim, &request)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            handle_request(&tables, &keys, victim, &init).unwrap(),
+            Some(to_victim)
+        );
+    }
+
+    /// A receipt only counts message packets the relay queued: one dropped
+    /// as its recipient's queue was full mustn't show as delivered.
+    #[test]
+    fn test_receipts_do_not_count_packets_dropped_for_a_full_queue() {
+        let (tables, keys) = relay();
+        let mut link = link_up(&tables, &keys, addr(50000));
+        let first = link.end.next_packet_number(Lane::Paced);
+        let inner = vec![0xAB; 64 * 1024];
+        let fits = (MAX_QUEUED_BYTES_PER_TOKEN / inner.len()) as u64;
+        for _ in 0..fits + 2 {
+            let packet =
+                relay_link::data_packet(&mut link.end, Lane::Paced, &[7; 16], None, &inner);
+            handle_request(&tables, &keys, addr(50000), &packet).unwrap();
+        }
+        let request = link.end.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]);
+        let reply = handle_request(&tables, &keys, addr(50000), &request)
+            .unwrap()
+            .unwrap();
+        let receipt = relay_link::Receipt::from_bytes(&link.receive(&reply).1).unwrap();
+        for i in 0..fits + 2 {
+            assert_eq!(receipt.taken_in(first + i), Some(i < fits), "packet {i}");
+        }
+    }
+
     /// Each address gets a burst of handshakes, then a steady trickle, so
     /// no one sender can take the relay's CPU. Others aren't held up.
     #[test]
@@ -1528,6 +1627,24 @@ mod tests {
         load_or_create_identity(&path).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         fs::remove_file(&path).unwrap();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// An identity file an older relay left readable by everyone is made
+    /// private when the relay loads it.
+    #[cfg(unix)]
+    #[test]
+    fn test_an_existing_identity_file_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("relay-identity-old-{}", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        let _ = fs::remove_file(&path);
+        let created = load_or_create_identity(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let loaded = load_or_create_identity(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(created.verifying_key(), loaded.verifying_key());
         assert_eq!(mode & 0o777, 0o600);
     }
 }

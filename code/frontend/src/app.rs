@@ -777,6 +777,11 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     // state, deleted the conversation, or reconnected from scratch.
     let messages = RwSignal::new(HashMap::<String, Vec<ChatMessage>>::new());
     let history_loaded_for = RwSignal::new(HashSet::<String>::new());
+    // Send statuses that came before their message was added: `send_message`
+    // returns only once the first packet is out, and a short message can be
+    // confirmed by then. Keyed by message id; the send takes its status
+    // from here (see `ChatPanel`).
+    let early_updates = StoredValue::new(HashMap::<u64, SendStatus>::new());
 
     Effect::new(move |_| {
         let Some(token) = selected.get() else {
@@ -878,6 +883,15 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                         let status = SendStatus::from_name(&update.status);
                         if let Some(message) = map.values_mut().flatten().find(|m| m.id == id) {
                             message.status = status;
+                        } else if let Some(status) = status {
+                            // Its `send_message` hasn't returned yet (or
+                            // failed, so it's never added: hence the bound).
+                            let _ = early_updates.try_update_value(|early| {
+                                if early.len() >= 64 {
+                                    early.clear();
+                                }
+                                early.insert(id, status);
+                            });
                         }
                     }
                 });
@@ -902,7 +916,12 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                     requests=requests
                     scanning=scanning
                 />
-                <ChatPanel contacts=contacts selected=selected messages=messages />
+                <ChatPanel
+                    contacts=contacts
+                    selected=selected
+                    messages=messages
+                    early_updates=early_updates
+                />
             </div>
             <ConnectionRequestNotice requests=requests scanning=scanning selected=selected />
         </section>
@@ -1341,6 +1360,7 @@ fn ChatPanel(
     contacts: RwSignal<Vec<api::ContactDto>>,
     selected: RwSignal<Option<String>>,
     messages: RwSignal<HashMap<String, Vec<ChatMessage>>>,
+    early_updates: StoredValue<HashMap<u64, SendStatus>>,
 ) -> impl IntoView {
     let draft = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
@@ -1365,23 +1385,28 @@ fn ChatPanel(
         leptos::task::spawn_local(async move {
             match api::send_message(&token_for_task, &text).await {
                 Ok(sent) => {
+                    // Same reasoning as the incoming side in
+                    // `MainScreen::refresh` — use the backend's own
+                    // chat-history row id so this optimistic display
+                    // agrees with a later `chat_history` fetch on what
+                    // identifies this message.
+                    let id = sent
+                        .id
+                        .map(history_message_id)
+                        .unwrap_or_else(next_message_id);
+                    // Its check mark (or not) comes later, from
+                    // `api::sent_message_updates`, unless it came already.
+                    let status = early_updates
+                        .try_update_value(|early| early.remove(&id))
+                        .flatten()
+                        .unwrap_or(SendStatus::Sending);
                     messages.update(|map| {
                         map.entry(token_for_task).or_default().push(ChatMessage {
-                            // Same reasoning as the incoming side in
-                            // `MainScreen::refresh` — use the backend's own
-                            // chat-history row id so this optimistic
-                            // display agrees with a later `chat_history`
-                            // fetch on what identifies this message.
-                            id: sent
-                                .id
-                                .map(history_message_id)
-                                .unwrap_or_else(next_message_id),
+                            id,
                             from_me: true,
                             text: text_for_history,
                             timestamp_ms: Some(sent.timestamp_ms),
-                            // Its check mark (or not) comes later, from
-                            // `api::sent_message_updates`.
-                            status: Some(SendStatus::Sending),
+                            status: Some(status),
                         });
                     });
                 }

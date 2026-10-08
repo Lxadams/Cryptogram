@@ -380,10 +380,20 @@ pub const RECEIPT_LEN: usize = 8 + 8 * WINDOW_WORDS;
 /// Which of a client's paced-lane packets the relay has taken in, as a
 /// `TYPE_RECEIPT` carries it: the newest, and which of the
 /// `REPLAY_WINDOW` before it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Receipt(ReplayWindow);
 
 impl Receipt {
+    /// Record paced-lane packet `packet_number` as taken in, for a receipt
+    /// that should only cover some of what a link opened (the relay's
+    /// covers what it queued, not what it dropped). Numbers from any other
+    /// lane are ignored.
+    pub fn record(&mut self, packet_number: PacketNumber) {
+        if Lane::of(packet_number) == Lane::Paced {
+            self.0.accept(packet_number & !LANE_BIT);
+        }
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(RECEIPT_LEN);
         out.extend_from_slice(&self.0.next.to_be_bytes());
@@ -1090,5 +1100,22 @@ mod tests {
         let receipt = relay.paced_receipt();
         assert_eq!(receipt.taken_in(first + 1), None);
         assert_eq!(receipt.taken_in(first + 12), Some(true));
+    }
+
+    #[test]
+    fn a_receipt_records_only_what_it_is_given() {
+        let mut receipt = Receipt::default();
+        receipt.record(LANE_BIT + 1);
+        receipt.record(LANE_BIT + 3);
+        receipt.record(2); // a direct-lane number: ignored
+        assert_eq!(receipt.taken_in(LANE_BIT), Some(false));
+        assert_eq!(receipt.taken_in(LANE_BIT + 1), Some(true));
+        assert_eq!(receipt.taken_in(LANE_BIT + 2), Some(false));
+        assert_eq!(receipt.taken_in(LANE_BIT + 3), Some(true));
+        let bytes = receipt.to_bytes();
+        assert_eq!(
+            Receipt::from_bytes(&bytes).unwrap().taken_in(LANE_BIT + 3),
+            Some(true)
+        );
     }
 }

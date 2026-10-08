@@ -21,8 +21,10 @@ on_request(request):
     padding to 320 bytes, so the request is bigger than all the copies of its reply
     put together, and the relay is never an amplifier):
         If it's a copy of one answered in the last minute (the same client ephemeral
-        key) and that link is still there, send the same reply again. Clients send
-        every init several times, and the copies mustn't open more links.
+        key) and that link is still there, send the same reply again if it came
+        from the link's own address, and nothing if not: the reply is what proves
+        the link is at that address. Clients send every init several times, and
+        the copies mustn't open more links.
         Refuse it if its address has run out of handshakes: each address gets a burst
         of 20, then one a second (an IPv6 address counts by its /64). A handshake
         costs a key agreement and a signature, so no one sender can take up the CPU.
@@ -72,8 +74,8 @@ on_request(request):
         Wake the outbound task.
     If a 'Receipt Request' is received (type 9, empty) from the link's address:
         Reply with a receipt (type 10, three times, REPLY_COPIES): the newest packet
-        number taken in from the client's paced lane (its messages), and which of the
-        1024 before it. The client asks every 2 s after sending, so it can show a check
+        from the client's paced lane (its messages) that the relay queued, and which
+        of the 1024 before it (one dropped for a full queue doesn't count). The client asks every 2 s after sending, so it can show a check
         mark once the relay has enough of a message to deliver it. From any other
         address, send nothing: three replies must never go to someone else.
     If a 'Path Response' request is received (type 7: the challenge, echoed):

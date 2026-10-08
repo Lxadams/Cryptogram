@@ -304,7 +304,9 @@ way, and phones connect to it the same way.
   resent after 30 s, then 60 s and so on. So add contacts at `0`, then type
   `0.7`.
 - **Jamming only one phone:** port 4431 reaches the relay with no loss.
-  Build the other phone with `./runpeer-lan.sh --mobile <this PC's IP>:4431`.
+  Build the other phone with the `:4431` command `./runserver-lan-lossy.sh`
+  prints, `SERVER_PUBKEY=<key> ./runpeer-lan.sh --mobile <this PC's IP>:4431`
+  (with an address, it needs the key).
   On WSL, also allow UDP 4431 as in step 2.3, with another `-Name` and
   `-LocalPorts 4431`.
 

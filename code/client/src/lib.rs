@@ -674,6 +674,11 @@ pub struct Client {
     /// When we last heard anything (authentic) from the relay on this link:
     /// an ack of a sync, say, or something it forwarded. Live state.
     last_heard: Instant,
+    /// The same, in Unix milliseconds: `Instant` stops while a phone
+    /// sleeps (it's the monotonic clock on Linux and Android), so only the
+    /// wall clock tells how long a sleep it has woken from (see
+    /// `keepalive`). Live state.
+    last_heard_ms: u64,
     /// When to send each contact we've added, but have no session with yet,
     /// our KeyExchange again (see `setup_resends`). Live state.
     setup_retries: HashMap<RoutingToken, SetupRetry>,
@@ -811,6 +816,7 @@ impl Client {
             relay_public: None,
             pending_handshake: None,
             last_heard: Instant::now(),
+            last_heard_ms: ordering::now_ms(),
             setup_retries: HashMap::new(),
             e2e_sessions: HashMap::new(),
             pending_contacts: HashMap::new(),
@@ -969,6 +975,7 @@ impl Client {
         self.link = LinkEnd::new(Side::Client, keys, session_id);
         self.pending_handshake = None;
         self.last_heard = Instant::now();
+        self.last_heard_ms = ordering::now_ms();
         // Anything sent on the old link may never have arrived, so contacts
         // we're still setting up with get our KeyExchange again right away.
         let now = Instant::now();
@@ -1036,7 +1043,13 @@ impl Client {
                     }
                     true
                 }
-                None => now.duration_since(self.last_heard) >= LINK_SILENCE_TIMEOUT,
+                // After a long sleep, straight away: `last_heard` can't
+                // tell, as the monotonic clock stops while a phone sleeps.
+                None => {
+                    now.duration_since(self.last_heard) >= LINK_SILENCE_TIMEOUT
+                        || ordering::now_ms().saturating_sub(self.last_heard_ms)
+                            >= LINK_SILENCE_TIMEOUT.as_millis() as u64
+                }
             };
             if link_gone {
                 if self.pending_handshake.is_none() {
@@ -1354,6 +1367,7 @@ impl Client {
                 ">> {} added you again, so your old session with them is gone.",
                 short(&peer)
             );
+            self.hand_over_held(&peer);
             self.e2e_sessions.remove(&peer);
             self.session_setups.remove(&peer);
             self.reassembler.forget(&peer);
@@ -1796,6 +1810,7 @@ impl Client {
         };
         // Authentic, and not a replay: the link is alive.
         self.last_heard = Instant::now();
+        self.last_heard_ms = ordering::now_ms();
         match header.packet_type {
             TYPE_DATA => {}
             // All it says is that the relay has our sync, and so the link.
@@ -2180,6 +2195,7 @@ impl Client {
             .get(&peer)
             .is_some_and(|ours| ours.root_key == session.root_key);
         if !have_it {
+            self.hand_over_held(&peer);
             let previous_session = self.e2e_sessions.insert(peer, session);
             let previous_setup = self.session_setups.insert(
                 peer,
@@ -2355,6 +2371,18 @@ impl Client {
             self.deliver(sender, text);
         }
         self.save();
+    }
+
+    /// Hand over everything held from `peer` for an earlier message, as
+    /// their session is about to be dropped or replaced: those messages'
+    /// keys are used up, so they couldn't be had again.
+    fn hand_over_held(&mut self, peer: &RoutingToken) {
+        let Some(session) = self.e2e_sessions.get_mut(peer) else {
+            return;
+        };
+        for text in session.delivery.release_all() {
+            self.deliver(*peer, text);
+        }
     }
 
     /// Hand over the messages that have waited `REORDER_WAIT` for one sent
@@ -5054,6 +5082,26 @@ mod tests {
         cleanup(&[&alice, &bob]);
     }
 
+    /// A message held for an earlier one has used up its key, so dropping
+    /// the session it's held in (the sender re-added us) hands it over
+    /// rather than losing it.
+    #[test]
+    fn test_held_messages_are_handed_over_when_their_session_goes() {
+        let (mut alice, mut bob) = connected_pair();
+        let msgs = send_messages(&mut alice, &bob, 2);
+        bob.handle_incoming_packet(&msgs[1].0).unwrap();
+        assert!(bob.drain_inbox().is_empty());
+
+        alice.forget_contact(bob.identity.routing_token);
+        let kx = alice
+            .add_contact(bob.identity.routing_token, bob.identity.ed25519_public)
+            .unwrap();
+        exchange(&mut alice, &mut bob, kx);
+        assert_one_session_with_pq_keys(&alice, &bob);
+        assert_eq!(inbox_texts(&mut bob), ["m1"]);
+        cleanup(&[&alice, &bob]);
+    }
+
     #[test]
     fn test_sessions_saved_before_ordering_hand_over_their_next_message() {
         let (mut alice, mut bob) = connected_pair();
@@ -5642,6 +5690,23 @@ mod tests {
             "syncs, then the KeyExchange"
         );
         assert!(client.handle_relay_packet(&reply).is_empty(), "taken once");
+        cleanup(&[&client]);
+    }
+
+    /// A phone that slept longer than `LINK_SILENCE_TIMEOUT` reconnects at
+    /// its first keepalive, though `Instant` (stopped while it slept) says
+    /// it heard from the relay a moment ago.
+    #[test]
+    fn test_keepalive_reconnects_straight_away_after_a_long_sleep() {
+        let mut client = new_client();
+        link_with(&mut client, 4, [1, 2, 3, 4]);
+        client.relay_public = Some(SigningKey::from_bytes(&[7; 32]).verifying_key());
+        assert_eq!(client.keepalive().len(), SYNC_COPIES);
+
+        client.last_heard_ms -= LINK_SILENCE_TIMEOUT.as_millis() as u64;
+        let inits = client.keepalive();
+        assert_eq!(inits.len(), HANDSHAKE_COPIES);
+        assert!(relay_link::parse_handshake_init(&inits[0]).is_ok());
         cleanup(&[&client]);
     }
 

@@ -92,8 +92,14 @@ impl DeliveryOrder {
     ) -> Vec<Vec<u8>> {
         if first < self.next {
             // Its turn has passed: the wait for it ran out. Late is better
-            // than never.
-            return text.into_iter().collect();
+            // than never. If it runs on past `next`, those positions are
+            // its own, so nothing after it may wait for them.
+            let mut out: Vec<Vec<u8>> = text.into_iter().collect();
+            if last >= self.next {
+                self.next = last + 1;
+                out.extend(self.release_ready());
+            }
+            return out;
         }
         if first > self.next {
             self.held.insert(
@@ -132,6 +138,13 @@ impl DeliveryOrder {
             Some(first) => self.release_through(first),
             None => Vec::new(),
         }
+    }
+
+    /// Hand over everything held, in order, whatever is missing in front of
+    /// it: for a session that's being dropped, whose held messages couldn't
+    /// be had again.
+    pub fn release_all(&mut self) -> Vec<Vec<u8>> {
+        self.release_through(u64::MAX)
     }
 
     /// Hand over every held message up to the one starting at `first`, and
@@ -237,6 +250,27 @@ mod tests {
         assert!(order.accept(4, 4, b"e".to_vec(), 0).is_empty());
         assert_eq!(texts(order.accept(2, 2, b"c".to_vec(), 0)), ["c", "e"]);
         assert_eq!(order.next, 5);
+    }
+
+    #[test]
+    fn a_late_message_running_past_next_holds_nothing_up() {
+        let mut order = DeliveryOrder::default();
+        // A chunk at 0 was dropped on its own, so `next` is 1, inside the
+        // message that turns up at 0..=2.
+        assert!(order.pass_over(0, 0, 0).is_empty());
+        assert!(order.accept(3, 3, b"d".to_vec(), 0).is_empty());
+        assert_eq!(texts(order.accept(0, 2, b"abc".to_vec(), 0)), ["abc", "d"]);
+        assert_eq!(order.next, 4);
+    }
+
+    #[test]
+    fn a_dropped_session_hands_over_everything_held() {
+        let mut order = DeliveryOrder::default();
+        assert!(order.accept(3, 3, b"d".to_vec(), 0).is_empty());
+        assert!(order.pass_over(2, 2, 0).is_empty());
+        assert!(order.accept(1, 1, b"b".to_vec(), 0).is_empty());
+        assert_eq!(texts(order.release_all()), ["b", "d"]);
+        assert!(order.held.is_empty());
     }
 
     #[test]

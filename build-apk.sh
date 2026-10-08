@@ -55,7 +55,7 @@ echo "Key:   $SERVER_PUBKEY"
 # Android toolchain: the environment's, or the usual install locations.
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
 if [ -z "${NDK_HOME:-}" ]; then
-  NDK_HOME="$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1)"
+  NDK_HOME="$({ find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true; } | sort -V | tail -1)"
 fi
 if [ -z "${JAVA_HOME:-}" ]; then
   if command -v javac >/dev/null; then

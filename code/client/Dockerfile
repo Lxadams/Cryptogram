@@ -1,4 +1,11 @@
-FROM rust:1-slim AS builder
+# Bookworm, as the runtime image below: a newer glibc in the builder would
+# leave the binary needing symbols bookworm lacks (bundled C code, e.g.
+# SQLCipher, picks up glibc 2.38's __isoc23_strtol).
+FROM rust:1-slim-bookworm AS builder
+# SQLCipher's vendored OpenSSL (rusqlite's bundled-sqlcipher-vendored-openssl)
+# builds with make and full Perl, which the slim image lacks.
+RUN apt-get update && apt-get install -y --no-install-recommends make perl \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 # Path dependencies of the client (RaptorQ FEC, and the client <-> relay link
 # protocol), resolved as ../fec and ../relay-link.
