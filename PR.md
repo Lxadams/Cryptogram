@@ -176,6 +176,5 @@ Closes issue: #40
 - **Production:**
   - ANDROID.md still has a TODO for the production relay address and key.
   - Release signing is still to do.
-- **The QUIC branch** needs the client-side fixes ported.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
