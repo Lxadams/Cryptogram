@@ -93,6 +93,15 @@ Phase 0 of the new [Stage 3 roadmap](documentations/stage-3-roadmap.md), apart f
   - **No amplification:** the init is padded to 320 bytes, which is still more than the three replies together.
   - **The result:** at 70% loss each way, one attempt gets through about half the time, up from 9%.
 - **Reconnecting waits for two minutes of silence** (see "They reconnect by themselves" above). Before, one unacked sync was enough, and heavy loss alone often caused that.
+- **Sent messages show whether the relay got them, and every message shows its time.**
+  - **✓ and !:** a sent message gets a check mark once the relay has enough of it to deliver (one more symbol than its source symbols, enough to rebuild it 9,999 times in 10,000), or a red exclamation mark if that isn't confirmed within 30 s. The mark means the relay has it, not that the recipient does; the relay goes on resending until they do.
+  - **How the client knows:** the relay never answered message packets. Now the client asks (`TYPE_RECEIPT_REQUEST`, three copies, every 2 s while anything's unconfirmed), and the relay answers with its replay window for the client's message lane (`TYPE_RECEIPT`, three copies, only to the link's own address), which says packet by packet what it took in (`client/src/confirmations.rs`).
+  - **Saved:** each status is saved in the chat history, so the marks are still there after a restart. A message still unconfirmed when the app closes is marked failed.
+  - **Times:** the time it was sent or arrived (from the chat history, which already kept it), with the date for anything before today.
+- **Messages are shown in the order they were sent.** From two phones at 75% loss: under loss they finished arriving out of order, and were shown that way.
+  - **How:** a message's chunks carry their ratchet positions, so one that arrives ahead of an earlier message is held until that one arrives, then both go out in order: to the chat, the history and notifications (`client/src/ordering.rs`).
+  - **The limit:** a message that never arrives holds the rest up for at most 10 s (`REORDER_WAIT`), long enough for the relay's first two resends. One that turns up later still goes out, late.
+  - **Nothing lost:** held messages are saved with the session, as their keys are already used up.
 - **Handshakes are rate-limited per address:** a burst of 20, then one a second, with an IPv6 address counted by its /64. Each handshake costs the relay a key agreement and a signature.
 - **Relay hygiene:**
   - **Identity file:** written readable by the relay's own user only (0600).
@@ -121,6 +130,9 @@ Phase 0 of the new [Stage 3 roadmap](documentations/stage-3-roadmap.md), apart f
   - **What it checks:** known vulnerabilities, unmaintained or yanked crates, licences, and crates.io as the only source.
   - **The rules** are in `code/deny.toml`, and all six crates pass.
 - **`lossy_link`** jams the handshake too. It now waits up to 60 s for every message, instead of counting what arrived within 2 s: the relay sends a recipient's packets 5 ms apart, so 30 messages take about 6 s to leave it.
+- **`runserver-lan-lossy.sh`** runs the LAN relay behind a proxy (`code/server/examples/lossy_proxy.rs`) that drops 70% of packets each way, for trying phones over a bad network.
+  - **Connecting:** clients connect as to `runserver-lan.sh`'s relay. Port 4431 skips the loss, to jam only one side.
+  - **Changing the loss:** typing a new loss while it runs changes it, so contacts can be added at 0 first.
 - **Docs:**
   - **The README** says what's built (a hash ratchet with PQ refreshes, no cover traffic yet), and links the roadmap for the rest.
   - **Also updated:** the relay's README, ANDROID.md and the crypto flow.
@@ -193,7 +205,7 @@ Everything here is breaking. **Deploy the relay and update every client together
   - **Keys:** the link has one key per direction, from HKDF labels `e2e-messenger/link/v2/to-relay` and `.../to-client`.
   - **Link packets:** `[type | session ID | 8-byte packet number | ChaCha20-Poly1305]`. The packet number is the nonce and replaces the 24-byte random one. The whole header is authenticated as AEAD associated data.
   - **Syncs:** the new `TYPE_SYNC` (4) replaces the empty `TYPE_DATA` sync. It carries `token | token_pub | signature | admission tags`. An older client's syncs are rejected, so the relay never sends it anything.
-  - **New packet types:** `TYPE_ADMITTED_DATA` (5), `TYPE_PATH_CHALLENGE` (6), `TYPE_PATH_RESPONSE` (7) and `TYPE_SYNC_ACK` (8).
+  - **New packet types:** `TYPE_ADMITTED_DATA` (5), `TYPE_PATH_CHALLENGE` (6), `TYPE_PATH_RESPONSE` (7), `TYPE_SYNC_ACK` (8), `TYPE_RECEIPT_REQUEST` (9) and `TYPE_RECEIPT` (10). A relay without the last two never answers a receipt request, so every message shows the red mark.
   - **KeyExchange:** now 1393 bytes, up from 1384. It gains a flags byte ("have your keys", "have a session"), the sender's add ID, and the add ID its session was made for.
   - **SessionEstablish:** now 1232 bytes, up from 1224, carrying the two add IDs it was made for.
   - **Packet sizes:** chat packets to a contact (FEC symbols) are 1,146 bytes, with their admission tag, and KeyExchanges to a contact are 1,447 (1,439 before the tag is known), inside a PPPoE link's 1,464. Both are pinned by tests.
@@ -207,16 +219,16 @@ Everything here is breaking. **Deploy the relay and update every client together
   - Production builds need the deployed relay's key (ANDROID.md, step 6).
   - The relay's identity persists in the `server_identity` volume, so the key doesn't change between deploys.
 - **EC2:** the inbound TCP 443 rule in the security group can be deleted by hand.
-- **New files need adding:** `build-apk.sh`, `run-emulator.sh` and `code/relay-link/` are new, so `git add` them.
+- **New files need adding:** `build-apk.sh`, `run-emulator.sh`, `runserver-lan-lossy.sh`, `code/relay-link/`, `code/deny.toml` and `code/server/examples/` are new, so `git add` them.
 
 ### Testing
 - **Unit tests:** all passing. `fmt`, and `clippy -D warnings` on all targets, are clean on every crate, with the frontend checked both native and for WASM.
 
   | Crate | Tests |
   |---|---|
-  | relay-link (new) | 11 |
-  | Relay | 44 |
-  | Client | 144 |
+  | relay-link (new) | 12 |
+  | Relay | 45 |
+  | Client | 163 |
   | Tauri backend | 15 |
   | Frontend | 10 |
 
@@ -224,6 +236,8 @@ Everything here is breaking. **Deploy the relay and update every client together
     - relay: copies of a handshake init get one link; handshakes from one address are rate-limited; sync acks go out several times; the identity file is private
     - relay-link: the three replies together are smaller than the init
     - client: a handshake gets through a lost attempt (over real UDP); ML-KEM keys round-trip and malformed ones are refused; the notification setting is saved
+    - send confirmations: a message is sent once a receipt shows the relay has one more symbol than its source symbols, and not before; a receipt from another link confirms nothing; an unconfirmed one fails after 30 s; requests go out once its burst has, then every 2 s; the status is saved in the history, and one cut short by a restart has failed; a database from before statuses gains them; the relay's receipt is right packet by packet, goes out three times, and only to the link's address; incoming messages carry the time their history row has
+    - client, delivery order: messages (one of them three chunks) that arrive ahead of the first are held, then handed over in the order sent; a lost one holds the rest up only for `REORDER_WAIT`, and still gets through late; a dropped payload holds nothing up; held messages survive a save and load; sessions saved before ordering resume at their next message
     - Tauri backend: notifications name senders only once that's turned on
 
   - **From the second review** (each fails without its fix):
@@ -272,6 +286,11 @@ Everything here is breaking. **Deploy the relay and update every client together
   - **`lossy_link` at 70% loss, re-run after the quick wins:** with Alice's link jammed, and again with Bob's.
     - **Connecting:** the jammed side connects through the loss: Alice in 0.4 s, Bob in 6.4 s after two lost attempts.
     - **Messages:** 30/30 each way, with both ratchets in step. The direction with the jammed receiver completes about 7 s after the last send.
+  - **Send confirmations, with two CLI clients through `lossy_proxy` (a temporary harness, not committed):** a message at 0% loss is confirmed; at 70% loss on both clients, 10 of 10 were confirmed within 10 s of the first, and none failed; at 100%, the message failed after 31 s.
+  - **`lossy_link` with in-order delivery** (it now fails if anything arrives out of order):
+    - **70%, Alice jammed:** 30/30 each way, in order.
+    - **75%, both jammed:** 30/30 each way, in order, within 4.4 s of the last send. A message arrived ahead of an earlier one 35 times, and each was held until its turn.
+    - **80%, both jammed:** fails. 3 of 60 messages never arrived, and 3 took over 10 s, so they came out late.
   - **Relay restart, with two CLI clients (a temporary harness, not committed), re-run after the quick wins:**
     - **Before the restart:** they connect and message, and adding your own code is refused.
     - **After it:** both notice the relay has gone quiet and redo the handshake by themselves, about two minutes later. Messages then flow both ways again.
@@ -295,6 +314,7 @@ Everything here is breaking. **Deploy the relay and update every client together
   - the Docker images
 
 ### Follow-ups
+- **Past 75% loss on both sides, messages go missing.** Each message's FEC burst is sized for 70% on one link, and nothing resends a message end to end. At 80% on both sides, 1 message in 20 never arrived. Phase 1's receipts and top-ups (roadmap 1.3) fix that.
 - **The pop-up needs the app open.** No Android notification is posted for connection requests.
 - **The requester's token isn't proven to the receiver.** The pop-up only prompts a scan, and the scan is the trust step.
 - **Contacts are trusted with your queue.** A contact's tag only proves they're a contact, so a malicious contact can still fill your contacts' queue. Contacts beyond the 64 a sync registers share the small queue for strangers.

@@ -33,7 +33,8 @@ To let other devices in (one-time setup):
        New-NetFirewallHyperVRule -Name E2E-Relay -DisplayName "E2E relay (UDP $PORT)" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol UDP -LocalPorts $PORT
 
 EOF
-elif command -v ufw >/dev/null && systemctl is-active --quiet ufw 2>/dev/null; then
+elif command -v ufw >/dev/null && grep -qs "^ENABLED=yes" /etc/ufw/ufw.conf; then
+  # (Not "systemctl is-active ufw": that says active even with ufw turned off.)
   echo "note: ufw is running; if devices can't connect, run: sudo ufw allow $PORT/udp" >&2
 fi
 

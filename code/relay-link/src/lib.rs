@@ -33,6 +33,8 @@
 //! | `TYPE_SYNC_ACK` | relay -> client | the sync's packet number |
 //! | `TYPE_PATH_CHALLENGE` | relay -> client | a challenge |
 //! | `TYPE_PATH_RESPONSE` | client -> relay | the same challenge |
+//! | `TYPE_RECEIPT_REQUEST` | client -> relay | nothing |
+//! | `TYPE_RECEIPT` | relay -> client | see `Receipt` |
 //!
 //! The inner payload is the clients' own business (end-to-end encrypted
 //! wherever it says anything private); the relay only routes it.
@@ -110,6 +112,15 @@ pub const TYPE_PATH_RESPONSE: u8 = 7;
 /// client knows its link is still there. A client whose syncs stop being
 /// acked does the handshake again.
 pub const TYPE_SYNC_ACK: u8 = 8;
+/// A client asking which of its message packets the relay has taken in
+/// (see `TYPE_RECEIPT`). Empty.
+pub const TYPE_RECEIPT_REQUEST: u8 = 9;
+/// The relay's answer to a `TYPE_RECEIPT_REQUEST`: a `Receipt` for the
+/// client's paced lane, which its messages go out in, so the client can
+/// tell when the relay has enough of a message to deliver it. Sent
+/// `REPLY_COPIES` times, and only to the address the link has shown it's
+/// at.
+pub const TYPE_RECEIPT: u8 = 10;
 
 /// Most admission tags one `Sync` registers. Keeps a sync to one small
 /// datagram; contacts beyond this share the queue for everyone else.
@@ -362,6 +373,61 @@ impl ReplayWindow {
     }
 }
 
+/// How long a `TYPE_RECEIPT`'s plaintext is: a `ReplayWindow`, as the
+/// newest number taken in plus one, then its bits.
+pub const RECEIPT_LEN: usize = 8 + 8 * WINDOW_WORDS;
+
+/// Which of a client's paced-lane packets the relay has taken in, as a
+/// `TYPE_RECEIPT` carries it: the newest, and which of the
+/// `REPLAY_WINDOW` before it.
+#[derive(Clone, Debug)]
+pub struct Receipt(ReplayWindow);
+
+impl Receipt {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(RECEIPT_LEN);
+        out.extend_from_slice(&self.0.next.to_be_bytes());
+        for word in self.0.seen {
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != RECEIPT_LEN {
+            return None;
+        }
+        let word = |i: usize| u64::from_be_bytes(bytes[8 * i..8 * i + 8].try_into().unwrap());
+        let mut window = ReplayWindow {
+            next: word(0),
+            ..Default::default()
+        };
+        for (i, seen) in window.seen.iter_mut().enumerate() {
+            *seen = word(i + 1);
+        }
+        Some(Self(window))
+    }
+
+    /// Whether the relay had taken in paced-lane packet `packet_number`:
+    /// `None` if the receipt can't say, as it's too far behind the newest
+    /// (or not a paced-lane number at all).
+    pub fn taken_in(&self, packet_number: PacketNumber) -> Option<bool> {
+        if Lane::of(packet_number) != Lane::Paced {
+            return None;
+        }
+        let n = packet_number & !LANE_BIT;
+        let window = &self.0;
+        if n >= window.next {
+            return Some(false);
+        }
+        if window.next - n > REPLAY_WINDOW {
+            return None;
+        }
+        let (word, mask) = ReplayWindow::bit(n);
+        Some(window.seen[word] & mask != 0)
+    }
+}
+
 /// One end of a link: the keys, how it numbers what it sends, and which
 /// numbers it has taken in from the other end.
 #[derive(Clone, Debug)]
@@ -417,6 +483,12 @@ impl LinkEnd {
     /// The number the next packet sealed in `lane` gets.
     pub fn next_packet_number(&self, lane: Lane) -> PacketNumber {
         self.next[lane.index()]
+    }
+
+    /// Which packets this end has taken in from the other end's paced lane,
+    /// for a `TYPE_RECEIPT`.
+    pub fn paced_receipt(&self) -> Receipt {
+        Receipt(self.received[Lane::Paced.index()].clone())
     }
 
     /// Seal `plaintext` as the next `packet_type` packet in `lane`.
@@ -981,5 +1053,42 @@ mod tests {
 
         assert_eq!(parse_sync_ack(&sync_ack_plaintext(42)), Some(42));
         assert_eq!(parse_sync_ack(&[0; 7]), None);
+    }
+
+    #[test]
+    fn a_receipt_says_which_paced_packets_were_taken_in() {
+        let (mut client, mut relay) = ends();
+        let first = client.next_packet_number(Lane::Paced);
+        let burst: Vec<Vec<u8>> = (0..10)
+            .map(|_| client.seal(Lane::Paced, TYPE_DATA, b"symbol"))
+            .collect();
+        // Every third packet is lost; a direct-lane packet goes through too.
+        for (i, packet) in burst.iter().enumerate() {
+            if i % 3 != 0 {
+                relay.open(packet).unwrap();
+            }
+        }
+        let direct = client.seal(Lane::Direct, TYPE_DATA, b"sync");
+        relay.open(&direct).unwrap();
+
+        let bytes = relay.paced_receipt().to_bytes();
+        assert_eq!(bytes.len(), RECEIPT_LEN);
+        let receipt = Receipt::from_bytes(&bytes).unwrap();
+        for i in 0..10 {
+            assert_eq!(receipt.taken_in(first + i), Some(i % 3 != 0), "packet {i}");
+        }
+        assert_eq!(receipt.taken_in(first + 10), Some(false), "not sent yet");
+        assert_eq!(receipt.taken_in(0), None, "a direct-lane number");
+        assert!(Receipt::from_bytes(&bytes[1..]).is_none());
+
+        // Once the window has moved on, the receipt can't say.
+        for _ in 0..REPLAY_WINDOW {
+            relay
+                .open(&client.seal(Lane::Paced, TYPE_DATA, b"later"))
+                .unwrap();
+        }
+        let receipt = relay.paced_receipt();
+        assert_eq!(receipt.taken_in(first + 1), None);
+        assert_eq!(receipt.taken_in(first + 12), Some(true));
     }
 }

@@ -12,6 +12,7 @@ Please visit the `documentations/` folder for more details.
 ## Setup
 - Run the server locally using `runserver.sh`. You might be prompted to enter your password since it uses `sudo`.
 - To test across devices on the same network (other PCs, Android phones), run the server with `runserver-lan.sh` and each client with `runpeer-lan.sh --pc <server-ip>` or `runpeer-lan.sh --mobile <server-ip>`. Android also needs the one-time toolchain setup in [`code/frontend/ANDROID.md`](code/frontend/ANDROID.md).
+- To try that over a bad network, run `runserver-lan-lossy.sh` instead. It drops 70% of packets each way (or `runserver-lan-lossy.sh 0.5` for 50%), and typing a new loss while it runs changes it. Clients connect to it exactly as to `runserver-lan.sh`'s relay. Port 4431 reaches the relay with no loss, to jam only one side.
 - To run the server/client in Docker instead, or build the desktop frontend's Linux bundle via Docker, see [`code/README.md`](code/README.md).
 - To build the app for an Android phone, see [`code/frontend/ANDROID.md`](code/frontend/ANDROID.md).
 

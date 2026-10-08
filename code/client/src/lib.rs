@@ -1,14 +1,16 @@
 use anyhow::{Result, anyhow};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+use confirmations::{Confirmations, REQUEST_COPIES, Unconfirmed};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use pq::{Ciphertext, PublicKey, SecretKey, decapsulate, encapsulate, keypair};
 use rand_core::{OsRng, RngCore};
 use relay_link::{
-    AdmissionTag, Lane, LinkEnd, LinkKeys, Side, TYPE_ACK, TYPE_DATA, TYPE_HANDSHAKE_RESP,
-    TYPE_PATH_CHALLENGE, TYPE_PATH_RESPONSE, TYPE_SYNC, TYPE_SYNC_ACK,
+    AdmissionTag, Lane, LinkEnd, LinkKeys, PacketNumber, Receipt, Side, TYPE_ACK, TYPE_DATA,
+    TYPE_HANDSHAKE_RESP, TYPE_PATH_CHALLENGE, TYPE_PATH_RESPONSE, TYPE_RECEIPT,
+    TYPE_RECEIPT_REQUEST, TYPE_SYNC, TYPE_SYNC_ACK,
 };
 use sha2::Sha256;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,14 +26,18 @@ use zeroize::Zeroizing;
 pub mod packets;
 use packets::*;
 mod chunks;
+mod confirmations;
 mod deliveries;
 mod history;
+mod ordering;
 mod padding;
 pub mod pq;
 mod storage;
 mod transport;
 pub use chunks::MAX_MESSAGE_LEN;
-pub use history::{ChatHistory, StoredMessage};
+pub use confirmations::CONFIRM_TIMEOUT;
+pub use history::{ChatHistory, SendStatus, StoredMessage};
+pub use ordering::{DeliveryOrder, REORDER_WAIT};
 /// Routing tokens, link session IDs and delivery IDs are the relay link's
 /// (see the `relay-link` crate), as is how a routing token is derived.
 pub use relay_link::{DeliveryId, RoutingToken, SessionId, routing_token_for};
@@ -72,6 +78,21 @@ const MAX_TIMESTAMP_DRIFT: u64 = 300;
 // their position. Refreshes come at least PQ_INJECT_INTERVAL steps apart and
 // messages more than 100 steps ahead are rejected anyway, so this is ample.
 const MAX_PENDING_PQ_INJECTS: usize = 32;
+/// Most send statuses kept for a front end to collect (see
+/// `Client::drain_send_updates`).
+const MAX_SEND_UPDATES: usize = 256;
+
+/// A message handed over from a contact (see `Client::drain_inbox`).
+#[derive(Debug, Clone)]
+pub struct InboxMessage {
+    pub from: RoutingToken,
+    pub text: Vec<u8>,
+    /// Its row in the chat history, or `None` if none is attached.
+    pub history_id: Option<i64>,
+    /// When it was handed over, in Unix milliseconds: the time its history
+    /// row has too.
+    pub at_ms: i64,
+}
 
 // A handshake attempt sends its init this many times, this far apart, then
 // waits for the relay's reply (which comes several times over too, see
@@ -367,6 +388,9 @@ pub struct SymmetricSessionState {
     pub peer_kyber_pub: Option<PublicKey>,
     pub skip_dict: HashMap<u64, [u8; 32]>,
     pub recv_pq_injects: RecvPqInjects,
+    /// Puts the peer's messages back in the order they were sent, however
+    /// they arrived (see `ordering`).
+    pub delivery: DeliveryOrder,
 }
 
 /// PQ refreshes received from the peer, tracked by the position the sender
@@ -427,6 +451,7 @@ impl SymmetricSessionState {
             peer_kyber_pub,
             skip_dict: HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         }
     }
 
@@ -681,12 +706,14 @@ pub struct Client {
     /// both pending and established contacts as soon as their KeyExchange
     /// arrives, no manual entry required.
     pub contact_names: HashMap<RoutingToken, String>,
-    /// Decrypted messages that have arrived but not yet been collected by a
-    /// consumer. The CLI doesn't use this (it prints inline as messages
-    /// arrive), but a GUI front end has no console to print to — it polls
-    /// `drain_inbox()` instead. Intentionally not persisted to disk: this is
-    /// a transient handoff buffer, not session state.
-    pub inbox: Vec<(RoutingToken, Vec<u8>, Option<i64>)>,
+    /// Decrypted messages that have been handed over (each contact's in the
+    /// order they sent them, see `ordering`) but not yet collected by a
+    /// consumer. The CLI doesn't use this (it prints messages as they're
+    /// handed over), but a GUI front end has no console to print to — it
+    /// polls `drain_inbox()` instead. Intentionally not persisted to disk:
+    /// this is a transient handoff buffer, not session state. (Messages
+    /// held back for an earlier one are session state, and are saved.)
+    pub inbox: Vec<InboxMessage>,
     /// This identity's local SQLCipher-backed chat history, if it's been
     /// unlocked (see `derive_vault_key` and `ChatHistory::open`). `None`
     /// until a caller attaches one — e.g. the CLI, which has no login/vault
@@ -709,6 +736,16 @@ pub struct Client {
     /// message for two under two different synthetic ids. Not persisted;
     /// meaningful only in the instant after `record_message` runs.
     pub last_recorded_id: Option<i64>,
+    /// When `record_message` last ran, in Unix milliseconds: the time it
+    /// gave the message (its history row's, if there's history).
+    pub last_recorded_at_ms: i64,
+    /// Messages we sent that the relay hasn't confirmed yet (see
+    /// `receipt_requests`). Live state, not persisted: one still waiting
+    /// when the app closes has failed (see `ChatHistory::open`).
+    pub(crate) confirmations: Confirmations,
+    /// What became of messages we sent, until a front end collects it (see
+    /// `drain_send_updates`).
+    send_updates: Vec<(Option<i64>, SendStatus)>,
     /// Chunks of long incoming messages still waiting on the rest (see
     /// `chunks`). Live local state, not persisted, like `inbox`.
     reassembler: chunks::Reassembler,
@@ -785,6 +822,9 @@ impl Client {
             history: None,
             identity_store: None,
             last_recorded_id: None,
+            last_recorded_at_ms: 0,
+            confirmations: Confirmations::default(),
+            send_updates: Vec::new(),
             reassembler: chunks::Reassembler::default(),
             fec_rx: Default::default(),
             recent_deliveries: Default::default(),
@@ -798,9 +838,11 @@ impl Client {
     }
 
     /// Take all messages received since the last call. Returns
-    /// `(sender_routing_token, plaintext, local_history_row_id)` triples in
-    /// arrival order — the row id is `None` if no chat history is attached.
-    pub fn drain_inbox(&mut self) -> Vec<(RoutingToken, Vec<u8>, Option<i64>)> {
+    /// `(sender_routing_token, plaintext, local_history_row_id)` triples,
+    /// each contact's in the order they sent them (see `ordering`) — the
+    /// row id is `None` if no chat history is attached.
+    pub fn drain_inbox(&mut self) -> Vec<InboxMessage> {
+        self.release_held_messages();
         std::mem::take(&mut self.inbox)
     }
 
@@ -810,11 +852,13 @@ impl Client {
     /// disk or a locked file shouldn't block sending/receiving a message
     /// over the wire, only its local record of it.
     fn record_message(&mut self, token: RoutingToken, from_me: bool, plaintext: &[u8]) {
+        self.last_recorded_at_ms = ordering::now_ms() as i64;
         let Some(history) = &self.history else {
             self.last_recorded_id = None;
             return;
         };
-        match history.append(token, from_me, &String::from_utf8_lossy(plaintext)) {
+        let text = String::from_utf8_lossy(plaintext);
+        match history.append_at(token, from_me, &text, self.last_recorded_at_ms) {
             Ok(id) => self.last_recorded_id = Some(id),
             Err(e) => {
                 tracing::error!("Failed to persist chat message to local history: {}", e);
@@ -1483,11 +1527,90 @@ impl Client {
             &msg_payloads,
             pq_payload.as_deref(),
         )?;
+        let needed = transport::symbols_needed(&msg_payloads, pq_payload.as_deref());
         let tag = self.admission_tag_for(&target_token);
-        Ok(symbols
+        let first = self.link.next_packet_number(Lane::Paced);
+        let packets: Vec<Vec<u8>> = symbols
             .iter()
             .map(|inner| self.wrap_data(Lane::Paced, target_token, tag.as_ref(), inner))
-            .collect())
+            .collect();
+        self.track_sent(first, packets.len(), needed, plaintext);
+        Ok(packets)
+    }
+
+    /// Watch for the relay to confirm it has the message just sealed as
+    /// `packets` packets from `first` in the paced lane (see
+    /// `confirmations`).
+    fn track_sent(&mut self, first: PacketNumber, packets: usize, needed: u32, plaintext: &[u8]) {
+        let history_id = self.last_recorded_id;
+        if let (Some(history), Some(id)) = (&self.history, history_id)
+            && let Err(e) = history.set_status(id, SendStatus::Sending)
+        {
+            tracing::error!("Failed to record a message as sending: {e}");
+        }
+        let text = String::from_utf8_lossy(plaintext);
+        let mut preview: String = text.chars().take(30).collect();
+        if preview.len() < text.len() {
+            preview.push('…');
+        }
+        let message = Unconfirmed {
+            session: self.link.session_id(),
+            first,
+            packets: packets as u64,
+            needed: u64::from(needed).min(packets as u64),
+            sent_at: Instant::now(),
+            history_id,
+            preview,
+        };
+        let burst_time = transport::FEC_PACKET_SPACING * packets as u32;
+        if let Some(given_up) = self.confirmations.track(message, burst_time) {
+            self.settle(given_up, SendStatus::Failed);
+        }
+    }
+
+    /// Ask the relay which of the messages we sent it has, when that's due,
+    /// and give up on any it hasn't confirmed within `CONFIRM_TIMEOUT`.
+    /// Returns the packets to send. Call it a few times a second.
+    pub fn receipt_requests(&mut self) -> Vec<Vec<u8>> {
+        let now = Instant::now();
+        for message in self.confirmations.expire(now) {
+            self.settle(message, SendStatus::Failed);
+        }
+        if !self.confirmations.request_due(now) {
+            return Vec::new();
+        }
+        (0..REQUEST_COPIES)
+            .map(|_| self.link.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]))
+            .collect()
+    }
+
+    /// What became of a message we sent: recorded in the chat history, and
+    /// queued for a front end (see `drain_send_updates`).
+    fn settle(&mut self, message: Unconfirmed, status: SendStatus) {
+        match status {
+            SendStatus::Sent => println!(">> The relay has your message: {}", message.preview),
+            _ => println!(
+                ">> Your message didn't get to the relay: {}",
+                message.preview
+            ),
+        }
+        if let (Some(history), Some(id)) = (&self.history, message.history_id)
+            && let Err(e) = history.set_status(id, status)
+        {
+            tracing::error!("Failed to record a message's status: {e}");
+        }
+        // Bounded, for a front end that never collects them (the CLI).
+        if self.send_updates.len() >= MAX_SEND_UPDATES {
+            self.send_updates.remove(0);
+        }
+        self.send_updates.push((message.history_id, status));
+    }
+
+    /// What became of messages we sent, since the last call: each one's
+    /// chat-history row (`None` without history) and whether the relay
+    /// confirmed it (`Sent`) or didn't in time (`Failed`).
+    pub fn drain_send_updates(&mut self) -> Vec<(Option<i64>, SendStatus)> {
+        std::mem::take(&mut self.send_updates)
     }
 
     /// Ratchet-encrypt `plaintext` for `target_token`. Returns the inner (not
@@ -1658,6 +1781,9 @@ impl Client {
     /// message. A packet that fails to handle is acked anyway: resending it
     /// wouldn't change the outcome.
     pub fn handle_relay_packet(&mut self, packet: &[u8]) -> Vec<Vec<u8>> {
+        // Whatever the packet is, it's a moment to hand over any message
+        // that has waited long enough for an earlier one.
+        self.release_held_messages();
         if packet.first() == Some(&TYPE_HANDSHAKE_RESP) {
             return self.finish_handshake(packet);
         }
@@ -1670,6 +1796,15 @@ impl Client {
             TYPE_DATA => {}
             // All it says is that the relay has our sync, and so the link.
             TYPE_SYNC_ACK => return Vec::new(),
+            TYPE_RECEIPT => {
+                if let Some(receipt) = Receipt::from_bytes(&plaintext) {
+                    let session = self.link.session_id();
+                    for message in self.confirmations.confirmed_by(session, &receipt) {
+                        self.settle(message, SendStatus::Sent);
+                    }
+                }
+                return Vec::new();
+            }
             TYPE_PATH_CHALLENGE => {
                 let Some(challenge) = relay_link::parse_challenge(&plaintext) else {
                     return Vec::new();
@@ -2137,9 +2272,17 @@ impl Client {
                     hex::encode(&sender_token[0..4]),
                     e
                 );
+                self.pass_over(sender_token, seq_no);
                 return Ok(Some(sender_token));
             }
         };
+        // The message's place in the sender's ratchet: its chunks were
+        // encrypted one after another, so chunk `index` is at
+        // `first + index`.
+        let span = chunks::position(chunk).ok().and_then(|(index, count)| {
+            let first = seq_no.checked_sub(index as u64)?;
+            Some((first, first + count as u64 - 1))
+        });
         let pt = match self.reassembler.accept(sender_token, chunk) {
             Ok(Some(message)) => message,
             // Waiting on the rest of the message's chunks.
@@ -2150,19 +2293,89 @@ impl Client {
                     hex::encode(&sender_token[0..4]),
                     e
                 );
+                self.pass_over(sender_token, seq_no);
                 return Ok(Some(sender_token));
             }
         };
+        // Hand it over in the order it was sent, which may mean holding it
+        // for one sent before it (see `ordering`).
+        let ready = match (span, self.e2e_sessions.get_mut(&sender_token)) {
+            (Some((first, last)), Some(session)) => {
+                session.delivery.accept(first, last, pt, ordering::now_ms())
+            }
+            _ => vec![pt],
+        };
+        if ready.is_empty() {
+            println!(
+                ">> Holding a message from {} until the ones sent before it arrive.",
+                hex::encode(&sender_token[0..4])
+            );
+        }
+        for text in ready {
+            self.deliver(sender_token, text);
+        }
+        // After delivering: a message can then only be delivered twice if
+        // the app stops in between, never lost.
+        self.save();
+        Ok(Some(sender_token))
+    }
+
+    /// Hand over a message from `sender`, in the order they sent it: print
+    /// it, record it in the chat history, and put it in the inbox for a
+    /// front end to collect (see `drain_inbox`).
+    fn deliver(&mut self, sender: RoutingToken, text: Vec<u8>) {
         println!(
             ">> [From {}]: {}",
-            hex::encode(&sender_token[0..4]),
-            String::from_utf8_lossy(&pt)
+            hex::encode(&sender[0..4]),
+            String::from_utf8_lossy(&text)
         );
-        // Also hand it to any polling consumer (e.g. a GUI) — see the
-        // `inbox` field doc comment above.
-        self.record_message(sender_token, false, &pt);
-        self.inbox.push((sender_token, pt, self.last_recorded_id));
-        Ok(Some(sender_token))
+        self.record_message(sender, false, &text);
+        self.inbox.push(InboxMessage {
+            from: sender,
+            text,
+            history_id: self.last_recorded_id,
+            at_ms: self.last_recorded_at_ms,
+        });
+    }
+
+    /// The payload at ratchet position `seq_no` from `sender` decrypted but
+    /// was dropped: the messages sent after it mustn't wait for it.
+    fn pass_over(&mut self, sender: RoutingToken, seq_no: u64) {
+        let Some(session) = self.e2e_sessions.get_mut(&sender) else {
+            return;
+        };
+        let ready = session
+            .delivery
+            .pass_over(seq_no, seq_no, ordering::now_ms());
+        for text in ready {
+            self.deliver(sender, text);
+        }
+        self.save();
+    }
+
+    /// Hand over the messages that have waited `REORDER_WAIT` for one sent
+    /// before them that hasn't arrived (see `ordering`). Every packet from
+    /// the relay and every `drain_inbox` does this; the CLI, which uses
+    /// neither between packets, calls it itself.
+    pub fn release_held_messages(&mut self) {
+        let now = ordering::now_ms();
+        let mut ready = Vec::new();
+        for (token, session) in &mut self.e2e_sessions {
+            ready.extend(
+                session
+                    .delivery
+                    .release_due(now)
+                    .into_iter()
+                    .map(|text| (*token, text)),
+            );
+        }
+        if ready.is_empty() {
+            return;
+        }
+        for (token, text) in ready {
+            self.deliver(token, text);
+        }
+        self.save();
     }
 
     /// Replay, in seq order, payloads from `sender` held back as not yet
@@ -2382,7 +2595,7 @@ mod tests {
             .unwrap();
         let inner_msg = strip_link(&msg_packet[0], &bob.link.keys().to_relay);
         alice.handle_incoming_packet(&inner_msg).unwrap();
-        let (_, _, live_incoming_id) = alice.drain_inbox().pop().unwrap();
+        let live_incoming_id = alice.drain_inbox().pop().unwrap().history_id;
         let fetched = alice.history_for_contact(bob.identity.routing_token, 10);
         assert_eq!(fetched.last().unwrap().id, live_incoming_id.unwrap());
 
@@ -2614,6 +2827,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -2624,6 +2838,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
         for i in 0..10 {
             let alice_mk = alice_state.symmetric_ratchet();
@@ -2644,6 +2859,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
         let mut seen_keys = std::collections::HashSet::new();
         for _ in 0..100 {
@@ -2669,6 +2885,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
+                delivery: Default::default(),
             },
         );
         bob.e2e_sessions.insert(
@@ -2682,6 +2899,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
+                delivery: Default::default(),
             },
         );
         let (packet, _pq) = alice
@@ -2722,6 +2940,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
+                delivery: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -2778,6 +2997,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
+                delivery: Default::default(),
                 peer_kyber_pub: None, // No Kyber key!
             },
         );
@@ -2814,6 +3034,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
+                delivery: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -2827,6 +3048,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
+                delivery: Default::default(),
                 peer_kyber_pub: Some(alice_kyber_copy),
             },
         );
@@ -2887,6 +3109,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
+                delivery: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -2932,6 +3155,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
         for _ in 0..5 {
             no_pq_state.symmetric_ratchet();
@@ -3672,7 +3896,7 @@ mod tests {
             .unwrap();
         let inner_msg = strip_link(&msg_to_bob[0], &alice1.link.keys().to_relay);
         bob.handle_incoming_packet(&inner_msg).unwrap();
-        assert_eq!(bob.inbox.last().unwrap().1, b"hi bob, it's alice");
+        assert_eq!(bob.inbox.last().unwrap().text, b"hi bob, it's alice");
 
         // --- Alice's identity is deleted and recreated: brand-new keys/token,
         // same self-chosen name. Bob's own state is completely untouched. ---
@@ -3715,14 +3939,17 @@ mod tests {
             .unwrap();
         let inner_msg2 = strip_link(&msg_to_bob2[0], &alice2.link.keys().to_relay);
         bob.handle_incoming_packet(&inner_msg2).unwrap();
-        assert_eq!(bob.inbox.last().unwrap().1, b"hi bob, it's the new alice");
+        assert_eq!(
+            bob.inbox.last().unwrap().text,
+            b"hi bob, it's the new alice"
+        );
 
         let (msg_to_alice2, _) = bob
             .create_encrypted_packets(alice2.identity.routing_token, b"hi new alice, it's bob")
             .unwrap();
         let inner_msg3 = strip_link(&msg_to_alice2[0], &bob.link.keys().to_relay);
         alice2.handle_incoming_packet(&inner_msg3).unwrap();
-        assert_eq!(alice2.inbox.last().unwrap().1, b"hi new alice, it's bob");
+        assert_eq!(alice2.inbox.last().unwrap().text, b"hi new alice, it's bob");
 
         // --- Bob manually forgets the stale old-Alice contact ---
         bob.forget_contact(alice1.identity.routing_token);
@@ -3909,6 +4136,7 @@ mod tests {
                 recv_count: 0,
                 skip_dict: std::collections::HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
+                delivery: Default::default(),
             },
         );
         let chain_before = bob.e2e_sessions[&alice_id.routing_token].recv_chain_key;
@@ -3956,6 +4184,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -3966,6 +4195,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
 
         let mk1 = alice_state.symmetric_ratchet();
@@ -4010,6 +4240,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4020,6 +4251,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
 
         // Receive packet with seq_no 150 (exceeds MAX_SKIP_DICT_ENTRIES of 100)
@@ -4087,6 +4319,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4097,6 +4330,7 @@ mod tests {
             recv_count: 0,
             skip_dict: std::collections::HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
 
         let mk0 = alice_state.symmetric_ratchet();
@@ -4253,6 +4487,17 @@ mod tests {
                     pending: BTreeMap::from([(10, [0xEE; 32])]),
                     applied_through: 5,
                 },
+                delivery: DeliveryOrder {
+                    next: 1,
+                    held: BTreeMap::from([(
+                        2,
+                        ordering::HeldMessage {
+                            last: 2,
+                            text: Some("held 👋".as_bytes().to_vec()),
+                            held_at_ms: 1234,
+                        },
+                    )]),
+                },
             },
         );
         original
@@ -4319,6 +4564,10 @@ mod tests {
             load_sess.recv_pq_injects.pending
         );
         assert_eq!(load_sess.recv_pq_injects.applied_through, 5);
+        assert_eq!(
+            load_sess.delivery, orig_sess.delivery,
+            "a message held for an earlier one must survive the app closing"
+        );
 
         // Verify pending contacts
         assert!(loaded.pending_contacts.contains_key(&peer_token));
@@ -4359,6 +4608,7 @@ mod tests {
                 peer_kyber_pub: None,
                 skip_dict: HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
+                delivery: Default::default(),
             },
         );
 
@@ -4373,6 +4623,7 @@ mod tests {
                 peer_kyber_pub: None,
                 skip_dict: HashMap::new(),
                 recv_pq_injects: RecvPqInjects::default(),
+                delivery: Default::default(),
             },
         );
 
@@ -4385,6 +4636,7 @@ mod tests {
             peer_kyber_pub: None,
             skip_dict: HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
 
         let mut charlie_sender = SymmetricSessionState {
@@ -4396,6 +4648,7 @@ mod tests {
             peer_kyber_pub: None,
             skip_dict: HashMap::new(),
             recv_pq_injects: RecvPqInjects::default(),
+            delivery: Default::default(),
         };
 
         let mut bob_pkts = vec![];
@@ -4519,7 +4772,7 @@ mod tests {
 
         let inbox = bob.drain_inbox();
         assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].1, b"m5");
+        assert_eq!(inbox[0].text, b"m5");
         assert_chains_in_sync(&alice, &bob);
     }
 
@@ -4595,6 +4848,196 @@ mod tests {
     }
 
     // ==========================================
+    // Send Confirmation Tests
+    // ==========================================
+
+    /// A scratch chat history for `client`.
+    fn attach_history(client: &mut Client, name: &str) -> std::path::PathBuf {
+        let db_path = std::env::temp_dir().join(format!(
+            "e2e-messenger-{name}-{}.sqlite",
+            hex::encode(client.identity.routing_token)
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        client.history = Some(ChatHistory::open(&db_path, &[7u8; 32]).unwrap());
+        db_path
+    }
+
+    #[test]
+    fn test_a_message_is_sent_once_the_relay_confirms_it_has_enough_of_it() {
+        let (mut alice, bob) = connected_pair();
+        let db = attach_history(&mut alice, "confirmed");
+        let bob_token = bob.identity.routing_token;
+        let packets = alice.create_fec_packets(bob_token, b"hi").unwrap();
+        let id = alice.last_recorded_id.unwrap();
+        let status = |alice: &Client| alice.history_for_contact(bob_token, 1)[0].status;
+        assert_eq!(status(&alice), Some(SendStatus::Sending));
+
+        // Asking once the burst has gone out: three copies of a request.
+        alice.confirmations.next_request = Some(Instant::now());
+        let requests = alice.receipt_requests();
+        assert_eq!(requests.len(), REQUEST_COPIES);
+        let mut relay = LinkEnd::new(Side::Relay, *alice.link.keys(), alice.link.session_id());
+        for request in &requests {
+            let (header, _) = relay.open(request).unwrap();
+            assert_eq!(header.packet_type, TYPE_RECEIPT_REQUEST);
+        }
+
+        // One short of enough: still sending.
+        let needed = alice.confirmations.pending[0].needed as usize;
+        assert!(needed < packets.len());
+        for packet in &packets[..needed - 1] {
+            relay.open(packet).unwrap();
+        }
+        let receipt = from_relay(&alice, TYPE_RECEIPT, &relay.paced_receipt().to_bytes());
+        alice.handle_relay_packet(&receipt);
+        assert!(alice.drain_send_updates().is_empty());
+
+        relay.open(&packets[packets.len() - 1]).unwrap();
+        let receipt = from_relay(&alice, TYPE_RECEIPT, &relay.paced_receipt().to_bytes());
+        alice.handle_relay_packet(&receipt);
+        assert_eq!(alice.drain_send_updates(), [(Some(id), SendStatus::Sent)]);
+        assert_eq!(status(&alice), Some(SendStatus::Sent));
+        assert!(
+            alice.receipt_requests().is_empty(),
+            "nothing left to ask about"
+        );
+        cleanup(&[&alice, &bob]);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[test]
+    fn test_a_message_the_relay_never_confirms_has_failed() {
+        let (mut alice, bob) = connected_pair();
+        let db = attach_history(&mut alice, "failed");
+        let bob_token = bob.identity.routing_token;
+        alice.create_fec_packets(bob_token, b"lost").unwrap();
+        let id = alice.last_recorded_id.unwrap();
+
+        // A receipt from another link (the relay restarted, say) can't
+        // confirm it.
+        let mut other = LinkEnd::new(Side::Relay, *alice.link.keys(), [0xEE; 4]);
+        let receipt = other.seal(Lane::Direct, TYPE_RECEIPT, &[0; relay_link::RECEIPT_LEN]);
+        alice.handle_relay_packet(&receipt);
+        assert!(alice.drain_send_updates().is_empty());
+
+        alice.confirmations.pending[0].sent_at -= CONFIRM_TIMEOUT;
+        alice.receipt_requests();
+        assert_eq!(alice.drain_send_updates(), [(Some(id), SendStatus::Failed)]);
+        assert_eq!(
+            alice.history_for_contact(bob_token, 1)[0].status,
+            Some(SendStatus::Failed)
+        );
+        cleanup(&[&alice, &bob]);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[test]
+    fn test_messages_carry_the_time_their_history_has() {
+        let (mut alice, mut bob) = connected_pair();
+        let db = attach_history(&mut bob, "times");
+        let msgs = send_messages(&mut alice, &bob, 1);
+        bob.handle_incoming_packet(&msgs[0].0).unwrap();
+        let message = bob.drain_inbox().pop().unwrap();
+        let stored = bob.history_for_contact(alice.identity.routing_token, 1);
+        assert_eq!(Some(stored[0].id), message.history_id);
+        assert_eq!(stored[0].timestamp_ms, message.at_ms);
+        assert!(message.at_ms > 0);
+        cleanup(&[&alice, &bob]);
+        let _ = std::fs::remove_file(db);
+    }
+
+    // ==========================================
+    // Delivery Order Tests
+    // ==========================================
+
+    /// Alice's chunk payloads of `text` for Bob, as they'd reach him.
+    fn chunk_payloads(alice: &mut Client, bob: &Client, text: &str) -> Vec<Vec<u8>> {
+        let (pkts, _) = alice
+            .create_encrypted_packets(bob.identity.routing_token, text.as_bytes())
+            .unwrap();
+        let key = alice.link.keys().to_relay;
+        pkts.iter().map(|p| strip_link(p, &key)).collect()
+    }
+
+    #[test]
+    fn test_messages_are_handed_over_in_the_order_they_were_sent() {
+        let (mut alice, mut bob) = connected_pair();
+        // The middle message is three chunks: three ratchet positions.
+        let long = "b".repeat(2 * chunks::CHUNK_DATA_LEN + 1);
+        let a = chunk_payloads(&mut alice, &bob, "a");
+        let b = chunk_payloads(&mut alice, &bob, &long);
+        let c = chunk_payloads(&mut alice, &bob, "c");
+        assert_eq!(b.len(), 3);
+
+        for payload in c.iter().chain(b.iter().rev()) {
+            bob.handle_incoming_packet(payload).unwrap();
+        }
+        assert!(
+            bob.drain_inbox().is_empty(),
+            "both must wait for the first message"
+        );
+        bob.handle_incoming_packet(&a[0]).unwrap();
+        assert_eq!(inbox_texts(&mut bob), ["a", long.as_str(), "c"]);
+        cleanup(&[&alice, &bob]);
+    }
+
+    #[test]
+    fn test_a_lost_message_holds_the_ones_after_it_up_only_for_a_while() {
+        let (mut alice, mut bob) = connected_pair();
+        let msgs = send_messages(&mut alice, &bob, 3);
+        bob.handle_incoming_packet(&msgs[1].0).unwrap();
+        bob.handle_incoming_packet(&msgs[2].0).unwrap();
+        assert!(bob.drain_inbox().is_empty());
+
+        // As if they had waited `REORDER_WAIT`. Any packet from the relay
+        // then hands them over, even junk: what a phone in the background,
+        // whose front end isn't polling, relies on.
+        let wait = REORDER_WAIT.as_millis() as u64;
+        let session = bob
+            .e2e_sessions
+            .get_mut(&alice.identity.routing_token)
+            .unwrap();
+        for held in session.delivery.held.values_mut() {
+            held.held_at_ms -= wait;
+        }
+        bob.handle_relay_packet(b"junk");
+        assert_eq!(inbox_texts(&mut bob), ["m1", "m2"]);
+
+        // The lost one turning up after all still gets through.
+        bob.handle_incoming_packet(&msgs[0].0).unwrap();
+        assert_eq!(inbox_texts(&mut bob), ["m0"]);
+        cleanup(&[&alice, &bob]);
+    }
+
+    #[test]
+    fn test_sessions_saved_before_ordering_hand_over_their_next_message() {
+        let (mut alice, mut bob) = connected_pair();
+        let msgs = send_messages(&mut alice, &bob, 2);
+        bob.handle_incoming_packet(&msgs[0].0).unwrap();
+        assert_eq!(inbox_texts(&mut bob), ["m0"]);
+
+        // Bob's state as a client from before ordering saved it.
+        let path = bob.state_path.clone();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for session in json["e2e_sessions"].as_object_mut().unwrap().values_mut() {
+            let session = session.as_object_mut().unwrap();
+            assert!(session.remove("delivery_next").is_some());
+            assert!(session.remove("held_messages").is_some());
+        }
+        std::fs::write(&path, json.to_string()).unwrap();
+
+        let mut reloaded = ClientStateDto::load(&path).unwrap();
+        reloaded.handle_incoming_packet(&msgs[1].0).unwrap();
+        assert_eq!(
+            inbox_texts(&mut reloaded),
+            ["m1"],
+            "nothing may wait for messages from before the upgrade"
+        );
+        cleanup(&[&alice, &bob]);
+    }
+
+    // ==========================================
     // Message Padding & Chunking Tests
     // ==========================================
 
@@ -4616,7 +5059,7 @@ mod tests {
             bob.handle_incoming_packet(&inner).unwrap();
             let inbox = bob.drain_inbox();
             assert_eq!(inbox.len(), 1);
-            assert_eq!(inbox[0].1, text.as_bytes());
+            assert_eq!(inbox[0].text, text.as_bytes());
         }
     }
 
@@ -4647,7 +5090,7 @@ mod tests {
         bob.handle_incoming_packet(&inner).unwrap();
         let inbox = bob.drain_inbox();
         assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].1, text.as_bytes());
+        assert_eq!(inbox[0].text, text.as_bytes());
     }
 
     #[test]
@@ -4679,7 +5122,7 @@ mod tests {
         }
         let inbox = bob.drain_inbox();
         assert_eq!(inbox.len(), 2);
-        assert_eq!(inbox[1].1, long);
+        assert_eq!(inbox[1].text, long);
 
         assert_eq!(
             alice.e2e_sessions[&bob_token].send_chain_key,
@@ -4689,7 +5132,7 @@ mod tests {
         let (next, _) = alice.create_encrypted_packets(bob_token, b"after").unwrap();
         bob.handle_incoming_packet(&strip_link(&next[0], &alice.link.keys().to_relay))
             .unwrap();
-        assert_eq!(bob.drain_inbox()[0].1, b"after");
+        assert_eq!(bob.drain_inbox()[0].text, b"after");
     }
 
     #[test]
@@ -4744,7 +5187,7 @@ mod tests {
         bob.handle_incoming_packet(&inner).unwrap();
         let inbox = bob.drain_inbox();
         assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].1, b"hi");
+        assert_eq!(inbox[0].text, b"hi");
     }
 
     #[test]

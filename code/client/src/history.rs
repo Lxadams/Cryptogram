@@ -30,6 +30,41 @@ pub struct StoredMessage {
     pub from_me: bool,
     pub text: String,
     pub timestamp_ms: i64,
+    /// For a message we sent, whether the relay confirmed it has it. `None`
+    /// for received messages, and ones sent before this was tracked.
+    pub status: Option<SendStatus>,
+}
+
+/// What became of a message we sent (see `Client::receipt_requests`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendStatus {
+    /// Waiting for the relay to confirm it has enough of it.
+    Sending,
+    /// The relay has enough of it to deliver.
+    Sent,
+    /// The relay never confirmed it: too little of it got there, or the
+    /// link went down first.
+    Failed,
+}
+
+impl SendStatus {
+    /// Its `status` column value. 0 is none (see `StoredMessage::status`).
+    fn code(self) -> i64 {
+        match self {
+            SendStatus::Sending => 1,
+            SendStatus::Sent => 2,
+            SendStatus::Failed => 3,
+        }
+    }
+
+    fn from_code(code: i64) -> Option<Self> {
+        match code {
+            1 => Some(SendStatus::Sending),
+            2 => Some(SendStatus::Sent),
+            3 => Some(SendStatus::Failed),
+            _ => None,
+        }
+    }
 }
 
 impl ChatHistory {
@@ -50,9 +85,27 @@ impl ChatHistory {
                 contact_token TEXT NOT NULL,
                 from_me INTEGER NOT NULL,
                 body TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL
+                timestamp_ms INTEGER NOT NULL,
+                status INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_token, id);",
+        )?;
+        // Databases from before send statuses lack the column.
+        let has_status: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('messages') WHERE name = 'status'",
+            [],
+            |row| row.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_status {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN status INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        // A message still sending when the app last closed can't be
+        // confirmed now: what it would have been checked against is gone.
+        conn.execute(
+            "UPDATE messages SET status = ?1 WHERE status = ?2",
+            params![SendStatus::Failed.code(), SendStatus::Sending.code()],
         )?;
         Ok(Self { conn })
     }
@@ -68,11 +121,32 @@ impl ChatHistory {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
+        self.append_at(contact_token, from_me, text, timestamp_ms)
+    }
+
+    /// `append`, timestamped `timestamp_ms` (Unix milliseconds), so a caller
+    /// can show the message with the same time a later fetch will.
+    pub fn append_at(
+        &self,
+        contact_token: RoutingToken,
+        from_me: bool,
+        text: &str,
+        timestamp_ms: i64,
+    ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO messages (contact_token, from_me, body, timestamp_ms) VALUES (?1, ?2, ?3, ?4)",
             params![hex::encode(contact_token), from_me as i64, text, timestamp_ms],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Record what became of message `id`, one we sent.
+    pub fn set_status(&self, id: i64, status: SendStatus) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET status = ?1 WHERE id = ?2",
+            params![status.code(), id],
+        )?;
+        Ok(())
     }
 
     /// Permanently delete all locally-stored history with `contact_token`.
@@ -90,7 +164,7 @@ impl ChatHistory {
     /// The most recent `limit` messages with `contact_token`, oldest first.
     pub fn recent(&self, contact_token: RoutingToken, limit: i64) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, from_me, body, timestamp_ms FROM messages
+            "SELECT id, from_me, body, timestamp_ms, status FROM messages
              WHERE contact_token = ?1 ORDER BY id DESC LIMIT ?2",
         )?;
         let mut rows = stmt.query(params![hex::encode(contact_token), limit])?;
@@ -101,6 +175,7 @@ impl ChatHistory {
                 from_me: row.get::<_, i64>(1)? != 0,
                 text: row.get(2)?,
                 timestamp_ms: row.get(3)?,
+                status: SendStatus::from_code(row.get(4)?),
             });
         }
         out.reverse();
@@ -175,6 +250,77 @@ mod tests {
         let msgs = reopened.recent(contact, 10).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].text, "persisted?");
+    }
+
+    #[test]
+    fn test_send_statuses_are_kept_and_a_send_cut_short_has_failed() {
+        let db = ScratchDb::new("statuses");
+        let key = [8u8; 32];
+        let contact = [2u8; 16];
+        let (sent, sending, received) = {
+            let history = ChatHistory::open(&db.0, &key).unwrap();
+            let sent = history.append_at(contact, true, "sent", 1000).unwrap();
+            history.set_status(sent, SendStatus::Sent).unwrap();
+            let sending = history.append(contact, true, "sending").unwrap();
+            history.set_status(sending, SendStatus::Sending).unwrap();
+            let received = history.append(contact, false, "received").unwrap();
+            let msgs = history.recent(contact, 10).unwrap();
+            assert_eq!(msgs[0].timestamp_ms, 1000);
+            assert_eq!(msgs[1].status, Some(SendStatus::Sending));
+            (sent, sending, received)
+        };
+
+        // Reopened, as when the app starts again: the one still sending
+        // can't be confirmed any more.
+        let reopened = ChatHistory::open(&db.0, &key).unwrap();
+        let statuses: Vec<_> = reopened
+            .recent(contact, 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.id, m.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                (sent, Some(SendStatus::Sent)),
+                (sending, Some(SendStatus::Failed)),
+                (received, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_a_database_from_before_statuses_gains_them() {
+        let db = ScratchDb::new("old_schema");
+        let key = [5u8; 32];
+        {
+            let conn = Connection::open(&db.0).unwrap();
+            conn.pragma_update(None, "key", format!("x'{}'", hex::encode(key)))
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contact_token TEXT NOT NULL,
+                    from_me INTEGER NOT NULL,
+                    body TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL
+                );
+                INSERT INTO messages (contact_token, from_me, body, timestamp_ms)
+                    VALUES ('01010101010101010101010101010101', 1, 'old', 5);",
+            )
+            .unwrap();
+        }
+        let history = ChatHistory::open(&db.0, &key).unwrap();
+        let contact = [1u8; 16];
+        let msgs = history.recent(contact, 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].status, None);
+        let id = history.append(contact, true, "new").unwrap();
+        history.set_status(id, SendStatus::Sent).unwrap();
+        assert_eq!(
+            history.recent(contact, 10).unwrap()[1].status,
+            Some(SendStatus::Sent)
+        );
     }
 
     #[test]

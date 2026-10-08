@@ -240,6 +240,11 @@ shows this as an ongoing "Connected" notification.
   delete the identity you're logged into.
 - **No backups.** Android's cloud backup and phone-to-phone transfer are
   switched off for this app, so identities never leave the phone.
+- **Message marks.** A message you send gets a ✓ once the relay has it, or
+  a red ! if it didn't get there within 30 seconds (send it again). The ✓
+  doesn't mean they've read it, or even received it yet: the relay holds it
+  until their phone takes it. Every message shows the time it was sent or
+  arrived.
 - **No screenshots.** The app blocks screenshots and screen recording, and
   shows as blank on the recent-apps screen, so no other app can capture
   your chats. That includes your QR code: show it to people in person.
@@ -290,6 +295,18 @@ must be on the same Wi-Fi.
    talking to each other. This is common on campus and office networks.
    Turn on the phone's hotspot, connect the PC to it, and run steps 1 and 3
    again.
+
+**Over a bad network.** Start the relay with `./runserver-lan-lossy.sh`
+instead of `./runserver-lan.sh` in step 1. It drops 70% of packets each
+way, and phones connect to it the same way.
+- **Changing the loss:** type a new one and press Enter, `0` for none.
+  Adding a contact at 70% can take many minutes, as its packets are only
+  resent after 30 s, then 60 s and so on. So add contacts at `0`, then type
+  `0.7`.
+- **Jamming only one phone:** port 4431 reaches the relay with no loss.
+  Build the other phone with `./runpeer-lan.sh --mobile <this PC's IP>:4431`.
+  On WSL, also allow UDP 4431 as in step 2.3, with another `-Name` and
+  `-LocalPorts 4431`.
 
 ## Troubleshooting
 

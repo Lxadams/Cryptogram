@@ -153,7 +153,7 @@ pub(crate) fn inbox_texts(client: &mut Client) -> Vec<String> {
     client
         .drain_inbox()
         .into_iter()
-        .map(|(_, pt, _)| String::from_utf8(pt).unwrap())
+        .map(|m| String::from_utf8(m.text).unwrap())
         .collect()
 }
 

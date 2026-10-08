@@ -70,6 +70,12 @@ on_request(request):
         nothing from the relay for 2 minutes (it restarted, or the link expired) does
         the handshake again.
         Wake the outbound task.
+    If a 'Receipt Request' is received (type 9, empty) from the link's address:
+        Reply with a receipt (type 10, three times, REPLY_COPIES): the newest packet
+        number taken in from the client's paced lane (its messages), and which of the
+        1024 before it. The client asks every 2 s after sending, so it can show a check
+        mark once the relay has enough of a message to deliver it. From any other
+        address, send nothing: three replies must never go to someone else.
     If a 'Path Response' request is received (type 7: the challenge, echoed):
         If it answers a challenge for this link at the address it came from (from the
         last 10-20 s), the link has moved there: send it everything there from now on,

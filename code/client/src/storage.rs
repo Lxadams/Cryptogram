@@ -1,3 +1,4 @@
+use crate::ordering::{DeliveryOrder, HeldMessage};
 use crate::pq::{Ciphertext, PublicKey, SecretKey};
 use crate::{
     AddIds, Client, RecvPqInjects, SessionOffer, SessionSetup, SymmetricSessionState, UserIdentity,
@@ -104,6 +105,22 @@ pub struct SymmetricSessionStateDto {
     pub pending_pq_injects: HashMap<u64, String>,
     #[serde(default)]
     pub pq_applied_through: u64,
+    // Where handing the peer's messages over in order is up to, and the
+    // ones held for an earlier message (see `DeliveryOrder`). Older state
+    // files predate both, so their next message is handed over as it comes.
+    #[serde(default)]
+    pub delivery_next: Option<u64>,
+    #[serde(default)]
+    pub held_messages: Vec<HeldMessageDto>,
+}
+
+/// A `HeldMessage`, by the ratchet position of its first chunk.
+#[derive(Serialize, Deserialize)]
+pub struct HeldMessageDto {
+    pub first: u64,
+    pub last: u64,
+    pub text: Option<String>,
+    pub held_at_ms: u64,
 }
 
 impl ClientStateDto {
@@ -158,6 +175,18 @@ impl ClientStateDto {
                     skip_dict,
                     pending_pq_injects,
                     pq_applied_through: state.recv_pq_injects.applied_through,
+                    delivery_next: Some(state.delivery.next),
+                    held_messages: state
+                        .delivery
+                        .held
+                        .iter()
+                        .map(|(&first, held)| HeldMessageDto {
+                            first,
+                            last: held.last,
+                            text: held.text.as_ref().map(hex::encode),
+                            held_at_ms: held.held_at_ms,
+                        })
+                        .collect(),
                 },
             );
         }
@@ -328,6 +357,18 @@ impl ClientStateDto {
                 hex::decode_to_slice(&hex_secret, &mut secret)?;
                 pending_pq_injects.insert(position, secret);
             }
+            let mut delivery =
+                DeliveryOrder::starting_at(dto_state.delivery_next.unwrap_or(dto_state.recv_count));
+            for held in dto_state.held_messages {
+                delivery.held.insert(
+                    held.first,
+                    HeldMessage {
+                        last: held.last,
+                        text: held.text.map(hex::decode).transpose()?,
+                        held_at_ms: held.held_at_ms,
+                    },
+                );
+            }
 
             e2e_sessions.insert(
                 tok,
@@ -343,6 +384,7 @@ impl ClientStateDto {
                         pending: pending_pq_injects,
                         applied_through: dto_state.pq_applied_through,
                     },
+                    delivery,
                 },
             );
         }
@@ -446,11 +488,14 @@ impl ClientStateDto {
             inbox: Vec::new(), // transient handoff buffer, not persisted
             history: None,     // attached separately once a vault key is available
             last_recorded_id: None,
-            identity_store: None, // attached separately once a vault key is available
+            last_recorded_at_ms: 0,
+            confirmations: Default::default(), // live state, not persisted
+            send_updates: Vec::new(),          // live state, not persisted
+            identity_store: None,              // attached separately once a vault key is available
             reassembler: Default::default(), // live state, not persisted — see Client::reassembler
-            fec_rx: Default::default(), // in-flight FEC state, not persisted
+            fec_rx: Default::default(),      // in-flight FEC state, not persisted
             recent_deliveries: Default::default(), // live state, not persisted
-            admission_changed: false, // live state, not persisted
+            admission_changed: false,        // live state, not persisted
             requests_muted: self.requests_muted,
             notify_with_names: self.notify_with_names,
             connection_requests: Vec::new(), // live state, not persisted

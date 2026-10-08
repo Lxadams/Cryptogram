@@ -50,7 +50,7 @@ const MESSAGE_MAX_FAILURE: f64 = 1e-4;
 /// desyncs the ratchet for good, not just one message.
 const PQ_MESSAGE_MAX_FAILURE: f64 = 1e-6;
 /// Gap between consecutive packets of a burst (see `send_burst`).
-const FEC_PACKET_SPACING: Duration = Duration::from_millis(10);
+pub(crate) const FEC_PACKET_SPACING: Duration = Duration::from_millis(10);
 
 /// How long, and how many, messages are parked per peer waiting for a PQ
 /// inject they were encrypted after.
@@ -110,16 +110,29 @@ pub(crate) fn encode_message(
     chunks: &[Vec<u8>],
     pq_inject: Option<&[u8]>,
 ) -> Result<Vec<Vec<u8>>> {
-    let mut parts: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-    parts.extend(pq_inject);
     let max_failure = match pq_inject {
         Some(_) => PQ_MESSAGE_MAX_FAILURE,
         None => MESSAGE_MAX_FAILURE,
     };
-    let object = bundle(&parts);
+    let object = message_object(chunks, pq_inject);
     let packets = fec::packets_for(object.len(), FEC_DESIGN_LOSS, max_failure);
     let symbols = fec::encode(object_id, &object, packets)?;
     Ok(seal_symbols(root_key, sender, target, &symbols))
+}
+
+/// How many of the symbols `encode_message` makes for a message the relay
+/// must have for the recipient to rebuild it all but certainly: one more
+/// than its source symbols, with which decoding fails 1 time in 10,000.
+pub(crate) fn symbols_needed(chunks: &[Vec<u8>], pq_inject: Option<&[u8]>) -> u32 {
+    fec::source_symbols_for(message_object(chunks, pq_inject).len()) + 1
+}
+
+/// A message's chunks, and the PQ inject that follows them if any, as one
+/// FEC object.
+fn message_object(chunks: &[Vec<u8>], pq_inject: Option<&[u8]>) -> Vec<u8> {
+    let mut parts: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+    parts.extend(pq_inject);
+    bundle(&parts)
 }
 
 /// Seal FEC symbols end to end: one 0x07 inner payload per symbol.

@@ -5,7 +5,7 @@ use rand_core::{OsRng, RngCore};
 use relay_link::{
     CHAT_INNER_PAYLOAD_LEN, Challenge, LinkEnd, REPLY_COPIES, SessionId, Sync, TYPE_ACK,
     TYPE_ADMITTED_DATA, TYPE_DATA, TYPE_HANDSHAKE_INIT, TYPE_HANDSHAKE_RESP, TYPE_PATH_CHALLENGE,
-    TYPE_PATH_RESPONSE, TYPE_SYNC, TYPE_SYNC_ACK,
+    TYPE_PATH_RESPONSE, TYPE_RECEIPT, TYPE_RECEIPT_REQUEST, TYPE_SYNC, TYPE_SYNC_ACK,
 };
 use sha2::Sha256;
 use std::{
@@ -213,18 +213,20 @@ async fn main() -> Result<()> {
     }
 }
 
-/// How many times to send `reply`: handshake replies and sync acks several
-/// times, to get through loss (`REPLY_COPIES`; an init is padded to more
-/// than all of its copies, so this never amplifies), anything else once.
+/// How many times to send `reply`: handshake replies, sync acks and
+/// receipts several times, to get through loss (`REPLY_COPIES`; an init is
+/// padded to more than all of its copies, so this never amplifies, and the
+/// others only go to where their link has shown it is), anything else once.
 fn copies_of(reply: &[u8]) -> usize {
     match reply.first() {
-        Some(&TYPE_HANDSHAKE_RESP | &TYPE_SYNC_ACK) => REPLY_COPIES,
+        Some(&TYPE_HANDSHAKE_RESP | &TYPE_SYNC_ACK | &TYPE_RECEIPT) => REPLY_COPIES,
         _ => 1,
     }
 }
 
 /// Handle one packet from `socket_address`. Returns the reply to send back
-/// there, if any: a handshake reply, a path challenge, or a sync ack.
+/// there, if any: a handshake reply, a path challenge, a sync ack or a
+/// receipt.
 fn handle_request(
     tables: &Arc<Mutex<Tables>>,
     keys: &RelayKeys,
@@ -335,6 +337,18 @@ fn handle_request(
                 .lock()
                 .unwrap()
                 .move_link(&session_id, socket_address, METADATA_TTL);
+        }
+        TYPE_RECEIPT_REQUEST => {
+            let mut tables = tables.lock().unwrap();
+            // Only to where the link has shown it is, like everything else
+            // on it. A request replayed from elsewhere was refused above, but
+            // a copy raced there ahead of the real one mustn't send three
+            // receipts to someone else. The client asks again anyway.
+            if tables.link_addr(&session_id) != Some(socket_address) {
+                return Err(anyhow!("Receipt request from where its link isn't"));
+            }
+            debug!("Receipt request");
+            return Ok(tables.receipt_for(&session_id));
         }
         TYPE_ACK => {
             let (routing_token, ids) =
@@ -1470,6 +1484,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(copies_of(&challenge), 1);
+    }
+
+    /// A client asking which of its message packets arrived gets a receipt
+    /// saying so, several times over, at its link's address only.
+    #[test]
+    fn test_receipt_requests_say_which_message_packets_arrived() {
+        let (tables, keys) = relay();
+        let mut link = link_up(&tables, &keys, addr(50000));
+        let first = link.end.next_packet_number(Lane::Paced);
+        for i in 0..6u64 {
+            let packet = relay_link::data_packet(&mut link.end, Lane::Paced, &[7; 16], None, b"x");
+            if i != 2 {
+                let _ = handle_request(&tables, &keys, addr(50000), &packet).unwrap();
+            }
+        }
+
+        let request = link.end.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]);
+        let reply = handle_request(&tables, &keys, addr(50000), &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copies_of(&reply), REPLY_COPIES);
+        let (header, plaintext) = link.end.open(&reply).unwrap();
+        assert_eq!(header.packet_type, TYPE_RECEIPT);
+        let receipt = relay_link::Receipt::from_bytes(&plaintext).unwrap();
+        for i in 0..6 {
+            assert_eq!(receipt.taken_in(first + i), Some(i != 2), "packet {i}");
+        }
+
+        // Not to another address, even with a fresh request.
+        let elsewhere = link.end.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]);
+        assert!(handle_request(&tables, &keys, addr(50001), &elsewhere).is_err());
     }
 
     /// The relay's identity key is written for its owner's eyes only.

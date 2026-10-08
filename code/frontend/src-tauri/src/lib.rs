@@ -29,6 +29,7 @@ pub fn run() {
             commands::notification_settings,
             commands::set_notify_with_names,
             commands::send_message,
+            commands::sent_message_updates,
             commands::poll_inbox,
             commands::chat_history,
         ])

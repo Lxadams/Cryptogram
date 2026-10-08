@@ -39,6 +39,69 @@ struct ChatMessage {
     id: u64,
     from_me: bool,
     text: String,
+    /// When it was sent or arrived, in Unix milliseconds.
+    timestamp_ms: Option<i64>,
+    /// For a message we sent, whether the relay has confirmed it has it.
+    status: Option<SendStatus>,
+}
+
+/// What became of a message we sent: shown as nothing yet, a check mark, or
+/// a red exclamation mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SendStatus {
+    /// Waiting for the relay to confirm it has it.
+    Sending,
+    /// The relay has enough of it to deliver.
+    Sent,
+    /// The relay didn't confirm it in time.
+    Failed,
+}
+
+impl SendStatus {
+    /// From its name in `api::StoredMessageDto` and
+    /// `api::SentMessageUpdateDto`.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "sending" => Some(SendStatus::Sending),
+            "sent" => Some(SendStatus::Sent),
+            "failed" => Some(SendStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// `timestamp_ms` as the time of day in the user's locale ("14:05", or
+/// "2:05 pm"), with the date in front if it isn't today.
+fn format_time(timestamp_ms: i64) -> String {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(timestamp_ms as f64));
+    let options = |fields: &[(&str, &str)]| {
+        let object = js_sys::Object::new();
+        for (key, value) in fields {
+            let _ = js_sys::Reflect::set(&object, &(*key).into(), &(*value).into());
+        }
+        wasm_bindgen::JsValue::from(object)
+    };
+    let time: String = date
+        .to_locale_time_string_with_options(
+            "default",
+            &options(&[("hour", "2-digit"), ("minute", "2-digit")]),
+        )
+        .into();
+    let now = js_sys::Date::new_0();
+    let today = date.get_full_year() == now.get_full_year()
+        && date.get_month() == now.get_month()
+        && date.get_date() == now.get_date();
+    if today {
+        time
+    } else {
+        let day: String = date
+            .to_locale_date_string(
+                "default",
+                &options(&[("day", "numeric"), ("month", "short")]),
+            )
+            .into();
+        format!("{day}, {time}")
+    }
 }
 
 fn next_message_id() -> u64 {
@@ -743,6 +806,8 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                             id: history_message_id(m.id),
                             from_me: m.from_me,
                             text: m.text,
+                            timestamp_ms: Some(m.timestamp_ms),
+                            status: m.status.as_deref().and_then(SendStatus::from_name),
                         })
                         .filter(|m| !existing_ids.contains(&m.id))
                         .collect();
@@ -796,7 +861,24 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                                 .unwrap_or_else(next_message_id),
                             from_me: false,
                             text: msg.text,
+                            timestamp_ms: Some(msg.timestamp_ms),
+                            status: None,
                         });
+                    }
+                });
+            }
+            // Whether the relay got what we sent: a check mark, or a red
+            // exclamation mark if it didn't in time.
+            if let Ok(updates) = api::sent_message_updates().await
+                && !updates.is_empty()
+            {
+                messages.update(|map| {
+                    for update in updates {
+                        let id = history_message_id(update.id);
+                        let status = SendStatus::from_name(&update.status);
+                        if let Some(message) = map.values_mut().flatten().find(|m| m.id == id) {
+                            message.status = status;
+                        }
                     }
                 });
             }
@@ -1282,7 +1364,7 @@ fn ChatPanel(
         let text_for_history = text.clone();
         leptos::task::spawn_local(async move {
             match api::send_message(&token_for_task, &text).await {
-                Ok(history_id) => {
+                Ok(sent) => {
                     messages.update(|map| {
                         map.entry(token_for_task).or_default().push(ChatMessage {
                             // Same reasoning as the incoming side in
@@ -1290,11 +1372,16 @@ fn ChatPanel(
                             // chat-history row id so this optimistic
                             // display agrees with a later `chat_history`
                             // fetch on what identifies this message.
-                            id: history_id
+                            id: sent
+                                .id
                                 .map(history_message_id)
                                 .unwrap_or_else(next_message_id),
                             from_me: true,
                             text: text_for_history,
+                            timestamp_ms: Some(sent.timestamp_ms),
+                            // Its check mark (or not) comes later, from
+                            // `api::sent_message_updates`.
+                            status: Some(SendStatus::Sending),
                         });
                     });
                 }
@@ -1386,13 +1473,29 @@ fn ChatPanel(
                             _ => None,
                         }}
                         <div class="transcript" node_ref=transcript_ref>
+                            // Keyed on the status too, so a message is drawn
+                            // again when its check mark comes.
                             <For
                                 each=history
-                                key=|m| m.id
+                                key=|m| (m.id, m.status)
                                 let(msg)
                             >
                                 <p class:from-me=msg.from_me class:from-peer=!msg.from_me>
                                     {msg.text.clone()}
+                                    <span class="msg-meta">
+                                        {msg.timestamp_ms.map(|ms| view! {
+                                            <span class="msg-time">{format_time(ms)}</span>
+                                        })}
+                                        {match msg.status {
+                                            Some(SendStatus::Sent) => Some(view! {
+                                                <span class="msg-status sent" title="The relay has it">"✓"</span>
+                                            }.into_any()),
+                                            Some(SendStatus::Failed) => Some(view! {
+                                                <span class="msg-status failed" title="It didn't get to the relay. Try sending it again.">"!"</span>
+                                            }.into_any()),
+                                            _ => None,
+                                        }}
+                                    </span>
                                 </p>
                             </For>
                         </div>

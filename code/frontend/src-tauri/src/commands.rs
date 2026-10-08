@@ -9,7 +9,7 @@ use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use client::{
     derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
     BurstSender, ChatHistory, Client, ClientStateDto, ContactStatus, IdentityStateStore,
-    RoutingToken,
+    RoutingToken, SendStatus,
 };
 use serde::Serialize;
 use std::{
@@ -800,6 +800,36 @@ pub struct IncomingMessageDto {
     /// `send_message`'s doc comment for why the frontend needs this instead
     /// of minting its own id for a live-delivered message.
     pub id: Option<i64>,
+    /// When it arrived, in Unix milliseconds: the time its history row has.
+    pub timestamp_ms: i64,
+}
+
+/// What `send_message` reports about the message it sent.
+#[derive(Serialize, Clone)]
+pub struct SentMessageDto {
+    /// Its chat-history row id (see `send_message`).
+    pub id: Option<i64>,
+    /// When it was sent, in Unix milliseconds: the time its history row has.
+    pub timestamp_ms: i64,
+}
+
+/// What became of a message we sent (see `sent_message_updates`).
+#[derive(Serialize, Clone)]
+pub struct SentMessageUpdateDto {
+    /// Its chat-history row id.
+    pub id: i64,
+    /// `"sent"` once the relay confirms it has it, `"failed"` if it didn't
+    /// in time.
+    pub status: &'static str,
+}
+
+/// A send status as the frontend names it.
+fn status_name(status: SendStatus) -> &'static str {
+    match status {
+        SendStatus::Sending => "sending",
+        SendStatus::Sent => "sent",
+        SendStatus::Failed => "failed",
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -810,6 +840,10 @@ pub struct StoredMessageDto {
     pub from_me: bool,
     pub text: String,
     pub timestamp_ms: i64,
+    /// For a message we sent: `"sending"`, `"sent"` or `"failed"` (see
+    /// `SentMessageUpdateDto`). `None` for received ones, and ones sent
+    /// before statuses were kept.
+    pub status: Option<&'static str>,
 }
 
 fn identity_dto(client: &Client) -> IdentityDto {
@@ -883,7 +917,8 @@ pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Ide
     // relative to the `state.runtime` write below doesn't matter.
     let tasks = vec![
         spawn_receive_loop(app.clone(), socket.clone()),
-        spawn_keepalive_loop(app, socket.clone()),
+        spawn_keepalive_loop(app.clone(), socket.clone()),
+        spawn_tick_loop(app, socket.clone()),
     ];
 
     let bursts = BurstSender::spawn(socket.clone(), client.server_addr);
@@ -981,6 +1016,42 @@ fn spawn_keepalive_loop(
     })
 }
 
+/// Background task, twice a second: ask the relay which of our messages it
+/// has (see `Client::receipt_requests`), and hand over any message held for
+/// one sent before it that has waited long enough (see
+/// `Client::release_held_messages`), with a notification, as the receive
+/// loop would have if a packet had come in.
+fn spawn_tick_loop(app: AppHandle, socket: Arc<UdpSocket>) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            ticker.tick().await;
+            let mut guard = state.runtime.lock().await;
+            let Some(rt) = guard.as_mut() else {
+                continue;
+            };
+            let inbox_before = rt.client.inbox.len();
+            rt.client.release_held_messages();
+            notify_new_messages(&rt.client, inbox_before);
+            let packets = rt.client.receipt_requests();
+            let server_addr = rt.client.server_addr;
+            drop(guard);
+            for packet in packets {
+                let _ = socket.send_to(&packet, server_addr).await;
+            }
+        }
+    })
+}
+
+/// Tell `background` about each message in the inbox from `inbox_before`
+/// on, so Android can show a notification while the app isn't on screen.
+fn notify_new_messages(client: &Client, inbox_before: usize) {
+    for message in client.inbox.iter().skip(inbox_before) {
+        background::message_received(notification_sender(client, &message.from).as_deref());
+    }
+}
+
 /// Background task: read inbound UDP packets for as long as the app runs
 /// and hand them to the client state machine (`Client::handle_relay_packet`,
 /// which also produces the ack the relay waits for) — exactly what the
@@ -1013,9 +1084,7 @@ fn spawn_receive_loop(
             };
             let inbox_before = rt.client.inbox.len();
             let replies = rt.client.handle_relay_packet(&buf[..len]);
-            for (from, _, _) in &rt.client.inbox[inbox_before..] {
-                background::message_received(notification_sender(&rt.client, from).as_deref());
-            }
+            notify_new_messages(&rt.client, inbox_before);
             for packet in replies {
                 let _ = socket.send_to(&packet, rt.client.server_addr).await;
             }
@@ -1222,13 +1291,15 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
 /// attached), so the frontend can label its own optimistic display of this
 /// message with the *same* id a later `chat_history` fetch would report for
 /// it — otherwise the two views disagree on what identifies "this message"
-/// and a merge between them can't tell they're the same one.
+/// and a merge between them can't tell they're the same one. And when it
+/// was sent, which the history has too. Whether the relay gets it comes
+/// later, from `sent_message_updates`.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn send_message(
     state: State<'_, AppState>,
     token_hex: String,
     text: String,
-) -> Result<Option<i64>, String> {
+) -> Result<SentMessageDto, String> {
     let mut guard = state.runtime.lock().await;
     let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
 
@@ -1238,7 +1309,10 @@ pub async fn send_message(
         .client
         .create_fec_packets(token, text.as_bytes())
         .map_err(|e| e.to_string())?;
-    let history_id = rt.client.last_recorded_id;
+    let sent = SentMessageDto {
+        id: rt.client.last_recorded_id,
+        timestamp_ms: rt.client.last_recorded_at_ms,
+    };
 
     // Queued while we still hold the runtime lock, so bursts go out in the
     // order they were made (see `BurstSender::queue`). It's paced out over a
@@ -1251,7 +1325,29 @@ pub async fn send_message(
         .await
         .map_err(|e| format!("Message not sent: {e}"))?;
 
-    Ok(history_id)
+    Ok(sent)
+}
+
+/// What became of messages we sent since the last call: confirmed by the
+/// relay, or not in time (see `Client::drain_send_updates`). The frontend
+/// polls this with `poll_inbox`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn sent_message_updates(
+    state: State<'_, AppState>,
+) -> Result<Vec<SentMessageUpdateDto>, String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    Ok(rt
+        .client
+        .drain_send_updates()
+        .into_iter()
+        .filter_map(|(id, status)| {
+            Some(SentMessageUpdateDto {
+                id: id?,
+                status: status_name(status),
+            })
+        })
+        .collect())
 }
 
 /// Collect any messages decrypted since the last poll. The frontend calls
@@ -1269,10 +1365,11 @@ pub async fn poll_inbox(state: State<'_, AppState>) -> Result<Vec<IncomingMessag
         .client
         .drain_inbox()
         .into_iter()
-        .map(|(token, bytes, id)| IncomingMessageDto {
-            from_token: hex::encode(token),
-            text: String::from_utf8_lossy(&bytes).into_owned(),
-            id,
+        .map(|message| IncomingMessageDto {
+            from_token: hex::encode(message.from),
+            text: String::from_utf8_lossy(&message.text).into_owned(),
+            id: message.history_id,
+            timestamp_ms: message.at_ms,
         })
         .collect())
 }
@@ -1303,6 +1400,7 @@ pub async fn chat_history(
             from_me: m.from_me,
             text: m.text,
             timestamp_ms: m.timestamp_ms,
+            status: m.status.map(status_name),
         })
         .collect())
 }

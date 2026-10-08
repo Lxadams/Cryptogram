@@ -403,6 +403,17 @@ impl Tables {
         Some(link.end.seal(Lane::Direct, packet_type, plaintext))
     }
 
+    /// A `TYPE_RECEIPT` for link `session_id`: which of its paced-lane
+    /// packets (its messages) it has taken in.
+    pub fn receipt_for(&mut self, session_id: &SessionId) -> Option<Vec<u8>> {
+        let link = self.active_links.get_mut(session_id)?;
+        let receipt = link.end.paced_receipt().to_bytes();
+        Some(
+            link.end
+                .seal(Lane::Direct, relay_link::TYPE_RECEIPT, &receipt),
+        )
+    }
+
     /// `packet`, sealed for the client on its link, if the link is still
     /// there.
     pub fn forward(&mut self, packet: &DuePacket) -> Option<Vec<u8>> {

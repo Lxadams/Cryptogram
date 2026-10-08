@@ -27,6 +27,7 @@ Every five messages, the sender also mixes a fresh ML-KEM secret into its chain 
 Once a session is established, messages are encrypted with a **symmetric hash ratchet**, not the Double Ratchet:
 - **Forward secrecy, per message:** every message gets its own key, from a chain that only moves forward (HMAC-SHA256), so earlier messages' keys can't be recovered from the current state.
 - **Out-of-order delivery:** a bounded skip dictionary holds at most 500 skipped keys, and nothing more than 100 messages ahead is accepted. Used keys are destroyed.
+- **In-order display:** messages are shown in the order they were sent. One that arrives ahead of an earlier one waits up to 10 seconds for it.
 - **No healing yet:** without a Diffie-Hellman step, the ratchet doesn't recover from a compromise on its own (see the roadmap).
 
 ### 4. Extreme Loss Tolerance (RaptorQ FEC)

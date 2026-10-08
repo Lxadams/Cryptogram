@@ -14,13 +14,13 @@
 //!
 //! Needs the relay running (./runserver.sh, or `cargo run` in code/server);
 //! SERVER_ADDR overrides its address (default 127.0.0.1:4430). Exits
-//! non-zero unless every message arrived and both ratchets stayed in step.
+//! non-zero unless every message arrived, in the order it was sent, and
+//! both ratchets stayed in step.
 
 use anyhow::{Result, anyhow, bail};
 use client::{Client, RoutingToken, parse_verifying_key, perform_handshake, send_burst};
 use ed25519_dalek::VerifyingKey;
 use rand_core::{OsRng, RngCore};
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -194,8 +194,8 @@ const DELIVERY_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Send `count` messages from `from` to `to` as paced FEC bursts, then wait
 /// until they've all arrived, or `DELIVERY_DEADLINE` passes. Returns how
-/// many arrived.
-async fn one_way(from: &Peer, to: &Peer, count: usize, label: &str) -> Result<usize> {
+/// many arrived, and whether in the order they were sent.
+async fn one_way(from: &Peer, to: &Peer, count: usize, label: &str) -> Result<(usize, bool)> {
     let _ = to.client.lock().await.drain_inbox(); // start from an empty inbox
     from.proxy.take_counts();
     to.proxy.take_counts();
@@ -213,7 +213,7 @@ async fn one_way(from: &Peer, to: &Peer, count: usize, label: &str) -> Result<us
     }
 
     let last_sent = Instant::now();
-    let mut got = HashSet::new();
+    let mut got: Vec<String> = Vec::new();
     while sent.iter().any(|s| !got.contains(s)) && last_sent.elapsed() < DELIVERY_DEADLINE {
         tokio::time::sleep(Duration::from_millis(100)).await;
         got.extend(
@@ -222,24 +222,34 @@ async fn one_way(from: &Peer, to: &Peer, count: usize, label: &str) -> Result<us
                 .await
                 .drain_inbox()
                 .into_iter()
-                .map(|(_, pt, _)| String::from_utf8_lossy(&pt).into_owned()),
+                .map(|m| String::from_utf8_lossy(&m.text).into_owned()),
         );
     }
     let waited = last_sent.elapsed();
     let delivered = sent.iter().filter(|s| got.contains(*s)).count();
+    // In order if each message arrived after every one sent before it.
+    let in_order = got
+        .iter()
+        .filter_map(|text| sent.iter().position(|s| s == text))
+        .is_sorted();
 
     let (a_dropped, a_carried) = from.proxy.take_counts();
     let (b_dropped, b_carried) = to.proxy.take_counts();
     let pct = |d: usize, c: usize| 100.0 * d as f64 / (d + c).max(1) as f64;
     println!(
-        "{label}: {delivered}/{count} delivered, {:.1}s after the last was sent | sender's link dropped {a_dropped}/{} ({:.1}%), receiver's link dropped {b_dropped}/{} ({:.1}%)",
+        "{label}: {delivered}/{count} delivered{}, {:.1}s after the last was sent | sender's link dropped {a_dropped}/{} ({:.1}%), receiver's link dropped {b_dropped}/{} ({:.1}%)",
+        if in_order {
+            " in order"
+        } else {
+            " OUT OF ORDER"
+        },
         waited.as_secs_f64(),
         a_dropped + a_carried,
         pct(a_dropped, a_carried),
         b_dropped + b_carried,
         pct(b_dropped, b_carried),
     );
-    Ok(delivered)
+    Ok((delivered, in_order))
 }
 
 #[tokio::main]
@@ -293,8 +303,8 @@ async fn main() -> Result<()> {
     alice.proxy.jam(alice_loss);
     bob.proxy.jam(bob_loss);
 
-    let to_bob = one_way(&alice, &bob, messages, "alice->bob").await?;
-    let to_alice = one_way(&bob, &alice, messages, "bob->alice").await?;
+    let (to_bob, bob_in_order) = one_way(&alice, &bob, messages, "alice->bob").await?;
+    let (to_alice, alice_in_order) = one_way(&bob, &alice, messages, "bob->alice").await?;
 
     let (a, b) = (alice.client.lock().await, bob.client.lock().await);
     let in_step = a.e2e_sessions[&bob.token].send_chain_key
@@ -304,7 +314,7 @@ async fn main() -> Result<()> {
     for c in [&*a, &*b] {
         let _ = std::fs::remove_file(&c.state_path);
     }
-    if to_bob == messages && to_alice == messages && in_step {
+    if to_bob == messages && to_alice == messages && bob_in_order && alice_in_order && in_step {
         println!("PASS");
         Ok(())
     } else {

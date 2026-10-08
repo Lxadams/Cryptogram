@@ -81,6 +81,8 @@ pub struct IncomingMessageDto {
     /// same id a `chat_history` fetch reports for this same message, so the
     /// frontend can merge live and persisted views without duplicating it.
     pub id: Option<i64>,
+    /// When it arrived, in Unix milliseconds.
+    pub timestamp_ms: i64,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -89,6 +91,28 @@ pub struct StoredMessageDto {
     pub from_me: bool,
     pub text: String,
     pub timestamp_ms: i64,
+    /// For a message we sent: `"sending"`, `"sent"` or `"failed"`. `None`
+    /// for received ones, and ones sent before statuses were kept.
+    pub status: Option<String>,
+}
+
+/// Mirrors `SentMessageDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct SentMessageDto {
+    /// Its chat-history row id (see `IncomingMessageDto::id`).
+    pub id: Option<i64>,
+    /// When it was sent, in Unix milliseconds.
+    pub timestamp_ms: i64,
+}
+
+/// Mirrors `SentMessageUpdateDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct SentMessageUpdateDto {
+    /// The message's chat-history row id.
+    pub id: i64,
+    /// `"sent"` once the relay confirms it has it, `"failed"` if it didn't
+    /// in time.
+    pub status: String,
 }
 
 #[derive(Serialize)]
@@ -268,12 +292,18 @@ struct SendMessageArgs<'a> {
 /// Returns the sent message's local chat-history row id (`None` if no
 /// history is attached), for the frontend to label its optimistic display
 /// of this message with the same id `chat_history` would later report.
-pub async fn send_message(token_hex: &str, text: &str) -> Result<Option<i64>, String> {
+pub async fn send_message(token_hex: &str, text: &str) -> Result<SentMessageDto, String> {
     call("send_message", &SendMessageArgs { token_hex, text }).await
 }
 
 pub async fn poll_inbox() -> Result<Vec<IncomingMessageDto>, String> {
     call("poll_inbox", &()).await
+}
+
+/// What became of messages we sent since the last call: whether the relay
+/// confirmed it has each one, or didn't in time.
+pub async fn sent_message_updates() -> Result<Vec<SentMessageUpdateDto>, String> {
+    call("sent_message_updates", &()).await
 }
 
 #[derive(Serialize)]

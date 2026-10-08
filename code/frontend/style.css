@@ -595,6 +595,38 @@ button.danger {
   background: var(--hover);
 }
 
+/* Under each message: its time and, for one you sent, a check mark once
+   the relay has it, or a red exclamation mark if it didn't get there. */
+.transcript .msg-meta {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.3rem;
+  margin-top: 0.15rem;
+  font-size: 0.7rem;
+  line-height: 1;
+}
+
+.transcript .msg-time {
+  opacity: 0.75;
+}
+
+.transcript .msg-status.sent {
+  font-weight: 700;
+}
+
+.transcript .msg-status.failed {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  background: var(--error);
+  color: white;
+  font-weight: 700;
+}
+
 .composer {
   display: flex;
   gap: 0.5rem;

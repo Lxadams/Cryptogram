@@ -122,6 +122,25 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Background task, twice a second: print any message held for one sent
+    // before it that has waited long enough (see
+    // `Client::release_held_messages`), whether or not another packet comes
+    // in meanwhile, and ask the relay which of our messages it has (see
+    // `Client::receipt_requests`).
+    let tick_socket = Arc::clone(&socket);
+    let tick_client = Arc::clone(&client);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            ticker.tick().await;
+            let mut c = tick_client.lock().await;
+            c.release_held_messages();
+            for packet in c.receipt_requests() {
+                let _ = tick_socket.send_to(&packet, c.server_addr).await;
+            }
+        }
+    });
+
     println!("Commands:");
     println!("  connect <routing_token_hex> <ed25519_pub_hex>");
     println!("  msg <routing_token_hex> <text...>");
