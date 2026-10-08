@@ -3,9 +3,9 @@ use ed25519_dalek::SigningKey;
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use relay_link::{
-    CHAT_INNER_PAYLOAD_LEN, Challenge, LinkEnd, SessionId, Sync, TYPE_ACK, TYPE_ADMITTED_DATA,
-    TYPE_DATA, TYPE_HANDSHAKE_INIT, TYPE_PATH_CHALLENGE, TYPE_PATH_RESPONSE, TYPE_SYNC,
-    TYPE_SYNC_ACK,
+    CHAT_INNER_PAYLOAD_LEN, Challenge, LinkEnd, REPLY_COPIES, SessionId, Sync, TYPE_ACK,
+    TYPE_ADMITTED_DATA, TYPE_DATA, TYPE_HANDSHAKE_INIT, TYPE_HANDSHAKE_RESP, TYPE_PATH_CHALLENGE,
+    TYPE_PATH_RESPONSE, TYPE_SYNC, TYPE_SYNC_ACK,
 };
 use sha2::Sha256;
 use std::{
@@ -78,8 +78,41 @@ fn load_or_create_identity(path: &str) -> Result<SigningKey> {
     let dto = ServerIdentityDto {
         ed25519_secret: hex::encode(identity_bytes),
     };
-    fs::write(path, serde_json::to_string_pretty(&dto)?)?;
+    write_private(path, serde_json::to_string_pretty(&dto)?.as_bytes())?;
     Ok(SigningKey::from_bytes(&identity_bytes))
+}
+
+/// Write a new file only its owner can read (mode 0600 on Unix), for the
+/// relay's secret key: `fs::write` would leave it readable by every user.
+fn write_private(path: &str, contents: &[u8]) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    io::Write::write_all(&mut options.open(path)?, contents)
+}
+
+/// Keep the relay's memory (link keys, queued messages, its identity key)
+/// out of core dumps, and out of reach of debuggers run as the same user: it
+/// only ever lives in RAM. Best effort: on other systems, the container's
+/// `--ulimit core=0` (see deploy.yml) does the first part.
+fn keep_memory_private() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: plain system calls on our own process, with valid arguments.
+    unsafe {
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::setrlimit(libc::RLIMIT_CORE, &none) != 0
+            || libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
+        {
+            warn!(
+                "Couldn't turn off core dumps: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 /// The relay's secrets: its identity, which clients pin, and the key its
@@ -124,6 +157,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     tracing_subscriber::fmt().with_env_filter("info").init();
+    keep_memory_private();
 
     let keys = RelayKeys::new(load_or_create_identity(IDENTITY_FILE)?);
     let server_pub_hex = hex::encode(keys.identity.verifying_key().as_bytes());
@@ -159,10 +193,12 @@ async fn main() -> Result<()> {
                 debug!("Received {} bytes", len);
                 match handle_request(&tables, &keys, addr, &buffer[..len]) {
                     Ok(reply) => {
-                        if let Some(reply) = reply
-                            && let Err(e) = socket.send_to(&reply, addr).await
-                        {
-                            error!("Failed to send response: {}", e);
+                        if let Some(reply) = reply {
+                            for _ in 0..copies_of(&reply) {
+                                if let Err(e) = socket.send_to(&reply, addr).await {
+                                    error!("Failed to send response: {}", e);
+                                }
+                            }
                         }
                         // A packet queued, or a recipient synced or moved.
                         outbound_wake.notify_one();
@@ -174,6 +210,16 @@ async fn main() -> Result<()> {
                 error!("Receive error: {}", e);
             }
         }
+    }
+}
+
+/// How many times to send `reply`: handshake replies and sync acks several
+/// times, to get through loss (`REPLY_COPIES`; an init is padded to more
+/// than all of its copies, so this never amplifies), anything else once.
+fn copies_of(reply: &[u8]) -> usize {
+    match reply.first() {
+        Some(&TYPE_HANDSHAKE_RESP | &TYPE_SYNC_ACK) => REPLY_COPIES,
+        _ => 1,
     }
 }
 
@@ -191,6 +237,17 @@ fn handle_request(
     if packet_type == TYPE_HANDSHAKE_INIT {
         let client_ephemeral = relay_link::parse_handshake_init(payload)
             .map_err(|e| anyhow!("Invalid handshake: {e}"))?;
+        {
+            let mut tables = tables.lock().unwrap();
+            // A copy of an init answered lately: the same reply, the same
+            // link. Clients send each init several times over.
+            if let Some(reply) = tables.recent_handshake_reply(client_ephemeral.as_bytes()) {
+                return Ok(Some(reply));
+            }
+            if !tables.allow_handshake(socket_address.ip()) {
+                return Err(anyhow!("Too many handshakes from one address"));
+            }
+        }
         let relay_secret = EphemeralSecret::random_from_rng(OsRng);
         let relay_ephemeral = X25519PublicKey::from(&relay_secret);
         let shared_secret = relay_secret.diffie_hellman(&client_ephemeral);
@@ -198,18 +255,19 @@ fn handle_request(
             return Err(anyhow!("Handshake with a degenerate key"));
         }
         let link_keys = relay_link::derive_link_keys(shared_secret.as_bytes());
+        let mut tables = tables.lock().unwrap();
         let session_id = tables
-            .lock()
-            .unwrap()
             .register_link(link_keys, socket_address)
             .ok_or_else(|| anyhow!("Link table full; refused a handshake"))?;
         debug!("Registered a new link");
-        return Ok(Some(relay_link::handshake_resp(
+        let reply = relay_link::handshake_resp(
             &keys.identity,
             &client_ephemeral,
             &relay_ephemeral,
             &session_id,
-        )));
+        );
+        tables.remember_handshake(client_ephemeral.to_bytes(), session_id, reply.clone());
+        return Ok(Some(reply));
     }
 
     // A link packet: refused unless it's for one of our links, authenticates
@@ -461,6 +519,11 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
+    /// An address on a host of its own, `host`.
+    fn host(host: u16) -> SocketAddr {
+        SocketAddr::from(([10, 0, (host >> 8) as u8, host as u8], 50000))
+    }
+
     /// A client's end of a link, as its handshake left it.
     struct TestLink {
         end: LinkEnd,
@@ -660,10 +723,24 @@ mod tests {
         let replayed = handle_request(&tables, &keys, addr(50001), &init)
             .unwrap()
             .unwrap();
-        assert_ne!(first[1..5], replayed[1..5], "a new session ID each time");
-        for resp in [first, replayed] {
-            assert_ne!(resp[1..5], victim.session());
-        }
+        // A copy gets the reply the first one got (it's what a client's own
+        // copies get), which is no use without the client's ephemeral
+        // secret, and doesn't move that link to the copy's address.
+        assert_eq!(first, replayed);
+        assert_ne!(first[1..5], victim.session());
+        let session: SessionId = first[1..5].try_into().unwrap();
+        assert_eq!(
+            tables.lock().unwrap().link_addr(&session),
+            Some(addr(50000))
+        );
+        let other = relay_link::handshake_init(&X25519PublicKey::from(
+            &EphemeralSecret::random_from_rng(OsRng),
+        ));
+        let other = handle_request(&tables, &keys, addr(50001), &other)
+            .unwrap()
+            .unwrap();
+        assert_ne!(other[1..5], first[1..5], "a new session ID each handshake");
+        assert_ne!(other[1..5], victim.session());
 
         // The victim's link still works, and is still where its packets go.
         let ack = victim.ack(&token, &[[0; 16]]);
@@ -685,8 +762,8 @@ mod tests {
     #[test]
     fn test_handshakes_are_refused_while_the_link_table_is_full() {
         let (tables, keys) = relay();
-        for port in 0..MAX_LINKS {
-            link_up(&tables, &keys, addr(port as u16));
+        for n in 0..MAX_LINKS {
+            link_up(&tables, &keys, host(n as u16));
         }
         let init = relay_link::handshake_init(&X25519PublicKey::from(
             &EphemeralSecret::random_from_rng(OsRng),
@@ -1326,5 +1403,86 @@ mod tests {
         forged[last] ^= 1;
         let err = handle_request(&tables, &keys, addr(50000), &forged).unwrap_err();
         assert!(err.to_string().contains(&LinkError::Forged.to_string()));
+    }
+
+    /// A client sends each handshake init several times over: every copy
+    /// gets the same reply, for the same one link.
+    #[test]
+    fn test_copies_of_a_handshake_init_get_one_link() {
+        let (tables, keys) = relay();
+        let client_ephemeral = X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng));
+        let init = relay_link::handshake_init(&client_ephemeral);
+        let replies: Vec<_> = (0..3)
+            .map(|_| {
+                handle_request(&tables, &keys, addr(50000), &init)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        assert!(replies.iter().all(|reply| *reply == replies[0]));
+        assert_eq!(tables.lock().unwrap().link_count(), 1);
+        assert_eq!(copies_of(&replies[0]), REPLY_COPIES);
+
+        // Once that link is gone, the same init is a new handshake.
+        let session: SessionId = replies[0][1..5].try_into().unwrap();
+        tables.lock().unwrap().expire_link(&session);
+        let again = handle_request(&tables, &keys, addr(50000), &init)
+            .unwrap()
+            .unwrap();
+        assert_ne!(again[1..5], replies[0][1..5]);
+    }
+
+    /// Each address gets a burst of handshakes, then a steady trickle, so
+    /// no one sender can take the relay's CPU. Others aren't held up.
+    #[test]
+    fn test_handshakes_from_one_address_are_rate_limited() {
+        let (tables, keys) = relay();
+        let new_init = || {
+            relay_link::handshake_init(&X25519PublicKey::from(&EphemeralSecret::random_from_rng(
+                OsRng,
+            )))
+        };
+        let mut allowed = 0;
+        while handle_request(&tables, &keys, addr(50000), &new_init()).is_ok() {
+            allowed += 1;
+            assert!(allowed <= 21, "never stops");
+        }
+        assert!(allowed >= 20, "a burst first: {allowed}");
+        let err = handle_request(&tables, &keys, addr(50001), &new_init()).unwrap_err();
+        assert!(err.to_string().contains("Too many"), "{err}");
+        assert!(handle_request(&tables, &keys, host(1), &new_init()).is_ok());
+    }
+
+    /// Sync acks go out several times, like handshake replies; challenges,
+    /// which the client's next sync asks for again anyway, go once.
+    #[test]
+    fn test_sync_acks_go_out_several_times() {
+        let (tables, keys) = relay();
+        let token_key = random_signing_key();
+        let mut link = link_up(&tables, &keys, addr(50000));
+        let sync = link.sync(&token_key, Vec::new());
+        let ack = handle_request(&tables, &keys, addr(50000), &sync)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copies_of(&ack), REPLY_COPIES);
+        let moved = link.sync(&token_key, Vec::new());
+        let challenge = handle_request(&tables, &keys, addr(50001), &moved)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copies_of(&challenge), 1);
+    }
+
+    /// The relay's identity key is written for its owner's eyes only.
+    #[cfg(unix)]
+    #[test]
+    fn test_identity_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("relay-identity-mode-{}", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        let _ = fs::remove_file(&path);
+        load_or_create_identity(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

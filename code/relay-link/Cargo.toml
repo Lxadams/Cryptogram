@@ -2,6 +2,7 @@
 name = "relay-link"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 # The client <-> relay link protocol, shared by code/client and code/server
 # so the two sides can't drift apart (see src/lib.rs).

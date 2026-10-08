@@ -36,9 +36,11 @@ pub fn session_ended() {
     emit("session_ended".to_string());
 }
 
-/// A chat message arrived from `from` (a contact's name, or a short token).
-pub fn message_received(from: &str) {
-    emit(format!("message\t{from}"));
+/// A chat message arrived. Who from isn't passed on: a notification
+/// shows only that one came, so nobody reading the lock screen learns who
+/// the user talks to.
+pub fn message_received() {
+    emit("message".to_string());
 }
 
 #[cfg(not(target_os = "android"))]
@@ -139,7 +141,7 @@ mod android {
     }
 
     /// `NativeBridge.nextEvent()`: blocks until the next event, then returns
-    /// it as `"session_started"`, `"session_ended"` or `"message\t<from>"`.
+    /// it as `"session_started"`, `"session_ended"` or `"message"`.
     #[no_mangle]
     pub extern "system" fn Java_nz_ac_waikato_compx374_e2e_1messenger_NativeBridge_nextEvent(
         env: JNIEnv,

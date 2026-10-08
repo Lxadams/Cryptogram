@@ -55,12 +55,21 @@ jobs:
             # `docker rm`+`run` this script does on later deploys, so the
             # server's Ed25519 identity (and the pubkey clients trust)
             # doesn't change every time you push to production.
+            # The rest locks the relay down: a read-only filesystem apart
+            # from that volume, no capabilities, no core dumps (it holds
+            # messages and keys in RAM only), and the sysctl that lets its
+            # unprivileged user bind 443.
             docker run -d \
               --name server \
               --restart unless-stopped \
               -p 443:443/udp \
               -v server_identity:/data \
               -e RUST_LOG=info \
+              --read-only \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --ulimit core=0 \
+              --sysctl net.ipv4.ip_unprivileged_port_start=0 \
               server:latest
             rm /home/ubuntu/server.tar
             docker image prune -f

@@ -23,7 +23,7 @@ object NativeBridge {
 
     /**
      * Blocks until the backend's next event: `"session_started"`,
-     * `"session_ended"` or `"message\t<from>"`.
+     * `"session_ended"` or `"message"`.
      */
     @JvmStatic external fun nextEvent(): String?
 
@@ -52,11 +52,11 @@ object NativeBridge {
         when {
             event == "session_started" -> MessageService.start(context)
             event == "session_ended" -> MessageService.stop(context)
-            event.startsWith("message\t") -> {
+            event == "message" -> {
                 val onScreen = ProcessLifecycleOwner.get().lifecycle.currentState
                     .isAtLeast(Lifecycle.State.STARTED)
                 if (!onScreen) {
-                    MessageService.notifyMessage(context, event.removePrefix("message\t"))
+                    MessageService.notifyMessage(context)
                 }
             }
         }

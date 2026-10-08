@@ -63,6 +63,11 @@ docker run -d \
   -p 443:443/udp \
   -v server_identity:/data \
   -e RUST_LOG=info \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --ulimit core=0 \
+  --sysctl net.ipv4.ip_unprivileged_port_start=0 \
   server:latest
 rm server.tar
 docker image prune -f
@@ -71,6 +76,11 @@ docker image prune -f
 The `-v server_identity:/data` matters even for a one-off manual deploy —
 without it, the container regenerates a fresh Ed25519 identity on every
 `docker rm`+`run`, and every client would need the new pubkey each time.
+
+The flags after it lock the relay down. The filesystem is read-only apart from
+that volume, the relay has no capabilities, and there are no core dumps (it
+holds messages and keys in RAM only). The `--sysctl` lets the image's
+unprivileged user bind port 443; it's Docker's default since 20.10 anyway.
 
 ## 5. Verify it's up
 
@@ -102,7 +112,9 @@ ssh -i /path/to/your-key.pem ubuntu@<EC2_HOST> '
   docker stop server || true &&
   docker rm server || true
   docker run -d --name server --restart unless-stopped -p 443:443/udp \
-    -v server_identity:/data -e RUST_LOG=info server:latest &&
+    -v server_identity:/data -e RUST_LOG=info \
+    --read-only --cap-drop ALL --security-opt no-new-privileges --ulimit core=0 \
+    --sysctl net.ipv4.ip_unprivileged_port_start=0 server:latest &&
   rm server.tar && docker image prune -f
 '
 ```

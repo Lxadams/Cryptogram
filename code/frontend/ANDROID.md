@@ -214,7 +214,7 @@ that keeps it connected to the relay when it's not on screen. Android
 shows this as an ongoing "Connected" notification.
 
 - A message that arrives while the app is in the background shows a "New
-  message" notification. It names the sender but never shows the text.
+  message" notification. It never says who it's from, or shows the text.
   Opening the app clears it.
 - Swiping the app away from the recent-apps screen doesn't log you out. The
   app keeps receiving, and reopening it goes straight back to your chats.

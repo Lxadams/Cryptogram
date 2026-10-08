@@ -4,12 +4,11 @@ use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use pqcrypto_kyber::kyber768::*;
-use pqcrypto_traits::kem::SharedSecret as _;
+use pq::{Ciphertext, PublicKey, SecretKey, decapsulate, encapsulate, keypair};
 use rand_core::{OsRng, RngCore};
 use relay_link::{
-    AdmissionTag, Lane, LinkEnd, LinkKeys, PacketNumber, Side, TYPE_ACK, TYPE_DATA,
-    TYPE_HANDSHAKE_RESP, TYPE_PATH_CHALLENGE, TYPE_PATH_RESPONSE, TYPE_SYNC, TYPE_SYNC_ACK,
+    AdmissionTag, Lane, LinkEnd, LinkKeys, Side, TYPE_ACK, TYPE_DATA, TYPE_HANDSHAKE_RESP,
+    TYPE_PATH_CHALLENGE, TYPE_PATH_RESPONSE, TYPE_SYNC, TYPE_SYNC_ACK,
 };
 use sha2::Sha256;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,6 +23,7 @@ use zeroize::Zeroizing;
 
 pub mod packets;
 use packets::*;
+pub mod pq;
 mod chunks;
 mod deliveries;
 mod history;
@@ -73,15 +73,28 @@ const MAX_TIMESTAMP_DRIFT: u64 = 300;
 // messages more than 100 steps ahead are rejected anyway, so this is ample.
 const MAX_PENDING_PQ_INJECTS: usize = 32;
 
-// How long `perform_handshake` (and a handshake `keepalive` starts) waits
-// for the relay's reply
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+// A handshake attempt sends its init this many times, this far apart, then
+// waits for the relay's reply (which comes several times over too, see
+// `relay_link::REPLY_COPIES`) until `HANDSHAKE_ATTEMPT` is up.
+// `perform_handshake` tries again, with the same init, until
+// `HANDSHAKE_GIVE_UP`. At 70% loss each way, one init and one reply get
+// through 9% of the time; three of each, about half.
+const HANDSHAKE_COPIES: usize = 3;
+const HANDSHAKE_COPY_SPACING: Duration = Duration::from_millis(200);
+const HANDSHAKE_ATTEMPT: Duration = Duration::from_secs(3);
+const HANDSHAKE_GIVE_UP: Duration = Duration::from_secs(30);
 
-// A sync the relay hasn't acked in this long means our link is gone: the
-// relay restarted, or dropped the link after we were quiet too long (see
-// `Client::keepalive`). Generous next to a round trip, and shorter than
-// the 15s between keepalives, so it's noticed at the next one.
-const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+// Syncs sent on each keepalive tick (see `Client::keepalive`), each acked
+// several times by the relay, so a link in heavy loss still hears from the
+// relay at most ticks.
+const SYNC_COPIES: usize = 3;
+
+// Hearing nothing from the relay for this long, despite syncing every 15s,
+// means our link is gone: the relay restarted, or dropped the link after we
+// were quiet too long (see `Client::keepalive`). Long enough that heavy loss
+// alone almost never looks like it: at 70% loss each way, eight ticks in a
+// row with no ack happen about one time in 200.
+const LINK_SILENCE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 // While setting up a session with a contact, our KeyExchange is sent again
 // (see `Client::setup_resends`) after this long, then twice as long each
@@ -166,13 +179,17 @@ fn within_drift(timestamp: u64) -> bool {
     now.abs_diff(timestamp) <= MAX_TIMESTAMP_DRIFT
 }
 
-// Argon2id parameters for every login secret derived below (OWASP's
-// baseline recommendation for Argon2id: ~19 MiB, 2 passes, single-threaded —
-// generous enough for a login gate, cheap enough not to make every app
-// launch feel slow). Stored alongside the salt in `passcode.hash` so tuning
-// these later doesn't invalidate identities created under the old values.
-const ARGON2_M_COST_KIB: u32 = 19_456;
-const ARGON2_T_COST: u32 = 2;
+// Argon2id parameters for every login secret derived below: 64 MiB and 3
+// passes, single-threaded. That's several times OWASP's ~19 MiB, 2-pass
+// baseline (what identities created before used), as a captured phone's
+// passcode is guessed offline at whatever rate the attacker's hardware
+// allows. About 0.1 s a login on a laptop, so up to a second or so on a
+// slow phone: worth timing on the slowest one supported. Stored alongside the
+// salt in `passcode.hash`, so tuning these later doesn't invalidate
+// identities created under the old values. (Those keep their old cost: the
+// vault key they derive also encrypts their databases.)
+const ARGON2_M_COST_KIB: u32 = 65_536;
+const ARGON2_T_COST: u32 = 3;
 const ARGON2_P_COST: u32 = 1;
 const ARGON2_SALT_LEN: usize = 16;
 const ARGON2_OUTPUT_LEN: usize = 32;
@@ -624,9 +641,9 @@ pub struct Client {
     /// `keepalive`): our ephemeral secret for it, and when we sent it.
     /// `handle_relay_packet` finishes it when the reply comes.
     pending_handshake: Option<(EphemeralSecret, Instant)>,
-    /// The oldest of our syncs on this link that the relay hasn't acked yet:
-    /// its packet number, and when we sent it. Live state.
-    unacked_sync: Option<(PacketNumber, Instant)>,
+    /// When we last heard anything (authentic) from the relay on this link:
+    /// an ack of a sync, say, or something it forwarded. Live state.
+    last_heard: Instant,
     /// When to send each contact we've added, but have no session with yet,
     /// our KeyExchange again (see `setup_resends`). Live state.
     setup_retries: HashMap<RoutingToken, SetupRetry>,
@@ -746,7 +763,7 @@ impl Client {
             link: unlinked(),
             relay_public: None,
             pending_handshake: None,
-            unacked_sync: None,
+            last_heard: Instant::now(),
             setup_retries: HashMap::new(),
             e2e_sessions: HashMap::new(),
             pending_contacts: HashMap::new(),
@@ -896,7 +913,7 @@ impl Client {
         self.relay_public = Some(*server_ed25519_pub);
         self.link = LinkEnd::new(Side::Client, keys, session_id);
         self.pending_handshake = None;
-        self.unacked_sync = None;
+        self.last_heard = Instant::now();
         // Anything sent on the old link may never have arrived, so contacts
         // we're still setting up with get our KeyExchange again right away.
         let now = Instant::now();
@@ -918,10 +935,15 @@ impl Client {
             self.link.keys(),
             self.admission_tags_in(),
         );
-        let number = self.link.next_packet_number(Lane::Direct);
-        self.unacked_sync
-            .get_or_insert_with(|| (number, Instant::now()));
         self.link.seal(Lane::Direct, TYPE_SYNC, &sync.to_bytes())
+    }
+
+    /// `SYNC_COPIES` syncs, each its own packet: what we send whenever we
+    /// sync, so heavy loss rarely stops all of them.
+    fn sync_packets(&mut self) -> Vec<Vec<u8>> {
+        (0..SYNC_COPIES)
+            .map(|_| self.generate_sync_packet())
+            .collect()
     }
 
     /// Tells the relay we have the packets it forwarded with delivery IDs
@@ -936,16 +958,17 @@ impl Client {
     }
 
     /// What to send the relay on a keepalive tick (every 15s, and when the
-    /// app comes back on screen): normally a fresh sync, plus any
-    /// KeyExchanges due again (see `setup_resends`).
+    /// app comes back on screen): normally fresh syncs (see `SYNC_COPIES`),
+    /// plus any KeyExchanges due again (see `setup_resends`).
     ///
-    /// But if the relay hasn't acked a sync of ours for `SYNC_ACK_TIMEOUT`,
-    /// our link is gone (the relay restarted, or dropped the link while we
-    /// were quiet), and nothing sent on it arrives. So this starts a new
+    /// But if we've heard nothing from the relay for `LINK_SILENCE_TIMEOUT`
+    /// (not even an ack of our syncs), our link is gone: the relay
+    /// restarted, or dropped the link while we were quiet, a phone asleep
+    /// say. Nothing sent on it arrives any more. So this starts a new
     /// handshake instead, on the same socket: the receive loop's
     /// `handle_relay_packet` finishes it, and syncs on the new link. Until
     /// then, ticks send nothing, and one with no reply after
-    /// `HANDSHAKE_TIMEOUT` tries again. A client that hasn't done
+    /// `HANDSHAKE_ATTEMPT` tries again. A client that hasn't done
     /// `perform_handshake` (so has no relay key to check a reply against)
     /// just keeps syncing.
     pub fn keepalive(&mut self) -> Vec<Vec<u8>> {
@@ -953,14 +976,12 @@ impl Client {
         if self.relay_public.is_some() {
             let link_gone = match &self.pending_handshake {
                 Some((_, sent)) => {
-                    if now.duration_since(*sent) < HANDSHAKE_TIMEOUT {
+                    if now.duration_since(*sent) < HANDSHAKE_ATTEMPT {
                         return Vec::new(); // still waiting for the reply
                     }
                     true
                 }
-                None => self
-                    .unacked_sync
-                    .is_some_and(|(_, sent)| now.duration_since(sent) >= SYNC_ACK_TIMEOUT),
+                None => now.duration_since(self.last_heard) >= LINK_SILENCE_TIMEOUT,
             };
             if link_gone {
                 if self.pending_handshake.is_none() {
@@ -968,10 +989,10 @@ impl Client {
                 }
                 let (secret, packet) = self.generate_handshake_packet();
                 self.pending_handshake = Some((secret, now));
-                return vec![packet];
+                return vec![packet; HANDSHAKE_COPIES];
             }
         }
-        let mut out = vec![self.generate_sync_packet()];
+        let mut out = self.sync_packets();
         out.extend(self.setup_resends(now));
         out
     }
@@ -999,7 +1020,7 @@ impl Client {
             return Vec::new();
         }
         println!(">> Reconnected to the relay.");
-        let mut out = vec![self.generate_sync_packet()];
+        let mut out = self.sync_packets();
         out.extend(self.setup_resends(Instant::now()));
         out
     }
@@ -1623,18 +1644,12 @@ impl Client {
         let Ok((header, plaintext)) = self.link.open(packet) else {
             return Vec::new();
         };
+        // Authentic, and not a replay: the link is alive.
+        self.last_heard = Instant::now();
         match header.packet_type {
             TYPE_DATA => {}
-            TYPE_SYNC_ACK => {
-                // Acks a sync from no earlier than our oldest unacked one.
-                if let (Some(acked), Some((oldest, _))) =
-                    (relay_link::parse_sync_ack(&plaintext), self.unacked_sync)
-                    && acked >= oldest
-                {
-                    self.unacked_sync = None;
-                }
-                return Vec::new();
-            }
+            // All it says is that the relay has our sync, and so the link.
+            TYPE_SYNC_ACK => return Vec::new(),
             TYPE_PATH_CHALLENGE => {
                 let Some(challenge) = relay_link::parse_challenge(&plaintext) else {
                     return Vec::new();
@@ -2151,25 +2166,67 @@ pub async fn perform_handshake(
     socket: &UdpSocket,
     server_pub: &VerifyingKey,
 ) -> Result<()> {
-    let (client_secret, hs_packet) = client.generate_handshake_packet();
-    socket.send_to(&hs_packet, client.server_addr).await?;
-
+    let (client_secret, init) = client.generate_handshake_packet();
+    let client_ephemeral = X25519PublicKey::from(&client_secret);
+    let give_up = tokio::time::Instant::now() + HANDSHAKE_GIVE_UP;
+    // A reply that doesn't check out against `server_pub`: most likely the
+    // app was built with another relay's key.
+    let mut wrong_key = false;
+    let mut buf = [0u8; 1024];
     // UDP gives no error for an unreachable relay (wrong address, relay
-    // down, packet lost) — without a deadline this would wait forever.
-    let mut resp_buf = [0u8; 1024];
-    let (len, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.recv_from(&mut resp_buf))
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "No response from the relay at {} within {}s. Check the address and that the relay is running.",
-                client.server_addr,
-                HANDSHAKE_TIMEOUT.as_secs()
-            )
-        })??;
-    client.complete_handshake(client_secret, server_pub, &resp_buf[..len])?;
-
-    let sync_packet = client.generate_sync_packet();
-    socket.send_to(&sync_packet, client.server_addr).await?;
+    // down, packets lost), so each attempt waits for a reply until its time
+    // is up, and the whole thing gives up after `HANDSHAKE_GIVE_UP`. Every
+    // attempt sends the same init, so the relay answers all its copies with
+    // one link.
+    let reply = 'connect: loop {
+        let attempt_ends = (tokio::time::Instant::now() + HANDSHAKE_ATTEMPT).min(give_up);
+        for copy in 0..HANDSHAKE_COPIES {
+            if copy > 0 {
+                tokio::time::sleep(HANDSHAKE_COPY_SPACING).await;
+            }
+            socket.send_to(&init, client.server_addr).await?;
+        }
+        loop {
+            match tokio::time::timeout_at(attempt_ends, socket.recv_from(&mut buf)).await {
+                Err(_) => break, // this attempt's time is up
+                Ok(Err(_)) => {
+                    // A receive error, like an ICMP "port unreachable" while
+                    // the relay restarts: wait out the attempt, not spin.
+                    tokio::time::sleep_until(attempt_ends).await;
+                    break;
+                }
+                Ok(Ok((len, _))) => {
+                    match relay_link::parse_handshake_resp(
+                        &buf[..len],
+                        server_pub,
+                        &client_ephemeral,
+                    ) {
+                        Ok(_) => break 'connect buf[..len].to_vec(),
+                        Err(relay_link::LinkError::BadSignature) => wrong_key = true,
+                        Err(_) => {} // not a reply to us: keep waiting
+                    }
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= give_up {
+            return Err(if wrong_key {
+                anyhow!(
+                    "The relay at {} answered, but not with the key this app has for it (SERVER_PUBKEY). Was it built for another relay?",
+                    client.server_addr
+                )
+            } else {
+                anyhow!(
+                    "No response from the relay at {} within {}s. Check the address and that the relay is running.",
+                    client.server_addr,
+                    HANDSHAKE_GIVE_UP.as_secs()
+                )
+            });
+        }
+    };
+    client.complete_handshake(client_secret, server_pub, &reply)?;
+    for sync in client.sync_packets() {
+        socket.send_to(&sync, client.server_addr).await?;
+    }
     Ok(())
 }
 
@@ -2185,7 +2242,6 @@ mod tests {
         inbox_texts, link_with, new_client, next_relay_packet_number, relay, relay_forward,
         session, strip_link,
     };
-    use pqcrypto_traits::kem::PublicKey as _;
 
     #[test]
     fn test_passcode_hash_roundtrip_and_rejection() {
@@ -3121,7 +3177,6 @@ mod tests {
     #[test]
     fn test_stale_offer_is_answered_with_a_fresh_request() {
         use ed25519_dalek::Signer;
-        use pqcrypto_traits::kem::Ciphertext as _;
         let (mut e, mut r) = establisher_and_responder();
         let offer = up_to_the_offer(&mut e, &mut r);
         let mut est = SessionEstablishPayload::from_bytes(&relay(&offer, &e)[1..]).unwrap();
@@ -3976,7 +4031,7 @@ mod tests {
         for _ in 0..100 {
             let eph_sec = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
             let eph_pub = x25519_dalek::PublicKey::from(&eph_sec);
-            let (_, kyber_ct) = pqcrypto_kyber::kyber768::encapsulate(&bob.identity.kyber_public);
+            let (_, kyber_ct) = pq::encapsulate(&bob.identity.kyber_public);
             let payload = SessionEstablishPayload::generate(
                 &alice_id,
                 bob.identity.routing_token,
@@ -4123,7 +4178,6 @@ mod tests {
         pqi.timestamp -= 600; // 10 minutes in the past
         // Re-sign with the stale timestamp
         use ed25519_dalek::Signer;
-        use pqcrypto_traits::kem::Ciphertext as _;
         let mut msg = Vec::new();
         msg.extend_from_slice(&pqi.routing_token);
         msg.extend_from_slice(&pqi.target_token);
@@ -4256,7 +4310,6 @@ mod tests {
         assert_eq!((setup.establisher_add_id, setup.responder_add_id), (11, 22));
         let offer = setup.offer.expect("still on offer");
         assert_eq!(offer.eph_x25519_pub, peer_id.x25519_public);
-        use pqcrypto_traits::kem::Ciphertext as _;
         assert_eq!(offer.kyber_ct.as_bytes(), kyber_ct.as_bytes());
         assert!(loaded.requests_muted());
 
@@ -4995,13 +5048,14 @@ mod tests {
         cleanup(&[&e, &r]);
     }
 
-    /// The relay acks each sync. While it does, a keepalive is just a sync.
-    /// Once one has gone unacked for `SYNC_ACK_TIMEOUT`, the link is
-    /// presumed gone, and the keepalive starts a new handshake instead.
-    /// Only our relay's reply to it finishes it: a new link, synced on at
-    /// once, with KeyExchanges for contacts we're still setting up with.
+    /// While the relay answers, a keepalive is just syncs. Once we've heard
+    /// nothing from it for `LINK_SILENCE_TIMEOUT`, the link is presumed gone,
+    /// and the keepalive starts a new handshake instead, sending the init
+    /// several times over. Only our relay's reply to it finishes it: a new
+    /// link, synced on at once, with KeyExchanges for contacts we're still
+    /// setting up with.
     #[test]
-    fn test_keepalive_redoes_the_handshake_once_syncs_go_unacked() {
+    fn test_keepalive_redoes_the_handshake_after_a_silence() {
         let relay_identity = SigningKey::from_bytes(&[7; 32]);
         let mut client = new_client();
         link_with(&mut client, 4, [1, 2, 3, 4]);
@@ -5011,23 +5065,31 @@ mod tests {
             .add_contact(contact.routing_token, contact.ed25519_public)
             .unwrap();
 
-        let sync = client.keepalive();
-        assert_eq!(sync.len(), 1, "a sync, and the KeyExchange isn't due yet");
-        let number = relay_link::header(&sync[0]).unwrap().packet_number;
+        let syncs = client.keepalive();
+        assert_eq!(
+            syncs.len(),
+            SYNC_COPIES,
+            "syncs; the KeyExchange isn't due yet"
+        );
+        assert!(syncs.iter().all(|sync| sync[0] == TYPE_SYNC));
+        let number = relay_link::header(&syncs[0]).unwrap().packet_number;
         let ack = from_relay(
             &client,
             TYPE_SYNC_ACK,
             &relay_link::sync_ack_plaintext(number),
         );
+        client.last_heard -= LINK_SILENCE_TIMEOUT;
         assert!(client.handle_relay_packet(&ack).is_empty());
-        assert!(client.unacked_sync.is_none());
+        assert_eq!(client.keepalive().len(), SYNC_COPIES, "heard from, so fine");
 
-        client.keepalive();
-        let (number, sent) = client.unacked_sync.unwrap();
-        client.unacked_sync = Some((number, sent - SYNC_ACK_TIMEOUT));
-        let init = client.keepalive();
-        assert_eq!(init.len(), 1);
-        let client_ephemeral = relay_link::parse_handshake_init(&init[0]).unwrap();
+        client.last_heard -= LINK_SILENCE_TIMEOUT;
+        let inits = client.keepalive();
+        assert_eq!(inits.len(), HANDSHAKE_COPIES);
+        assert!(
+            inits.iter().all(|init| *init == inits[0]),
+            "one init, copied"
+        );
+        let client_ephemeral = relay_link::parse_handshake_init(&inits[0]).unwrap();
         assert!(client.keepalive().is_empty(), "waiting for the reply");
 
         let relay_secret = EphemeralSecret::random_from_rng(OsRng);
@@ -5066,16 +5128,16 @@ mod tests {
             .collect();
         assert_eq!(
             types,
-            [TYPE_SYNC, TYPE_DATA],
-            "a sync, then the KeyExchange"
+            [TYPE_SYNC, TYPE_SYNC, TYPE_SYNC, TYPE_DATA],
+            "syncs, then the KeyExchange"
         );
         assert!(client.handle_relay_packet(&reply).is_empty(), "taken once");
         cleanup(&[&client]);
     }
 
-    /// A handshake that gets no reply is tried again with a fresh key, and
-    /// a reply nobody asked for, or an ack for a sync older than the oldest
-    /// unacked one, changes nothing.
+    /// A handshake that gets no reply is tried again with a fresh key; a
+    /// reply nobody asked for changes nothing; and a replayed packet from
+    /// the relay can't make a dead link look alive.
     #[test]
     fn test_unanswered_handshakes_are_retried_and_strays_ignored() {
         let relay_identity = SigningKey::from_bytes(&[7; 32]);
@@ -5091,42 +5153,80 @@ mod tests {
         assert!(client.handle_relay_packet(&stray).is_empty());
         assert_eq!(client.link.session_id(), [1, 2, 3, 4]);
 
-        let first_sync = client.keepalive().remove(0);
-        let acked = relay_link::header(&first_sync).unwrap().packet_number;
-        let ack = from_relay(
-            &client,
-            TYPE_SYNC_ACK,
-            &relay_link::sync_ack_plaintext(acked),
-        );
-        client.handle_relay_packet(&ack);
-
         // Without the relay's key (no `perform_handshake` yet), a client
         // can only keep syncing.
-        client.keepalive();
-        let (oldest, sent) = client.unacked_sync.unwrap();
-        assert!(oldest > acked);
-        client.unacked_sync = Some((oldest, sent - SYNC_ACK_TIMEOUT));
-        let synced = client.keepalive();
-        assert_eq!(
-            relay_link::header(&synced[0]).unwrap().packet_type,
-            TYPE_SYNC
+        client.last_heard -= LINK_SILENCE_TIMEOUT;
+        assert!(
+            client
+                .keepalive()
+                .iter()
+                .all(|packet| packet[0] == TYPE_SYNC)
         );
 
+        let ack = from_relay(&client, TYPE_SYNC_ACK, &relay_link::sync_ack_plaintext(0));
+        client.handle_relay_packet(&ack);
         client.relay_public = Some(relay_identity.verifying_key());
+        client.last_heard -= LINK_SILENCE_TIMEOUT;
+        client.handle_relay_packet(&ack); // a replay: not heard from
         let first = client.keepalive();
-        let started = client.pending_handshake.as_ref().unwrap().1;
-        client.pending_handshake.as_mut().unwrap().1 = started - HANDSHAKE_TIMEOUT;
-        let second = client.keepalive();
-        assert_eq!(second.len(), 1);
-        assert_ne!(first, second, "a fresh ephemeral key");
+        assert_eq!(first.len(), HANDSHAKE_COPIES);
+        assert!(relay_link::parse_handshake_init(&first[0]).is_ok());
 
-        let behind = from_relay(
-            &client,
-            TYPE_SYNC_ACK,
-            &relay_link::sync_ack_plaintext(acked),
+        let started = client.pending_handshake.as_ref().unwrap().1;
+        client.pending_handshake.as_mut().unwrap().1 = started - HANDSHAKE_ATTEMPT;
+        let second = client.keepalive();
+        assert_eq!(second.len(), HANDSHAKE_COPIES);
+        assert_ne!(first[0], second[0], "a fresh ephemeral key");
+        cleanup(&[&client]);
+    }
+
+    /// Over real UDP: the whole first attempt's inits are lost, and the
+    /// handshake still completes, on the next attempt, with the same init.
+    #[tokio::test]
+    async fn test_handshake_gets_through_a_lost_attempt() {
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let relay_identity = SigningKey::from_bytes(&[7; 32]);
+        let relay_public = relay_identity.verifying_key();
+        let relay = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let mut inits = Vec::new();
+            loop {
+                let (len, from) = relay_socket.recv_from(&mut buf).await.unwrap();
+                if buf[0] != relay_link::TYPE_HANDSHAKE_INIT {
+                    continue; // the syncs that follow
+                }
+                inits.push(buf[..len].to_vec());
+                if inits.len() <= HANDSHAKE_COPIES {
+                    continue; // lost
+                }
+                let client_ephemeral = relay_link::parse_handshake_init(&buf[..len]).unwrap();
+                let relay_ephemeral =
+                    X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng));
+                let reply = relay_link::handshake_resp(
+                    &relay_identity,
+                    &client_ephemeral,
+                    &relay_ephemeral,
+                    &[5, 6, 7, 8],
+                );
+                relay_socket.send_to(&reply, from).await.unwrap();
+                return inits;
+            }
+        });
+        let mut client = new_client();
+        client.server_addr = relay_addr;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        perform_handshake(&mut client, &socket, &relay_public)
+            .await
+            .unwrap();
+        assert_eq!(client.link.session_id(), [5, 6, 7, 8]);
+        let inits = relay.await.unwrap();
+        assert_eq!(
+            inits.len(),
+            HANDSHAKE_COPIES + 1,
+            "answered on the second attempt"
         );
-        client.handle_relay_packet(&behind);
-        assert!(client.unacked_sync.is_some());
+        assert!(inits.iter().all(|init| *init == inits[0]), "the same init");
         cleanup(&[&client]);
     }
 }

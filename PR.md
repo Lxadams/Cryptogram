@@ -70,7 +70,7 @@ Closes issue: #40
 
 **Clients**
 - **They reconnect by themselves.**
-  - **How:** the relay acks every sync (new `TYPE_SYNC_ACK`). A client whose sync goes unacked for 10 s does the handshake again on the same socket, checks the reply against the pinned relay key, syncs on the new link, and resends any KeyExchanges still pending.
+  - **How:** a client sends three syncs every 15 s, and the relay acks each one three times (new `TYPE_SYNC_ACK`). A client that hasn't heard from the relay for two minutes, or straight away after a long sleep, does the handshake again on the same socket. It checks the reply against the pinned relay key, syncs on the new link, and resends any KeyExchanges still pending. Heavy loss alone rarely looks like a dead link: at 70% loss each way, two silent minutes happen about one time in 200.
   - **The result:** a relay restart (every deploy), or a link that expired while the phone slept, no longer cuts everyone off until they restart the app.
   - **The CLI** now runs the same keepalive. It had none, so its NAT mapping lapsed.
 - **Contact setup can't stall.**
@@ -146,7 +146,7 @@ Two phones connected fine, but adding a contact looked broken: one side showed "
 ### ⚠️ Wire format and deployment
 Everything here is breaking. **Deploy the relay and update every client together.**
 - **Wire format changes** (all defined in `code/relay-link`, apart from the E2E payloads):
-  - **Handshake:** the init is the client's ephemeral X25519 key and 96 zero bytes (129 bytes): no session ID, identity key or signature. The reply carries the session ID the relay picked, and its signature covers it.
+  - **Handshake:** the init is the client's ephemeral X25519 key padded with zeros to 320 bytes: no session ID, identity key or signature. The reply carries the session ID the relay picked, and its signature covers it. The relay sends it three times (`REPLY_COPIES`), which together are still smaller than the init.
   - **Keys:** the link has one key per direction, from HKDF labels `e2e-messenger/link/v2/to-relay` and `.../to-client`.
   - **Link packets:** `[type | session ID | 8-byte packet number | ChaCha20-Poly1305]`. The packet number is the nonce and replaces the 24-byte random one. The whole header is authenticated as AEAD associated data.
   - **Syncs:** the new `TYPE_SYNC` (4) replaces the empty `TYPE_DATA` sync. It carries `token | token_pub | signature | admission tags`. An older client's syncs are rejected, so the relay never sends it anything.

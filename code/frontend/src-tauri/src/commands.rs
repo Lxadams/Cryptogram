@@ -993,24 +993,14 @@ fn spawn_receive_loop(
             };
             let inbox_before = rt.client.inbox.len();
             let replies = rt.client.handle_relay_packet(&buf[..len]);
-            for (from, _, _) in &rt.client.inbox[inbox_before..] {
-                background::message_received(&contact_label(&rt.client, from));
+            for _ in inbox_before..rt.client.inbox.len() {
+                background::message_received();
             }
             for packet in replies {
                 let _ = socket.send_to(&packet, rt.client.server_addr).await;
             }
         }
     })
-}
-
-/// How a notification names a contact: their chosen name, or failing that
-/// the start of their routing token.
-fn contact_label(client: &Client, token: &RoutingToken) -> String {
-    client
-        .contact_names
-        .get(token)
-        .cloned()
-        .unwrap_or_else(|| hex::encode(&token[..4]))
 }
 
 /// Union of `pending_contacts` (KeyExchange in flight) and `e2e_sessions`

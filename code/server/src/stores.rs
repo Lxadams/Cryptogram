@@ -6,7 +6,7 @@ use relay_link::{
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
     fmt,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
 
@@ -77,6 +77,25 @@ const ADMISSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// existed, until expired entries make room. (Smaller under test, so tests
 /// can fill it.)
 pub const MAX_ADMISSION_ENTRIES: usize = if cfg!(test) { 64 } else { 100_000 };
+
+/// How long the relay remembers its reply to a handshake init. A client
+/// sends each init several times over (it's one packet, and loss is the
+/// norm), and a copy of one just answered gets the same reply: the same
+/// link, not a link per copy. As long as a link nobody has synced on lives.
+const RECENT_HANDSHAKE_TTL: Duration = UNSYNCED_LINK_TTL;
+
+/// Handshakes each source address may start (see `Tables::allow_handshake`):
+/// a burst of `HANDSHAKE_BURST`, then `HANDSHAKE_RATE` a second. A
+/// handshake costs the relay a key agreement and a signature, so this keeps
+/// one sender from taking its CPU. Copies of an init already answered don't
+/// count. Generous, as many clients can share one address behind a NAT.
+const HANDSHAKE_BURST: f64 = 20.0;
+const HANDSHAKE_RATE: f64 = 1.0;
+/// Most source addresses whose handshake budgets are tracked at once.
+/// Past this, a new address isn't limited (someone spoofing addresses gets
+/// round any per-address limit anyway, and `MAX_LINKS` still bounds what
+/// they can take). Smaller under test, so tests can fill it.
+const MAX_HANDSHAKE_SOURCES: usize = if cfg!(test) { 64 } else { 65_536 };
 
 /// One client's link: the relay's end of it (its keys, and the packet
 /// numbers sent and taken in), and the one address the relay sends it
@@ -180,6 +199,42 @@ struct Admission {
     expiry: Instant,
 }
 
+/// The relay's reply to a recent handshake init (see
+/// `RECENT_HANDSHAKE_TTL`).
+struct RecentHandshake {
+    session_id: SessionId,
+    reply: Vec<u8>,
+    at: Instant,
+}
+
+/// What's left of a source address's handshake budget (see
+/// `HANDSHAKE_BURST`), as of `at`.
+struct HandshakeBudget {
+    tokens: f64,
+    at: Instant,
+}
+
+impl HandshakeBudget {
+    /// The budget refilled up to `now`.
+    fn refilled(&self, now: Instant) -> f64 {
+        let refill = now.saturating_duration_since(self.at).as_secs_f64() * HANDSHAKE_RATE;
+        (self.tokens + refill).min(HANDSHAKE_BURST)
+    }
+}
+
+/// Which handshake budget a source address draws on: the address itself
+/// for IPv4, and its /64 for IPv6, as one host can have a whole /64.
+fn handshake_source(ip: IpAddr) -> [u8; 16] {
+    match ip {
+        IpAddr::V4(ip) => ip.to_ipv6_mapped().octets(),
+        IpAddr::V6(ip) => {
+            let mut prefix = [0u8; 16];
+            prefix[..8].copy_from_slice(&ip.octets()[..8]);
+            prefix
+        }
+    }
+}
+
 /// A packet `take_due` released for sending: where to, on which link, and
 /// the delivery ID the recipient acks it with.
 pub struct DuePacket {
@@ -202,6 +257,9 @@ pub struct Tables {
     /// recounted at every sweep (`sweep_expired_messages`), so in between
     /// it can run high, but never low.
     unregistered_bytes: usize,
+    /// Recent replies to handshake inits, by the client's ephemeral key.
+    recent_handshakes: HashMap<[u8; 32], RecentHandshake>,
+    handshake_budgets: HashMap<[u8; 16], HandshakeBudget>,
 }
 
 impl Tables {
@@ -213,7 +271,66 @@ impl Tables {
             message_queues: HashMap::new(),
             admission: HashMap::new(),
             unregistered_bytes: 0,
+            recent_handshakes: HashMap::new(),
+            handshake_budgets: HashMap::new(),
         }
+    }
+
+    /// The reply the relay sent a handshake init with the ephemeral key
+    /// `client_ephemeral` lately, if its link is still unused or in use:
+    /// what a copy of that init gets, rather than a new link.
+    pub fn recent_handshake_reply(&self, client_ephemeral: &[u8; 32]) -> Option<Vec<u8>> {
+        let recent = self.recent_handshakes.get(client_ephemeral)?;
+        (recent.at.elapsed() < RECENT_HANDSHAKE_TTL
+            && self.active_links.contains_key(&recent.session_id))
+        .then(|| recent.reply.clone())
+    }
+
+    /// Remember `reply`, to the init with `client_ephemeral`, which gave
+    /// `session_id` its link (see `recent_handshake_reply`). There's room
+    /// for one per link.
+    pub fn remember_handshake(
+        &mut self,
+        client_ephemeral: [u8; 32],
+        session_id: SessionId,
+        reply: Vec<u8>,
+    ) {
+        if self.recent_handshakes.len() < MAX_LINKS {
+            self.recent_handshakes.insert(
+                client_ephemeral,
+                RecentHandshake {
+                    session_id,
+                    reply,
+                    at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    /// Whether a new handshake from `ip` is within its address's budget
+    /// (see `HANDSHAKE_BURST`), taking one from it if so.
+    pub fn allow_handshake(&mut self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let source = handshake_source(ip);
+        if !self.handshake_budgets.contains_key(&source)
+            && self.handshake_budgets.len() >= MAX_HANDSHAKE_SOURCES
+        {
+            return true;
+        }
+        let budget = self
+            .handshake_budgets
+            .entry(source)
+            .or_insert(HandshakeBudget {
+                tokens: HANDSHAKE_BURST,
+                at: now,
+            });
+        budget.tokens = budget.refilled(now);
+        budget.at = now;
+        if budget.tokens < 1.0 {
+            return false;
+        }
+        budget.tokens -= 1.0;
+        true
     }
 
     /// Register a new link from `addr`, which just handshook from there,
@@ -295,6 +412,16 @@ impl Tables {
             &packet.id,
             &packet.payload,
         ))
+    }
+
+    #[cfg(test)]
+    pub fn link_count(&self) -> usize {
+        self.active_links.len()
+    }
+
+    #[cfg(test)]
+    pub fn expire_link(&mut self, session_id: &SessionId) {
+        self.active_links.remove(session_id);
     }
 
     #[allow(dead_code)]
@@ -506,6 +633,13 @@ impl Tables {
         let links = &self.active_links;
         self.token_links
             .retain(|_, session_id| links.contains_key(session_id));
+        self.recent_handshakes.retain(|_, recent| {
+            now.duration_since(recent.at) < RECENT_HANDSHAKE_TTL
+                && links.contains_key(&recent.session_id)
+        });
+        // A budget that has refilled is the same as none at all.
+        self.handshake_budgets
+            .retain(|_, budget| budget.refilled(now) < HANDSHAKE_BURST);
     }
 
     pub fn sweep_metadata(&mut self) {

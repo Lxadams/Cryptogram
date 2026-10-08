@@ -6,6 +6,7 @@ authors = ["Compx374 team"]
 license = ""
 repository = ""
 edition = "2021"
+publish = false
 # Bumped from 1.77.2: identity session locking (see commands.rs's
 # try_acquire_session_lock) uses std::fs::File::try_lock, stabilized in
 # 1.89. Android's std doesn't support it, which that function allows for.
@@ -49,3 +50,11 @@ webkit2gtk = { version = "2.0", features = ["v2_8"] }
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 
+# Argon2id (see `ARGON2_M_COST_KIB` in code/client/src/lib.rs) is built
+# optimised even in debug builds and tests, where it would otherwise take
+# many seconds per login.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

@@ -37,7 +37,7 @@ code/frontend/
 Cargo dependencies (`leptos`, `tauri`, `wasm-bindgen`, etc.) all fetch
 automatically on first build — nothing to install manually there. First
 build of each crate is slow (a few minutes, compiling large dependency
-trees like `webkit2gtk` bindings and `pqcrypto-kyber`'s C code); every
+trees like `webkit2gtk` bindings and SQLCipher's bundled OpenSSL); every
 build after that is fast incremental compilation.
 
 ## Running it
@@ -147,7 +147,7 @@ app sends them its KeyExchange again now and then (after 30 seconds, then
 twice as long each time, up to 8 times). Adding them again, from either
 side, also picks the setup up where it stopped, and starts those resends
 over. If the relay restarts, the app notices its syncs going unanswered
-and reconnects by itself within about 15 seconds. Someone who tries to connect before you've added them
+and reconnects by itself once it has heard nothing from the relay for two minutes, or straight away after a phone wakes from a long sleep. Someone who tries to connect before you've added them
 pops up as "Someone wants to connect": scanning their code accepts, "Not
 now" hides them for a day, and "Mute connection requests" stops the pop-ups
 until you unmute them in the contact list. Just closing the pop-up only

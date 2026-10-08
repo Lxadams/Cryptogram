@@ -686,6 +686,15 @@ button.danger {
   border-radius: 8px;
 }
 
+.qr-scanner .scanner-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
 /* One column: phones and narrow windows. The contact list (with your
    identity above it) fills the screen until a chat is opened, then the
    chat fills it instead, with a back button to return. */

@@ -572,6 +572,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac",
+ "libc",
  "rand_core 0.6.4",
  "relay-link",
  "serde",

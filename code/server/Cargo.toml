@@ -2,6 +2,7 @@
 name = "server"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -19,3 +20,6 @@ hmac = "0.12.1"
 # The client <-> relay link protocol, shared with the client so the two
 # can't drift apart.
 relay-link = { path = "../relay-link" }
+# To keep the relay's memory out of core dumps and debuggers (see
+# `keep_memory_private` in src/main.rs). Already in the tree via tokio.
+libc = "0.2"

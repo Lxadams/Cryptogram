@@ -1,8 +1,7 @@
 use crate::{RoutingToken, UserIdentity};
 use anyhow::{Result, anyhow};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
-use pqcrypto_kyber::kyber768::{Ciphertext, PublicKey};
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _};
+use crate::pq::{Ciphertext, PublicKey};
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
@@ -422,6 +421,12 @@ mod tests {
         assert_eq!(KX_LEN, 1393);
         assert_eq!(EST_LEN, 1232);
         assert_eq!(PQI_LEN, 1200);
+        // ML-KEM-768 (FIPS 203) has the sizes round-3 Kyber-768 had, and the
+        // same key layout, so payloads kept their sizes and identities saved
+        // with Kyber keys still load: they're valid ML-KEM keys.
+        assert_eq!(crate::pq::PUBLIC_KEY_LEN, KYBER_PUB_LEN);
+        assert_eq!(crate::pq::CIPHERTEXT_LEN, KYBER_CT_LEN);
+        assert_eq!(crate::pq::SECRET_KEY_LEN, 2400);
     }
 
     /// Byte-for-byte layout pin: the same fields concatenated by hand, in

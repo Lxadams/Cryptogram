@@ -4,8 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use pqcrypto_kyber::kyber768::{Ciphertext, PublicKey, SecretKey};
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _};
+use crate::pq::{Ciphertext, PublicKey, SecretKey};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -426,7 +425,7 @@ impl ClientStateDto {
             link: unlinked(), // every run handshakes for a link of its own
             relay_public: None,
             pending_handshake: None,
-            unacked_sync: None,
+            last_heard: std::time::Instant::now(),
             setup_retries: HashMap::new(), // live state, not persisted
             e2e_sessions,
             pending_contacts,

@@ -127,10 +127,15 @@ const HEADER_LEN: usize = 1 + 4 + 8;
 /// What a link packet adds around its plaintext: its header and AEAD tag.
 pub const LINK_OVERHEAD: usize = HEADER_LEN + 16;
 
-/// A handshake init is padded to more than the reply it gets, so the relay
-/// never sends an address more than it received from it: a handshake with
-/// someone else's source address can't make the relay an amplifier.
-pub const HANDSHAKE_INIT_LEN: usize = 1 + 32 + 96;
+/// How many times the relay sends its reply to each handshake init, and
+/// each sync ack, so they get through heavy loss (a client sends its inits
+/// and syncs several times too).
+pub const REPLY_COPIES: usize = 3;
+/// A handshake init is padded to more than all the copies of the reply it
+/// gets, so the relay never sends an address more than it received from it:
+/// a handshake with someone else's source address can't make the relay an
+/// amplifier.
+pub const HANDSHAKE_INIT_LEN: usize = 320;
 pub const HANDSHAKE_RESP_LEN: usize = 1 + 4 + 32 + 64;
 const SYNC_BASE_LEN: usize = 16 + 32 + 64;
 
@@ -846,7 +851,10 @@ mod tests {
         let relay_secret = EphemeralSecret::random_from_rng(OsRng);
         let relay_ephemeral = X25519PublicKey::from(&relay_secret);
         let resp = handshake_resp(&relay, &client_ephemeral, &relay_ephemeral, &[9, 9, 9, 9]);
-        assert!(resp.len() < init.len(), "never an amplifier");
+        assert!(
+            REPLY_COPIES * resp.len() < init.len(),
+            "never an amplifier"
+        );
         let (session_id, got_ephemeral) =
             parse_handshake_resp(&resp, &relay.verifying_key(), &client_ephemeral).unwrap();
         assert_eq!(session_id, [9, 9, 9, 9]);

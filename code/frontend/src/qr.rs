@@ -2,10 +2,10 @@
 //!
 //! Everything here runs in the shared WASM UI, so it's the same code on
 //! desktop and mobile: the camera comes from the webview's standard
-//! `getUserMedia`, and frames are decoded in Rust (`rqrr`) and, where the
-//! webview has one, by its own `BarcodeDetector` too (Android's copes far
-//! better with blur and glare), with no native scanner plugin per
-//! platform. The only per-platform piece is letting the
+//! `getUserMedia`, and frames are decoded in Rust (`rqrr`) and, if the user
+//! turns it on, by the webview's own `BarcodeDetector` too (Android's copes
+//! far better with blur and glare, but it's Google's, in Play services),
+//! with no native scanner plugin per platform. The only per-platform piece is letting the
 //! webview use the camera at all: Linux needs an opt-in (see
 //! src-tauri/src/lib.rs), Android/iOS/macOS need a camera permission in
 //! their app manifests, and Windows prompts the user on its own.
@@ -79,6 +79,10 @@ pub fn QrScanner(on_scan: Callback<String, Result<(), String>>) -> impl IntoView
     let stream = StoredValue::new_local(None::<web_sys::MediaStream>);
     let interval = StoredValue::new(None::<IntervalHandle>);
     let stopped = StoredValue::new(false);
+    // The webview's own detector, if the user has turned it on (see
+    // `uses_system_scanner`) and it has one: `None` otherwise, or once it
+    // has failed.
+    let native = StoredValue::new_local(None::<JsValue>);
 
     // `try_*` throughout: this can run from the interval after the parent
     // has already closed us, by which point these values may be disposed.
@@ -145,13 +149,15 @@ pub fn QrScanner(on_scan: Callback<String, Result<(), String>>) -> impl IntoView
                 }
             }
         });
-        // The webview's own detector, if it has one (`None` once it has
-        // failed). It works asynchronously, so `detecting` keeps one frame
-        // in it at a time.
-        let native = Rc::new(RefCell::new(native_detector().await));
-        if closed() {
-            return; // `stop` has already released the camera
+        if uses_system_scanner() {
+            let detector = native_detector().await;
+            if closed() {
+                return; // `stop` has already released the camera
+            }
+            native.set_value(detector);
         }
+        // The native detector works asynchronously, so `detecting` keeps one
+        // frame in it at a time.
         let detecting = Rc::new(Cell::new(false));
         // When `rqrr` may next decode a frame (see `MAX_DECODE_SHARE`), as
         // a `Date::now()` timestamp.
@@ -162,21 +168,18 @@ pub fn QrScanner(on_scan: Callback<String, Result<(), String>>) -> impl IntoView
                 if stopped.try_get_value() != Some(false) || !has_frame(&video) {
                     return;
                 }
-                let detector = native.borrow().clone();
-                if let Some(detector) = detector
+                if let Some(detector) = native.try_get_value().flatten()
                     && !detecting.replace(true)
                 {
-                    let (video, native, detecting, found) = (
-                        video.clone(),
-                        native.clone(),
-                        detecting.clone(),
-                        found.clone(),
-                    );
+                    let (video, detecting, found) =
+                        (video.clone(), detecting.clone(), found.clone());
                     leptos::task::spawn_local(async move {
                         match native_detect(&detector, &video).await {
                             Ok(Some(text)) => found(text),
                             Ok(None) => {}
-                            Err(()) => *native.borrow_mut() = None,
+                            Err(()) => {
+                                let _ = native.try_set_value(None);
+                            }
                         }
                         detecting.set(false);
                     });
@@ -215,8 +218,61 @@ pub fn QrScanner(on_scan: Callback<String, Result<(), String>>) -> impl IntoView
                 }.into_any(),
                 None => view! { <p class="hint">"Starting camera..."</p> }.into_any(),
             }}
+            {has_system_scanner().then(|| view! {
+                <label class="scanner-option">
+                    <input
+                        type="checkbox"
+                        prop:checked=uses_system_scanner()
+                        on:change=move |ev| {
+                            let on = event_target_checked(&ev);
+                            set_system_scanner(on);
+                            if on {
+                                leptos::task::spawn_local(async move {
+                                    let detector = native_detector().await;
+                                    let _ = native.try_set_value(detector);
+                                });
+                            } else {
+                                let _ = native.try_set_value(None);
+                            }
+                        }
+                    />
+                    "Also use this device's own scanner (on Android, Google Play services), which copes better with blur and glare"
+                </label>
+            })}
         </div>
     }
+}
+
+/// Where the "use this device's own scanner" setting is kept, like the
+/// theme (see app.rs).
+const SYSTEM_SCANNER_KEY: &str = "e2e-messenger-system-qr-scanner";
+
+/// Whether the user has chosen to have the webview's own `BarcodeDetector`
+/// decode too. Off unless they have: on Android it's Google's ML Kit,
+/// running in Play services, and `rqrr` reads codes without either.
+fn uses_system_scanner() -> bool {
+    window()
+        .local_storage()
+        .ok()
+        .flatten()
+        .and_then(|storage| storage.get_item(SYSTEM_SCANNER_KEY).ok().flatten())
+        .as_deref()
+        == Some("on")
+}
+
+fn set_system_scanner(on: bool) {
+    if let Ok(Some(storage)) = window().local_storage() {
+        let _ = match on {
+            true => storage.set_item(SYSTEM_SCANNER_KEY, "on"),
+            false => storage.remove_item(SYSTEM_SCANNER_KEY),
+        };
+    }
+}
+
+/// Whether the webview has a `BarcodeDetector` at all. Most desktop ones
+/// don't, and then there's no setting to show.
+fn has_system_scanner() -> bool {
+    js_sys::Reflect::has(&window(), &"BarcodeDetector".into()).unwrap_or(false)
 }
 
 async fn start_camera() -> Result<web_sys::MediaStream, String> {
