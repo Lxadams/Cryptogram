@@ -13,12 +13,10 @@
 //! own Rust-to-Kotlin calls need a live activity, and there isn't one once
 //! the app has been swiped away.
 //!
-//! Swiping the app away is also handled here (see `on_run_event`), and so
-//! is pausing presence pings while the app is off screen (see `on_screen`).
+//! Swiping the app away is also handled here (see `on_run_event`).
 //!
 //! On other platforms all of this does nothing.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_os = "android"))]
 use tauri::{AppHandle, RunEvent};
 use tokio::sync::Notify;
@@ -27,20 +25,6 @@ use tokio::sync::Notify;
 /// signals it when the app comes back to the foreground, so messages the
 /// relay is holding arrive at once instead of on the next 15s tick.
 pub static RESYNC: Notify = Notify::const_new();
-
-/// See `on_screen`. Only Android ever changes it.
-static ON_SCREEN: AtomicBool = AtomicBool::new(true);
-
-/// Wakes `spawn_presence_loop` when the app comes back on screen, so
-/// contacts see us online again straight away rather than on its next tick.
-pub static BACK_ON_SCREEN: Notify = Notify::const_new();
-
-/// Whether the app is on screen. `spawn_presence_loop` skips its pings
-/// while it isn't, to save battery: each one wakes the phone's radio, and
-/// they only feed contacts' online markers. Always true on desktop.
-pub fn on_screen() -> bool {
-    ON_SCREEN.load(Ordering::Relaxed)
-}
 
 /// Someone logged in and connected to the relay.
 pub fn session_started() {
@@ -52,9 +36,16 @@ pub fn session_ended() {
     emit("session_ended".to_string());
 }
 
-/// A chat message arrived from `from` (a contact's name, or a short token).
-pub fn message_received(from: &str) {
-    emit(format!("message\t{from}"));
+/// A chat message arrived. Who from (`from`, a contact's name) is passed on
+/// only if the user lets notifications say (see
+/// `commands::notification_sender`). Otherwise a notification shows only
+/// that one came, so nobody reading the lock screen learns who the user
+/// talks to.
+pub fn message_received(from: Option<&str>) {
+    emit(match from {
+        Some(from) => format!("message\t{from}"),
+        None => "message".to_string(),
+    });
 }
 
 #[cfg(not(target_os = "android"))]
@@ -74,12 +65,8 @@ pub use android::{init, on_run_event};
 #[cfg(target_os = "android")]
 mod android {
     use crate::state::AppState;
-    use jni::{
-        objects::JClass,
-        sys::{jboolean, jstring},
-        JNIEnv,
-    };
-    use std::sync::{atomic::Ordering, mpsc, Mutex, OnceLock};
+    use jni::{objects::JClass, sys::jstring, JNIEnv};
+    use std::sync::{mpsc, Mutex, OnceLock};
     use tauri::{AppHandle, Manager, RunEvent, WebviewWindowBuilder};
 
     /// Set once Tauri's setup has run, which is after it built the first
@@ -159,7 +146,8 @@ mod android {
     }
 
     /// `NativeBridge.nextEvent()`: blocks until the next event, then returns
-    /// it as `"session_started"`, `"session_ended"` or `"message\t<from>"`.
+    /// it as `"session_started"`, `"session_ended"`, `"message"` or
+    /// `"message\t<from>"`.
     #[no_mangle]
     pub extern "system" fn Java_nz_ac_waikato_compx374_e2e_1messenger_NativeBridge_nextEvent(
         env: JNIEnv,
@@ -170,21 +158,6 @@ mod android {
         match event.ok().and_then(|e| env.new_string(e).ok()) {
             Some(s) => s.into_raw(),
             None => std::ptr::null_mut(),
-        }
-    }
-
-    /// `NativeBridge.appVisible(visible)`: the app came on screen or left it.
-    #[no_mangle]
-    pub extern "system" fn Java_nz_ac_waikato_compx374_e2e_1messenger_NativeBridge_appVisible(
-        _env: JNIEnv,
-        _class: JClass,
-        visible: jboolean,
-    ) {
-        let visible = visible != 0;
-        log::info!("App on screen: {visible} (presence pings follow)");
-        super::ON_SCREEN.store(visible, Ordering::Relaxed);
-        if visible {
-            super::BACK_ON_SCREEN.notify_one();
         }
     }
 

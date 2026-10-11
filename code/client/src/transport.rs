@@ -50,12 +50,60 @@ const MESSAGE_MAX_FAILURE: f64 = 1e-4;
 /// desyncs the ratchet for good, not just one message.
 const PQ_MESSAGE_MAX_FAILURE: f64 = 1e-6;
 /// Gap between consecutive packets of a burst (see `send_burst`).
-const FEC_PACKET_SPACING: Duration = Duration::from_millis(10);
+pub(crate) const FEC_PACKET_SPACING: Duration = Duration::from_millis(10);
 
 /// How long, and how many, messages are parked per peer waiting for a PQ
-/// inject they were encrypted after.
-const DEFER_TTL: Duration = Duration::from_secs(60);
-const MAX_DEFERRED_PER_PEER: usize = 32;
+/// inject they were encrypted after. As long as the relay holds a message
+/// (the inject rides in one), since a parked message has already been acked
+/// to the relay and can't be had again. As many as the ratchet looks ahead.
+const DEFER_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const MAX_DEFERRED_PER_PEER: usize = 100;
+
+/// Chat payloads from one peer that couldn't be decrypted yet, as they were
+/// encrypted after a PQ inject still on its way, by seq number. Kept in
+/// the session (`SymmetricSessionState::parked`), so they're saved with it
+/// and go with it when it's replaced.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ParkedPayloads(pub BTreeMap<u64, Parked>);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Parked {
+    pub payload: Vec<u8>,
+    /// When it was first parked, in Unix milliseconds.
+    pub parked_at_ms: u64,
+}
+
+impl ParkedPayloads {
+    /// Park payload `seq` for a later retry. `parked_at_ms` is when it was
+    /// first parked: re-parking after a failed retry keeps it, so a payload
+    /// can't outlive `DEFER_TTL`.
+    pub(crate) fn park(&mut self, seq: u64, payload: Vec<u8>, parked_at_ms: u64, now_ms: u64) {
+        let ttl = DEFER_TTL.as_millis() as u64;
+        let fresh = |parked: u64| now_ms.saturating_sub(parked) < ttl;
+        if !fresh(parked_at_ms) {
+            return;
+        }
+        self.0.retain(|_, parked| fresh(parked.parked_at_ms));
+        self.0.entry(seq).or_insert(Parked {
+            payload,
+            parked_at_ms,
+        });
+        // Over the cap, drop the furthest-ahead payload: lower seq numbers
+        // are the ones the next PQ inject unblocks first.
+        if self.0.len() > MAX_DEFERRED_PER_PEER {
+            self.0.pop_last();
+        }
+    }
+
+    /// Everything still fresh, in seq order, taken out for a retry.
+    pub(crate) fn take(&mut self, now_ms: u64) -> Vec<Parked> {
+        let ttl = DEFER_TTL.as_millis() as u64;
+        std::mem::take(&mut self.0)
+            .into_values()
+            .filter(|parked| now_ms.saturating_sub(parked.parked_at_ms) < ttl)
+            .collect()
+    }
+}
 
 const NONCE_LEN: usize = 24;
 
@@ -110,16 +158,31 @@ pub(crate) fn encode_message(
     chunks: &[Vec<u8>],
     pq_inject: Option<&[u8]>,
 ) -> Result<Vec<Vec<u8>>> {
-    let mut parts: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-    parts.extend(pq_inject);
     let max_failure = match pq_inject {
         Some(_) => PQ_MESSAGE_MAX_FAILURE,
         None => MESSAGE_MAX_FAILURE,
     };
-    let object = bundle(&parts);
+    let object = message_object(chunks, pq_inject);
     let packets = fec::packets_for(object.len(), FEC_DESIGN_LOSS, max_failure);
     let symbols = fec::encode(object_id, &object, packets)?;
     Ok(seal_symbols(root_key, sender, target, &symbols))
+}
+
+/// How many of the symbols `encode_message` makes for a message the relay
+/// must have for the recipient to rebuild it: its source symbols, with
+/// which decoding works 99 times in 100 (one more makes it 9,999 in 10,000).
+/// Requiring the extra one made the check mark wait, and often time out, on
+/// messages that arrived (two phones at 70% loss each way).
+pub(crate) fn symbols_needed(chunks: &[Vec<u8>], pq_inject: Option<&[u8]>) -> u32 {
+    fec::source_symbols_for(message_object(chunks, pq_inject).len())
+}
+
+/// A message's chunks, and the PQ inject that follows them if any, as one
+/// FEC object.
+fn message_object(chunks: &[Vec<u8>], pq_inject: Option<&[u8]>) -> Vec<u8> {
+    let mut parts: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+    parts.extend(pq_inject);
+    bundle(&parts)
 }
 
 /// Seal FEC symbols end to end: one 0x07 inner payload per symbol.
@@ -179,10 +242,9 @@ fn open_symbol(
         .ok()
 }
 
-/// Receive-side FEC state: per-session seal ciphers, half-rebuilt objects,
-/// and chat messages parked because they arrived ahead of the PQ inject
-/// they were encrypted after. Transient — never persisted (a restart just
-/// drops anything in flight).
+/// Receive-side FEC state: per-session seal ciphers and half-rebuilt
+/// objects. Transient — never persisted (a restart just drops anything in
+/// flight, which the relay resends, as it isn't acked until rebuilt).
 #[derive(Default)]
 pub struct FecReceiver {
     /// Keyed by (sender, session epoch): object ids are per-session seq
@@ -191,8 +253,6 @@ pub struct FecReceiver {
     reassembler: fec::Reassembler<(RoutingToken, u64)>,
     peers: HashMap<RoutingToken, PeerSeal>,
     next_epoch: u64,
-    /// Parked 0x01 payloads per sender, keyed by seq number.
-    deferred: HashMap<RoutingToken, BTreeMap<u64, (Instant, Vec<u8>)>>,
 }
 
 /// A peer's symbol-opening cipher, derived once per session rather than
@@ -206,8 +266,7 @@ struct PeerSeal {
 impl FecReceiver {
     /// Open a sealed symbol from `sender` (see `open_symbol`) under the
     /// session `root_key` belongs to. A session not seen before gets a fresh
-    /// cipher and reassembly epoch, and anything still parked from the
-    /// sender's previous session is dropped (it can't decrypt any more).
+    /// cipher and reassembly epoch.
     pub(crate) fn open(
         &mut self,
         root_key: &[u8; 32],
@@ -229,7 +288,6 @@ impl FecReceiver {
                     epoch: self.next_epoch,
                 },
             );
-            self.deferred.remove(sender);
         }
         open_symbol(&self.peers[sender].cipher, sender, target, sealed)
     }
@@ -244,52 +302,6 @@ impl FecReceiver {
     ) -> Result<Option<Vec<u8>>, fec::FecError> {
         let epoch = self.peers.get(&sender).map_or(0, |peer| peer.epoch);
         self.reassembler.ingest((sender, epoch), symbol, now)
-    }
-
-    /// Park the undecryptable 0x01 message `seq` from `sender` for a later
-    /// retry. `parked_at` is when it was first parked: re-parking after a
-    /// failed retry keeps it, so a message can't outlive `DEFER_TTL`.
-    pub(crate) fn defer(
-        &mut self,
-        sender: RoutingToken,
-        seq: u64,
-        payload: Vec<u8>,
-        parked_at: Instant,
-        now: Instant,
-    ) {
-        let fresh = |parked: &Instant| now.saturating_duration_since(*parked) < DEFER_TTL;
-        if !fresh(&parked_at) {
-            return;
-        }
-        let queue = self.deferred.entry(sender).or_default();
-        queue.retain(|_, (parked, _)| fresh(parked));
-        queue.entry(seq).or_insert((parked_at, payload));
-        // Over the cap, drop the furthest-ahead message: lower seq numbers
-        // are the ones the next PQ inject unblocks first.
-        if queue.len() > MAX_DEFERRED_PER_PEER {
-            queue.pop_last();
-        }
-    }
-
-    /// Everything still fresh that's parked for `sender`, in seq order, as
-    /// (parked_at, payload).
-    pub(crate) fn take_deferred(
-        &mut self,
-        sender: &RoutingToken,
-        now: Instant,
-    ) -> Vec<(Instant, Vec<u8>)> {
-        self.deferred
-            .remove(sender)
-            .into_iter()
-            .flatten()
-            .map(|(_, entry)| entry)
-            .filter(|(parked, _)| now.saturating_duration_since(*parked) < DEFER_TTL)
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn deferred_count(&self, sender: &RoutingToken) -> usize {
-        self.deferred.get(sender).map_or(0, BTreeMap::len)
     }
 
     #[cfg(test)]
@@ -382,10 +394,24 @@ impl BurstSender {
     /// case none of it leaves this machine — while the rest is paced out in
     /// the background.
     pub async fn send(&self, packets: Vec<Vec<u8>>) -> io::Result<()> {
-        let stopped = || io::Error::other("burst sender task has stopped");
+        self.queue(packets).await
+    }
+
+    /// `send`, but the burst is queued straight away, before the returned
+    /// future is first polled. Bursts are numbered in their link's paced
+    /// lane as they're made (see `Client::create_fec_packets`), and must
+    /// leave in that order, so a front end queues each one before letting
+    /// go of the `Client` that made it, then waits outside the lock.
+    pub fn queue(&self, packets: Vec<Vec<u8>>) -> impl Future<Output = io::Result<()>> + use<> {
+        fn stopped() -> io::Error {
+            io::Error::other("burst sender task has stopped")
+        }
         let (tx, rx) = oneshot::channel();
-        self.0.send((packets, tx)).map_err(|_| stopped())?;
-        rx.await.map_err(|_| stopped())?
+        let queued = self.0.send((packets, tx)).map_err(|_| stopped());
+        async move {
+            queued?;
+            rx.await.map_err(|_| stopped())?
+        }
     }
 }
 
@@ -395,6 +421,14 @@ mod tests {
     use crate::test_support::{
         Rng, cleanup, connect, connected_pair, inbox_texts, new_client, relay, session,
     };
+
+    /// How many of `sender`'s payloads `client` has parked.
+    fn parked_count(client: &Client, sender: &RoutingToken) -> usize {
+        client
+            .e2e_sessions
+            .get(sender)
+            .map_or(0, |session| session.parked.0.len())
+    }
     use crate::{Client, MAX_MESSAGE_LEN};
 
     /// Each message's burst, as the relay hands it to the recipient.
@@ -490,17 +524,48 @@ mod tests {
             deliver(&mut bob, &bursts[i]);
         }
         assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2", "m3"]);
-        assert_eq!(bob.fec_rx.deferred_count(&alice.identity.routing_token), 1);
+        assert_eq!(parked_count(&bob, &alice.identity.routing_token), 1);
 
         // Message 4 + its PQ inject arrive last: 4 decrypts, the inject
         // lands, and the parked message 5 goes through right after.
         deliver(&mut bob, &bursts[4]);
         assert_eq!(inbox_texts(&mut bob), ["m4", "m5"]);
-        assert_eq!(bob.fec_rx.deferred_count(&alice.identity.routing_token), 0);
+        assert_eq!(parked_count(&bob, &alice.identity.routing_token), 0);
         assert_eq!(
             session(&alice, &bob).send_chain_key,
             session(&bob, &alice).recv_chain_key
         );
+        cleanup(&[&alice, &bob]);
+    }
+
+    /// What two phones at 70% loss each way hit: the burst carrying a PQ
+    /// inject took over five minutes to arrive, and the messages after it,
+    /// parked meanwhile (and already acked to the relay), were dropped after
+    /// a minute. They must wait as long as it takes, the app restarting in
+    /// between included.
+    #[test]
+    fn messages_parked_for_a_slow_pq_inject_survive_minutes_and_a_restart() {
+        let (mut alice, mut bob) = connected_pair();
+        let bursts = bursts(&mut alice, &bob, 8);
+        for i in [0, 1, 2, 3, 5, 6, 7] {
+            deliver(&mut bob, &bursts[i]);
+        }
+        assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2", "m3"]);
+        let alice_token = alice.identity.routing_token;
+        assert_eq!(parked_count(&bob, &alice_token), 3);
+
+        // Ten minutes go by, and the app restarts.
+        let session = bob.e2e_sessions.get_mut(&alice_token).unwrap();
+        for parked in session.parked.0.values_mut() {
+            parked.parked_at_ms -= 10 * 60 * 1000;
+        }
+        bob.save();
+        let mut bob = crate::ClientStateDto::load(&bob.state_path).unwrap();
+        assert_eq!(parked_count(&bob, &alice_token), 3);
+
+        deliver(&mut bob, &bursts[4]);
+        assert_eq!(inbox_texts(&mut bob), ["m4", "m5", "m6", "m7"]);
+        assert_eq!(parked_count(&bob, &alice_token), 0);
         cleanup(&[&alice, &bob]);
     }
 
@@ -517,7 +582,7 @@ mod tests {
             deliver(&mut bob, &bursts[i]);
         }
         assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2", "m3"]);
-        assert_eq!(bob.fec_rx.deferred_count(&alice.identity.routing_token), 5);
+        assert_eq!(parked_count(&bob, &alice.identity.routing_token), 5);
         assert!(
             session(&bob, &alice)
                 .recv_pq_injects
@@ -546,7 +611,7 @@ mod tests {
         for i in [0, 1, 2, 3, 5] {
             deliver(&mut bob, &bursts[i]);
         }
-        assert_eq!(bob.fec_rx.deferred_count(&alice_token), 1);
+        assert_eq!(parked_count(&bob, &alice_token), 1);
 
         for seq in 0..2 * MAX_DEFERRED_PER_PEER as u64 {
             let mut forged = vec![0x01];
@@ -555,7 +620,7 @@ mod tests {
             forged.extend_from_slice(&[0u8; 24 + 32]);
             bob.handle_incoming_packet(&forged).unwrap();
         }
-        assert_eq!(bob.fec_rx.deferred_count(&alice_token), 1);
+        assert_eq!(parked_count(&bob, &alice_token), 1);
 
         deliver(&mut bob, &bursts[4]);
         assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2", "m3", "m4", "m5"]);
@@ -585,7 +650,7 @@ mod tests {
             deliver(&mut bob, &burst.unwrap());
         }
         assert_eq!(inbox_texts(&mut bob), ["once"]);
-        assert_eq!(bob.fec_rx.deferred_count(&alice_token), 0);
+        assert_eq!(parked_count(&bob, &alice_token), 0);
         cleanup(&[&alice, &bob]);
     }
 
@@ -805,47 +870,53 @@ mod tests {
                 .create_fec_packets(bob.identity.routing_token, &vec![b'x'; len])
                 .unwrap();
             sizes.extend(burst.iter().map(Vec::len));
+            // What the relay forwards, which its dummy packets copy.
+            for packet in &burst {
+                assert_eq!(
+                    relay(packet, &alice).len(),
+                    relay_link::CHAT_INNER_PAYLOAD_LEN
+                );
+            }
         }
         assert!(sizes.iter().all(|&size| size == sizes[0]), "{sizes:?}");
         assert!(sizes[0] <= 1200, "{}-byte datagrams", sizes[0]);
+        // The size the docs give (see `padding::PADDED_LEN`): link header,
+        // recipient token, admission tag, symbol, AEAD tag.
+        assert_eq!(
+            sizes[0],
+            relay_link::LINK_OVERHEAD + 16 + 8 + relay_link::CHAT_INNER_PAYLOAD_LEN
+        );
+        assert_eq!(sizes[0], 1146);
         cleanup(&[&alice, &bob]);
     }
 
     #[test]
-    fn deferred_queue_is_bounded_per_peer_ordered_and_expires() {
-        let mut rx = FecReceiver::default();
-        let t = Instant::now();
-        let (peer, other) = ([7u8; 16], [8u8; 16]);
-        for seq in (0..40u64).rev() {
-            rx.defer(peer, seq, vec![seq as u8], t, t);
+    fn parked_payloads_are_bounded_ordered_and_expire() {
+        let mut parked = ParkedPayloads::default();
+        let t = 1_000_000u64;
+        let ttl = DEFER_TTL.as_millis() as u64;
+        for seq in (0..120u64).rev() {
+            parked.park(seq, vec![seq as u8], t, t);
         }
-        assert_eq!(rx.deferred_count(&peer), MAX_DEFERRED_PER_PEER);
-        let taken: Vec<Vec<u8>> = rx
-            .take_deferred(&peer, t)
-            .into_iter()
-            .map(|(_, p)| p)
-            .collect();
+        assert_eq!(parked.0.len(), MAX_DEFERRED_PER_PEER);
+        let taken: Vec<Vec<u8>> = parked.take(t).into_iter().map(|p| p.payload).collect();
         // The furthest-ahead were dropped to make room; seq order on the way out.
         let expected: Vec<Vec<u8>> = (0..MAX_DEFERRED_PER_PEER as u8).map(|i| vec![i]).collect();
         assert_eq!(taken, expected);
-        assert_eq!(rx.deferred_count(&peer), 0);
+        assert!(parked.0.is_empty());
 
-        rx.defer(peer, 1, vec![1], t, t);
-        rx.defer(other, 2, vec![2], t, t);
-        assert!(rx.take_deferred(&peer, t + DEFER_TTL).is_empty(), "expired");
-        assert_eq!(
-            rx.take_deferred(&other, t),
-            [(t, vec![2])],
-            "peers independent"
-        );
+        // Minutes are nothing: an inject can take that long under loss.
+        parked.park(1, vec![1], t, t);
+        assert_eq!(parked.take(t + 10 * 60 * 1000).len(), 1);
+        parked.park(1, vec![1], t, t);
+        assert!(parked.take(t + ttl).is_empty(), "expired");
 
         // Re-parking after a failed retry keeps the original park time, so
-        // retries can't keep a message alive past DEFER_TTL.
-        let later = t + DEFER_TTL / 2;
-        rx.defer(peer, 3, vec![3], t, later);
-        let (parked_at, payload) = rx.take_deferred(&peer, later).remove(0);
-        rx.defer(peer, 3, payload, parked_at, t + DEFER_TTL);
-        assert_eq!(rx.deferred_count(&peer), 0);
+        // retries can't keep a payload alive past DEFER_TTL.
+        parked.park(3, vec![3], t, t + ttl / 2);
+        let again = parked.take(t + ttl / 2).remove(0);
+        parked.park(3, again.payload, again.parked_at_ms, t + ttl);
+        assert!(parked.0.is_empty());
     }
 
     /// Bursts queued back to back go out whole and in order, never
@@ -885,7 +956,7 @@ mod tests {
     /// re-key the session, a nested symbol) is ignored.
     #[test]
     fn bundles_only_carry_the_sealing_peers_own_messages() {
-        let (alice, mut bob) = connected_pair();
+        let (mut alice, mut bob) = connected_pair();
         let mut carol = new_client();
         connect(&mut carol, &mut bob);
         let (alice_token, bob_token) = (alice.identity.routing_token, bob.identity.routing_token);
@@ -905,7 +976,7 @@ mod tests {
             assert_eq!(bob.handle_incoming_packet(&inner).unwrap(), None);
         }
         assert!(bob.drain_inbox().is_empty());
-        assert_eq!(bob.fec_rx.deferred_count(&carol.identity.routing_token), 0);
+        assert_eq!(parked_count(&bob, &carol.identity.routing_token), 0);
         assert_eq!(session(&bob, &alice).root_key, root_before, "not re-keyed");
         cleanup(&[&alice, &bob, &carol]);
     }

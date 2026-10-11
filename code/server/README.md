@@ -1,31 +1,103 @@
 ## Tables
-- Metadata: (routing_token, incoming IP, incoming port, expiry_timestamp)
-- Message Queue: (routing_token, delivery_id, payload, expiry_timestamp, next resend)
+- Links: (session_id, a link key per direction, the packet numbers sent and taken in, the address the link has proven it's at, the one token synced on it, expiry)
+- Token links: (routing_token, the session_id of the link it was last synced on)
+- Metadata: (routing_token, incoming IP, incoming port, link session, expiry_timestamp)
+- Message Queue: (routing_token, delivery_id, payload, admitted?, expiry_timestamp, next resend)
+- Admission: (routing_token, the admission tags its contacts put on their packets, expiry)
 
 Storage-engine agnostic: for now using in-memory hashmaps; Redis can be considered for later if needed.
 
 ## Server Identity
-The server persists its Ed25519 identity to `server_identity.json` on first run. On subsequent boots, the same key is loaded automatically — clients do not need to update their server pubkey after restarts.
+The server persists its Ed25519 identity to `server_identity.json` on first run, readable by its own user only (mode 0600). On subsequent boots, the same key is loaded automatically — clients do not need to update their server pubkey after restarts.
+
+`server --print-pubkey` prints the key and exits. It never creates an identity: if there's none in the current directory yet, it says so and exits with an error, rather than making up a key no running relay has (which would be baked into every client built with it). Start the relay once to create one.
+
+The packet formats, the handshake and the sync proof live in `code/relay-link`, which the client builds on too.
 
 ## Protocol
 ```
 on_request(request):
-    If a 'Handshake' request is received:
-        Verify client's Ed25519 signature over ephemeral X25519 key (mutual auth).
-        Perform DH(ServerEph, ClientEph), derive link key via HKDF-SHA256.
-        Sign (ClientPub || ServerPub) with server Ed25519 identity.
-        Return handshake response.
-    Any link-encrypted request ('Sync', 'Forward', 'Ack') refreshes its link's expiry.
-    If a 'Sync' request is received (empty inner payload after link decryption):
+    If a 'Handshake' request is received (type 0: client ephemeral X25519, then zero
+    padding to 320 bytes, so the request is bigger than all the copies of its reply
+    put together, and the relay is never an amplifier):
+        If it's a copy of one answered in the last minute (the same client ephemeral
+        key) and that link is still there, send the same reply again if it came
+        from the link's own address, and nothing if not: the reply is what proves
+        the link is at that address. Clients send every init several times, and
+        the copies mustn't open more links.
+        Refuse it if its address has run out of handshakes: each address gets a burst
+        of 20, then one a second (an IPv6 address counts by its /64). A handshake
+        costs a key agreement and a signature, so no one sender can take up the CPU.
+        Up to MAX_HANDSHAKE_SOURCES (65,536) addresses are tracked; past that, a new
+        one isn't limited (MAX_LINKS still bounds what it can take), and the sweep
+        forgets addresses whose burst has refilled.
+        Perform DH(ServerEph, ClientEph), derive a link key for each direction via
+        HKDF-SHA256. (The handshake doesn't say who the client is: its sync proves that.)
+        If the link table is full (MAX_LINKS, 100,000), refuse it.
+        Give the link a random session ID no live link has, and remember the address
+        the handshake came from: the link's packets go there and nowhere else. (The
+        session ID is in the clear on every packet, so it's the relay's to pick: nobody
+        who sees one can take that link over by handshaking with it.)
+        Sign (label || ClientPub || ServerPub || SessionId) with server Ed25519 identity.
+        Return handshake response (type 2: session ID + server ephemeral + signature),
+        three times (REPLY_COPIES), so one is likely to get through heavy loss.
+    Every other request is a link packet: [type | session ID | packet number | AEAD],
+    sealed with the client-to-relay key, the whole header authenticated too. Refuse it
+    unless it's for a link we have, authenticates, and has a packet number not taken in
+    before (within a 1024-packet window per lane, for reordering). So a copy of any
+    packet, replayed from anywhere, is refused, and one the relay sent (sealed with the
+    other key) can't be bounced back to it. Any packet taken in refreshes its link's
+    expiry: an hour once a token has synced on it, a minute until then.
+    If a 'Sync' request is received (type 4: routing token + token public key + signature
+    + up to 64 8-byte admission tags):
+        Reject it unless the token is the hash of the public key and the signature, by
+        that key, covers a value derived from this link's keys (so only the token's
+        owner can sync it, and only on its own link).
+        If it came from an address other than the link's (its NAT mapping changed, say),
+        don't believe it yet: reply with a path challenge (type 6) to that address,
+        sealed with the link key, and change nothing.
+        Otherwise:
+        Reject it if the link already carries another token: a link carries one token
+        for good, so one link can't register any number of made-up tokens.
+        If the token was on another link before, delete that link, however long ago it
+        was last used, so nothing from it (a replayed sync, say) can move the token back.
         Update the 'Metadata' table with (routing_token, incoming IP, incoming port, expiry_timestamp).
         If the address changed, or this token was silent for over 30 s (asleep), make
         everything still queued for it due now, so it's resent straight away.
+        Replace the token's admission tags (kept 7 days, so they still protect it
+        offline), unless it has none yet and the table is full (MAX_ADMISSION_ENTRIES,
+        100,000): then its packets share one queue, as before tags existed.
+        Reply with a sync ack (type 8: the sync's packet number), three times, so the
+        client hears from its link even through heavy loss. A client that hears
+        nothing from the relay for 2 minutes (it restarted, or the link expired) does
+        the handshake again.
         Wake the outbound task.
-    If a 'Forward' request is received:
-        A presence ping (inner type 0x06) is queued only if the recipient is online, and sent once.
-        Anything else is added to the message queue with a random 16-byte delivery ID,
+    If a 'Receipt Request' is received (type 9, empty) from the link's address:
+        Reply with a receipt (type 10, three times, REPLY_COPIES): the newest packet
+        from the client's paced lane (its messages) that the relay queued, and which
+        of the 1024 before it (one dropped for a full queue doesn't count). The client asks every 2 s after sending, so it can show a check
+        mark once the relay has enough of a message to deliver it. From any other
+        address, send nothing: three replies must never go to someone else.
+    If a 'Path Response' request is received (type 7: the challenge, echoed):
+        If it answers a challenge for this link at the address it came from (from the
+        last 10-20 s), the link has moved there: send it everything there from now on,
+        resending whatever it hasn't acked. Challenges are HMACs under a key the relay
+        keeps in memory, so it doesn't have to remember the ones it sent.
+    If a 'Forward' request is received (type 1, or type 5 with an admission tag, with a
+    non-empty inner payload):
+        Add it to the message queue with a random 16-byte delivery ID,
         kept until acknowledged or expired (7 days).
-        Queue is bounded to MAX_QUEUED_BYTES_PER_TOKEN (2 MiB) per token; once full, new packets are refused (older ones kept) — clients send each message as a burst of FEC packets.
+        Once the recipient has registered admission tags, a packet carrying one of them
+        is from a contact; anything else isn't, and only gets a separate
+        MAX_UNADMITTED_BYTES_PER_TOKEN (64 KiB) per token, oldest evicted first, so
+        anyone who only knows the token (it's in the recipient's QR code) can't fill
+        the queue its contacts' messages wait in.
+        The contacts' queue is bounded to MAX_QUEUED_BYTES_PER_TOKEN (2 MiB) per token
+        (everything shares it before the recipient registers tags); once full, new
+        packets are refused (older ones kept) — clients send each message as a burst of
+        FEC packets. Recipients without tags (not synced since the relay started, or
+        tokens nobody owns) also share MAX_UNREGISTERED_QUEUED_BYTES (64 MiB) between
+        them, so made-up tokens can't take the relay's memory.
         Wake the outbound task.
     If an 'Ack' request is received (type 3: own routing token + delivery IDs):
         If it comes from the token's current link session, drop those packets from its queue.
@@ -36,26 +108,30 @@ send_due_packets():
         Take the oldest ONE packet that's due (new, or its resend backoff passed);
         next slot for this token is RELAY_PACKET_SPACING (5 ms) later.
         It stays queued until acked; its next resend is 2 s later, doubling to at most 60 s.
-        (A presence ping is dropped once sent instead.)
-        Re-encrypt payload with recipient's link key (XChaCha20-Poly1305).
-        Prepend the 16-byte delivery ID, which the client echoes back in its ack.
+        Prepend the 16-byte delivery ID, which the client echoes back in its ack, and
+        seal it on the recipient's link (ChaCha20-Poly1305, relay-to-client key, the
+        link's next packet number: every resend is sealed afresh).
         Send UDP packet to recipient's IP + port.
     Return when the next slot or resend falls due (if anything is still queued for an online token).
     (Cover traffic: dummy_packet() builds a packet the same size and framing as a
-    forwarded FEC chat packet (1154 bytes), inner type 0x00, which clients ignore.
+    forwarded FEC chat packet (1138 bytes), inner type 0x00, which clients ignore.
     Currently disabled: nothing sends them.)
 
 sweep_expired_messages():
     For all entries in the message queue that have expired:
         Delete the entry
+    Recount the bytes queued for recipients without tags.
 
 sweep_metadata():
-    For all entries in the Metadata table that have expired:
+    For all entries in the Metadata and Admission tables that have expired:
         Delete the entry
 
 sweep_active_links():
-    For all link keys that have expired (7 days since last use):
-        Delete the entry
+    For all links that have expired (an hour since last use, or a minute if no token
+    ever synced on it):
+        Delete the entry, and its token's entry in 'Token links'
+    If the link, admission or tagless-queue limits are full, log a warning: someone may
+    be flooding the relay.
 
 main():
     Load or generate server Ed25519 identity.
@@ -66,4 +142,7 @@ main():
 ## Other implementation details
 - Listens on `127.0.0.1:4430` by default (localhost, for development without `sudo`). Override with the `BIND_ADDR` env var — the Docker image sets `BIND_ADDR=0.0.0.0:443`.
 - Server has zero knowledge of user IDs or E2E keys
+- Refused packets (unknown links, forgeries, replays, malformed or rejected requests) are only logged at debug level, as anyone can send junk
 - All message payloads are stored encrypted in RAM only
+- At startup it turns off core dumps, and (on Linux) stops other processes of the same user from reading its memory, so a crash can't write link keys, queued messages or its identity key to disk
+- The Docker image runs it as an unprivileged user, and `deploy.yml` and `docker-compose.yml` give it a read-only filesystem (apart from `/data`, where its identity lives), no capabilities and no core dumps

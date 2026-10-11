@@ -1,11 +1,16 @@
-use crate::{Client, RecvPqInjects, SymmetricSessionState, UserIdentity};
+use crate::ordering::{DeliveryOrder, HeldMessage};
+use crate::pq::{Ciphertext, PublicKey, SecretKey};
+use crate::transport::{Parked, ParkedPayloads};
+use crate::{
+    AddIds, Client, RecvPqInjects, SessionOffer, SessionSetup, SymmetricSessionState, UserIdentity,
+    first_add_id, routing_token_for, unlinked,
+};
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use pqcrypto_kyber::kyber768::{PublicKey, SecretKey};
-use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
+use rand_core::{OsRng, RngCore};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -15,20 +20,62 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 pub struct ClientStateDto {
     pub identity: UserIdentityDto,
     pub server_addr: String,
-    pub session_id: String,
+    // Older state files also carry the link's `session_id`, which is
+    // ignored: every run gets its own link from its handshake.
     pub e2e_sessions: HashMap<String, SymmetricSessionStateDto>,
     pub pending_contacts: HashMap<String, String>,
     pub peer_kyber_keys: HashMap<String, String>,
-    pub seen_session_keys: Vec<String>,
     /// Peer display names learned via KeyExchange. Older state files
     /// predate this field entirely.
     #[serde(default)]
     pub contact_names: HashMap<String, String>,
+    // Contacts' X25519 keys, add IDs, how each session came about, the
+    // add-ID counter, whether connection requests are muted and whether
+    // notifications may name senders (see `Client`). Older state files predate all of them, and may still carry
+    // the `seen_session_keys` they replaced, which is ignored.
+    #[serde(default)]
+    pub peer_x25519_keys: HashMap<String, String>,
+    #[serde(default)]
+    pub add_ids: HashMap<String, AddIdsDto>,
+    #[serde(default)]
+    pub session_setups: HashMap<String, SessionSetupDto>,
+    #[serde(default)]
+    pub next_add_id: u32,
+    #[serde(default)]
+    pub requests_muted: bool,
+    #[serde(default)]
+    pub notify_with_names: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AddIdsDto {
+    pub mine: u32,
+    pub theirs: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SessionSetupDto {
+    pub establisher_add_id: u32,
+    pub responder_add_id: u32,
+    /// Hex, while the responder hasn't confirmed the session.
+    pub offer: Option<SessionOfferDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SessionOfferDto {
+    pub eph_x25519_pub: String,
+    pub kyber_ct: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct UserIdentityDto {
+    /// Always derived from `token_secret` on load; kept for readability.
     pub routing_token: String,
+    /// The key the routing token is a hash of (see `routing_token_for`).
+    /// Older state files predate it, and had a random routing token that
+    /// can't be proved to the relay, so they get a new token on load.
+    #[serde(default)]
+    pub token_secret: String,
     pub ed25519_secret: String,
     pub ed25519_public: String,
     pub x25519_secret: String,
@@ -59,6 +106,34 @@ pub struct SymmetricSessionStateDto {
     pub pending_pq_injects: HashMap<u64, String>,
     #[serde(default)]
     pub pq_applied_through: u64,
+    // Where handing the peer's messages over in order is up to, and the
+    // ones held for an earlier message (see `DeliveryOrder`). Older state
+    // files predate both, so their next message is handed over as it comes.
+    #[serde(default)]
+    pub delivery_next: Option<u64>,
+    #[serde(default)]
+    pub held_messages: Vec<HeldMessageDto>,
+    // The peer's payloads waiting for a PQ inject (see `ParkedPayloads`).
+    // Older state files predate them.
+    #[serde(default)]
+    pub parked_payloads: Vec<ParkedDto>,
+}
+
+/// A `Parked` payload, by its seq number.
+#[derive(Serialize, Deserialize)]
+pub struct ParkedDto {
+    pub seq: u64,
+    pub payload: String,
+    pub parked_at_ms: u64,
+}
+
+/// A `HeldMessage`, by the ratchet position of its first chunk.
+#[derive(Serialize, Deserialize)]
+pub struct HeldMessageDto {
+    pub first: u64,
+    pub last: u64,
+    pub text: Option<String>,
+    pub held_at_ms: u64,
 }
 
 impl ClientStateDto {
@@ -78,6 +153,7 @@ impl ClientStateDto {
     fn from_client(client: &Client) -> Self {
         let identity = UserIdentityDto {
             routing_token: hex::encode(client.identity.routing_token),
+            token_secret: hex::encode(client.identity.token_secret.to_bytes()),
             ed25519_secret: hex::encode(client.identity.ed25519_secret.to_bytes()),
             ed25519_public: hex::encode(client.identity.ed25519_public.as_bytes()),
             x25519_secret: hex::encode(client.identity.x25519_secret.to_bytes()),
@@ -112,6 +188,28 @@ impl ClientStateDto {
                     skip_dict,
                     pending_pq_injects,
                     pq_applied_through: state.recv_pq_injects.applied_through,
+                    delivery_next: Some(state.delivery.next),
+                    held_messages: state
+                        .delivery
+                        .held
+                        .iter()
+                        .map(|(&first, held)| HeldMessageDto {
+                            first,
+                            last: held.last,
+                            text: held.text.as_ref().map(hex::encode),
+                            held_at_ms: held.held_at_ms,
+                        })
+                        .collect(),
+                    parked_payloads: state
+                        .parked
+                        .0
+                        .iter()
+                        .map(|(&seq, parked)| ParkedDto {
+                            seq,
+                            payload: hex::encode(&parked.payload),
+                            parked_at_ms: parked.parked_at_ms,
+                        })
+                        .collect(),
                 },
             );
         }
@@ -126,28 +224,83 @@ impl ClientStateDto {
             peer_kyber_keys.insert(hex::encode(token), hex::encode(key.as_bytes()));
         }
 
-        let seen_session_keys = client.seen_session_keys.iter().map(hex::encode).collect();
-
         let mut contact_names = HashMap::new();
         for (token, name) in &client.contact_names {
             contact_names.insert(hex::encode(token), name.clone());
         }
 
+        let peer_x25519_keys = client
+            .peer_x25519_keys
+            .iter()
+            .map(|(token, key)| (hex::encode(token), hex::encode(key.as_bytes())))
+            .collect();
+        let add_ids = client
+            .add_ids
+            .iter()
+            .map(|(token, ids)| {
+                let dto = AddIdsDto {
+                    mine: ids.mine,
+                    theirs: ids.theirs,
+                };
+                (hex::encode(token), dto)
+            })
+            .collect();
+        let session_setups = client
+            .session_setups
+            .iter()
+            .map(|(token, setup)| {
+                let offer = setup.offer.map(|offer| SessionOfferDto {
+                    eph_x25519_pub: hex::encode(offer.eph_x25519_pub.as_bytes()),
+                    kyber_ct: hex::encode(offer.kyber_ct.as_bytes()),
+                });
+                let dto = SessionSetupDto {
+                    establisher_add_id: setup.establisher_add_id,
+                    responder_add_id: setup.responder_add_id,
+                    offer,
+                };
+                (hex::encode(token), dto)
+            })
+            .collect();
+
         Self {
             identity,
             server_addr: client.server_addr.to_string(),
-            session_id: hex::encode(client.session_id),
             e2e_sessions,
             pending_contacts,
             peer_kyber_keys,
-            seen_session_keys,
             contact_names,
+            peer_x25519_keys,
+            add_ids,
+            session_setups,
+            next_add_id: client.next_add_id,
+            requests_muted: client.requests_muted,
+            notify_with_names: client.notify_with_names,
         }
     }
 
-    fn into_client(self, path: &str) -> Result<Client> {
-        let mut r_token = [0u8; 16];
-        hex::decode_to_slice(&self.identity.routing_token, &mut r_token)?;
+    fn into_client(mut self, path: &str) -> Result<Client> {
+        let mut token_sec = [0u8; 32];
+        if self.identity.token_secret.is_empty() {
+            // Its contacts know it by the old token, which nobody can
+            // receive at any more, and it knows them by theirs, which they
+            // lose the same way. Kept, they'd look connected while nothing
+            // got through.
+            tracing::warn!(
+                "This identity predates signed routing tokens, so it gets a new routing token, and its contacts are removed: they can't reach it at the new one. Add each other again."
+            );
+            OsRng.fill_bytes(&mut token_sec);
+            self.e2e_sessions.clear();
+            self.pending_contacts.clear();
+            self.peer_kyber_keys.clear();
+            self.contact_names.clear();
+            self.peer_x25519_keys.clear();
+            self.add_ids.clear();
+            self.session_setups.clear();
+        } else {
+            hex::decode_to_slice(&self.identity.token_secret, &mut token_sec)?;
+        }
+        let token_secret = SigningKey::from_bytes(&token_sec);
+        let token_public = token_secret.verifying_key();
 
         let mut ed_sec = [0u8; 32];
         hex::decode_to_slice(&self.identity.ed25519_secret, &mut ed_sec)?;
@@ -171,7 +324,9 @@ impl ClientStateDto {
             .map_err(|_| anyhow::anyhow!("Kyber sec err"))?;
 
         let identity = UserIdentity {
-            routing_token: r_token,
+            routing_token: routing_token_for(&token_public),
+            token_secret,
+            token_public,
             ed25519_secret,
             ed25519_public,
             x25519_secret,
@@ -181,9 +336,6 @@ impl ClientStateDto {
         };
 
         let server_addr: SocketAddr = self.server_addr.parse()?;
-
-        let mut session_id = [0u8; 4];
-        hex::decode_to_slice(&self.session_id, &mut session_id)?;
 
         let mut e2e_sessions = HashMap::new();
         for (hex_tok, dto_state) in self.e2e_sessions {
@@ -228,6 +380,29 @@ impl ClientStateDto {
                 hex::decode_to_slice(&hex_secret, &mut secret)?;
                 pending_pq_injects.insert(position, secret);
             }
+            let mut delivery =
+                DeliveryOrder::starting_at(dto_state.delivery_next.unwrap_or(dto_state.recv_count));
+            for held in dto_state.held_messages {
+                delivery.held.insert(
+                    held.first,
+                    HeldMessage {
+                        last: held.last,
+                        text: held.text.map(hex::decode).transpose()?,
+                        held_at_ms: held.held_at_ms,
+                    },
+                );
+            }
+
+            let mut parked = ParkedPayloads::default();
+            for dto in dto_state.parked_payloads {
+                parked.0.insert(
+                    dto.seq,
+                    Parked {
+                        payload: hex::decode(&dto.payload)?,
+                        parked_at_ms: dto.parked_at_ms,
+                    },
+                );
+            }
 
             e2e_sessions.insert(
                 tok,
@@ -243,6 +418,8 @@ impl ClientStateDto {
                         pending: pending_pq_injects,
                         applied_through: dto_state.pq_applied_through,
                     },
+                    delivery,
+                    parked,
                 },
             );
         }
@@ -267,13 +444,6 @@ impl ClientStateDto {
             );
         }
 
-        let mut seen_session_keys = HashSet::new();
-        for hex_key in self.seen_session_keys {
-            let mut key = [0u8; 32];
-            hex::decode_to_slice(&hex_key, &mut key)?;
-            seen_session_keys.insert(key);
-        }
-
         let mut contact_names = HashMap::new();
         for (hex_tok, name) in self.contact_names {
             let mut tok = [0u8; 16];
@@ -281,26 +451,92 @@ impl ClientStateDto {
             contact_names.insert(tok, name);
         }
 
+        let mut peer_x25519_keys = HashMap::new();
+        for (hex_tok, hex_key) in self.peer_x25519_keys {
+            let mut tok = [0u8; 16];
+            hex::decode_to_slice(&hex_tok, &mut tok)?;
+            let mut key = [0u8; 32];
+            hex::decode_to_slice(&hex_key, &mut key)?;
+            peer_x25519_keys.insert(tok, X25519PublicKey::from(key));
+        }
+
+        let mut add_ids = HashMap::new();
+        for (hex_tok, ids) in self.add_ids {
+            let mut tok = [0u8; 16];
+            hex::decode_to_slice(&hex_tok, &mut tok)?;
+            add_ids.insert(
+                tok,
+                AddIds {
+                    mine: ids.mine,
+                    theirs: ids.theirs,
+                },
+            );
+        }
+
+        let mut session_setups = HashMap::new();
+        for (hex_tok, setup) in self.session_setups {
+            let mut tok = [0u8; 16];
+            hex::decode_to_slice(&hex_tok, &mut tok)?;
+            let offer = match setup.offer {
+                Some(offer) => {
+                    let mut eph = [0u8; 32];
+                    hex::decode_to_slice(&offer.eph_x25519_pub, &mut eph)?;
+                    Some(SessionOffer {
+                        eph_x25519_pub: X25519PublicKey::from(eph),
+                        kyber_ct: Ciphertext::from_bytes(&hex::decode(&offer.kyber_ct)?)
+                            .map_err(|_| anyhow::anyhow!("Kyber err"))?,
+                    })
+                }
+                None => None,
+            };
+            session_setups.insert(
+                tok,
+                SessionSetup {
+                    establisher_add_id: setup.establisher_add_id,
+                    responder_add_id: setup.responder_add_id,
+                    offer,
+                },
+            );
+        }
+
         Ok(Client {
             identity,
             server_addr,
-            link_master_key: [0u8; 32], // re-negotiated on boot
-            session_id,                 // can reuse the stored session id, or generate new
+            link: unlinked(), // every run handshakes for a link of its own
+            relay_public: None,
+            pending_handshake: None,
+            last_heard: std::time::Instant::now(),
+            last_heard_ms: crate::ordering::now_ms(),
+            setup_retries: HashMap::new(), // live state, not persisted
             e2e_sessions,
             pending_contacts,
             peer_kyber_keys,
-            seen_session_keys,
+            peer_x25519_keys,
+            add_ids,
+            next_add_id: match self.next_add_id {
+                0 => first_add_id(), // from before add IDs existed
+                next => next,
+            },
+            session_setups,
             state_path: path.to_string(),
             local_name: String::new(), // always re-supplied at launch, not persisted
             contact_names,
-            inbox: Vec::new(),         // transient handoff buffer, not persisted
-            last_seen: HashMap::new(), // live status, not persisted — see Client::last_seen
-            history: None,             // attached separately once a vault key is available
+            inbox: Vec::new(), // transient handoff buffer, not persisted
+            history: None,     // attached separately once a vault key is available
             last_recorded_id: None,
-            identity_store: None, // attached separately once a vault key is available
+            last_recorded_at_ms: 0,
+            confirmations: Default::default(), // live state, not persisted
+            send_updates: Vec::new(),          // live state, not persisted
+            identity_store: None,              // attached separately once a vault key is available
             reassembler: Default::default(), // live state, not persisted — see Client::reassembler
-            fec_rx: Default::default(), // in-flight FEC state, not persisted
+            fec_rx: Default::default(),      // in-flight FEC state, not persisted
             recent_deliveries: Default::default(), // live state, not persisted
+            admission_changed: false,        // live state, not persisted
+            requests_muted: self.requests_muted,
+            notify_with_names: self.notify_with_names,
+            connection_requests: Vec::new(), // live state, not persisted
+            listed_requests: Default::default(), // live state, not persisted
+            dismissed_requests: HashMap::new(), // live state, not persisted
         })
     }
 }
@@ -457,6 +693,45 @@ mod identity_state_store_tests {
         let db = ScratchDb::new("empty");
         let store = IdentityStateStore::open(&db.0, &[3u8; 32]).unwrap();
         assert!(store.load(&db.0.to_string_lossy()).unwrap().is_none());
+    }
+
+    /// A state file from before routing tokens were derived from a key has
+    /// a random token the relay won't accept syncs for, so it loads with a
+    /// new, provable one (and the rest of the identity unchanged). Its
+    /// contacts know it by the old token, so they're removed rather than
+    /// left looking connected when nothing would get through.
+    #[test]
+    fn test_identity_without_token_key_gets_a_provable_token() {
+        let (mut original, mut contact) = (Client::new(test_addr()), Client::new(test_addr()));
+        original.state_path = std::env::temp_dir()
+            .join(format!("e2e-legacy-test-{}.json", rand_suffix()))
+            .to_string_lossy()
+            .into_owned();
+        contact.state_path = format!("{}-contact", original.state_path);
+        crate::test_support::connect(&mut original, &mut contact);
+        let mut dto = ClientStateDto::from_client(&original);
+        dto.identity.token_secret.clear();
+        let loaded = dto.into_client("unused").unwrap();
+        crate::test_support::cleanup(&[&original, &contact]);
+
+        assert!(loaded.e2e_sessions.is_empty());
+        assert!(loaded.pending_contacts.is_empty());
+        assert!(loaded.contact_names.is_empty());
+        assert!(loaded.peer_x25519_keys.is_empty());
+        assert!(!loaded.is_connected(&contact.identity.routing_token));
+
+        assert_ne!(
+            loaded.identity.routing_token,
+            original.identity.routing_token
+        );
+        assert_eq!(
+            loaded.identity.routing_token,
+            routing_token_for(&loaded.identity.token_public)
+        );
+        assert_eq!(
+            loaded.identity.ed25519_public,
+            original.identity.ed25519_public
+        );
     }
 
     #[test]

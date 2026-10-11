@@ -71,7 +71,6 @@ pub struct ContactDto {
     pub token: String,
     pub status: String,
     pub name: Option<String>,
-    pub online: bool,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -82,6 +81,8 @@ pub struct IncomingMessageDto {
     /// same id a `chat_history` fetch reports for this same message, so the
     /// frontend can merge live and persisted views without duplicating it.
     pub id: Option<i64>,
+    /// When it arrived, in Unix milliseconds.
+    pub timestamp_ms: i64,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -90,6 +91,28 @@ pub struct StoredMessageDto {
     pub from_me: bool,
     pub text: String,
     pub timestamp_ms: i64,
+    /// For a message we sent: `"sending"`, `"sent"` or `"failed"`. `None`
+    /// for received ones, and ones sent before statuses were kept.
+    pub status: Option<String>,
+}
+
+/// Mirrors `SentMessageDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct SentMessageDto {
+    /// Its chat-history row id (see `IncomingMessageDto::id`).
+    pub id: Option<i64>,
+    /// When it was sent, in Unix milliseconds.
+    pub timestamp_ms: i64,
+}
+
+/// Mirrors `SentMessageUpdateDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct SentMessageUpdateDto {
+    /// The message's chat-history row id.
+    pub id: i64,
+    /// `"sent"` once the relay confirms it has it, `"failed"` if it didn't
+    /// in time.
+    pub status: String,
 }
 
 #[derive(Serialize)]
@@ -193,6 +216,73 @@ pub async fn remove_contact(token_hex: &str) -> Result<(), String> {
     call("remove_contact", &RemoveContactArgs { token_hex }).await
 }
 
+/// Mirrors `ConnectionRequestsDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ConnectionRequestsDto {
+    /// People who tried to connect but aren't contacts yet, in the order
+    /// they first tried (token hex). Empty while muted.
+    pub tokens: Vec<String>,
+    pub muted: bool,
+}
+
+/// Who's trying to connect, and whether requests are muted. Scanning their
+/// code is what accepts.
+pub async fn connection_requests() -> Result<ConnectionRequestsDto, String> {
+    call("connection_requests", &()).await
+}
+
+#[derive(Serialize)]
+struct MuteRequestsArgs {
+    muted: bool,
+}
+
+/// Stop (or start again) listing connection requests. Saved with the
+/// identity.
+pub async fn set_connection_requests_muted(muted: bool) -> Result<(), String> {
+    call("set_connection_requests_muted", &MuteRequestsArgs { muted }).await
+}
+
+#[derive(Serialize)]
+struct DismissRequestArgs<'a> {
+    token_hex: &'a str,
+}
+
+/// "Not now": stop listing their request, and don't list another from them
+/// for a day.
+pub async fn dismiss_connection_request(token_hex: &str) -> Result<(), String> {
+    call(
+        "dismiss_connection_request",
+        &DismissRequestArgs { token_hex },
+    )
+    .await
+}
+
+/// Mirrors `NotificationSettingsDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct NotificationSettingsDto {
+    /// Whether this device posts new-message notifications at all (only
+    /// Android does).
+    pub posted: bool,
+    /// Whether they say who each message is from.
+    pub with_names: bool,
+}
+
+/// How new-message notifications work on this device.
+pub async fn notification_settings() -> Result<NotificationSettingsDto, String> {
+    call("notification_settings", &()).await
+}
+
+#[derive(Serialize)]
+struct NotifyWithNamesArgs {
+    on: bool,
+}
+
+/// Let new-message notifications say who each message is from, or not.
+/// Saved with the identity.
+pub async fn set_notify_with_names(on: bool) -> Result<(), String> {
+    call("set_notify_with_names", &NotifyWithNamesArgs { on }).await
+}
+
 #[derive(Serialize)]
 struct SendMessageArgs<'a> {
     token_hex: &'a str,
@@ -202,12 +292,18 @@ struct SendMessageArgs<'a> {
 /// Returns the sent message's local chat-history row id (`None` if no
 /// history is attached), for the frontend to label its optimistic display
 /// of this message with the same id `chat_history` would later report.
-pub async fn send_message(token_hex: &str, text: &str) -> Result<Option<i64>, String> {
+pub async fn send_message(token_hex: &str, text: &str) -> Result<SentMessageDto, String> {
     call("send_message", &SendMessageArgs { token_hex, text }).await
 }
 
 pub async fn poll_inbox() -> Result<Vec<IncomingMessageDto>, String> {
     call("poll_inbox", &()).await
+}
+
+/// What became of messages we sent since the last call: whether the relay
+/// confirmed it has each one, or didn't in time.
+pub async fn sent_message_updates() -> Result<Vec<SentMessageUpdateDto>, String> {
+    call("sent_message_updates", &()).await
 }
 
 #[derive(Serialize)]

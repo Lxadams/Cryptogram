@@ -8,11 +8,12 @@ use crate::background;
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use client::{
     derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
-    BurstSender, ChatHistory, Client, ClientStateDto, IdentityStateStore, RoutingToken,
+    BurstSender, ChatHistory, Client, ClientStateDto, ContactStatus, IdentityStateStore,
+    RoutingToken, SendStatus,
 };
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     fs::{self, File, TryLockError},
     io,
     net::SocketAddr,
@@ -142,96 +143,22 @@ fn server_addr_raw() -> String {
         .unwrap_or_else(|| "127.0.0.1:4430".to_string())
 }
 
-/// Ask the relay for its Ed25519 identity pubkey over its `GET /pubkey`
-/// HTTP endpoint, served over TCP on the same `host:port` as its UDP relay
-/// socket (see `spawn_pubkey_http_task` in code/server/src/main.rs).
-///
-/// Plain HTTP, so this answer is only as trustworthy as the network path:
-/// `bootstrap` pins it on first use rather than trusting it every time.
-async fn fetch_relay_pubkey(server_addr_raw: &str) -> Result<String, String> {
-    let url = format!("http://{server_addr_raw}/pubkey");
-    // reqwest's own message only says the request failed; the innermost
-    // source is the useful part (e.g. "Connection refused").
-    let unreachable = |e: reqwest::Error| {
-        let mut cause: &dyn std::error::Error = &e;
-        while let Some(next) = cause.source() {
-            cause = next;
-        }
-        format!("Couldn't fetch the relay's public key from {url} ({cause}). Is the relay running?")
-    };
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?
-        .get(&url)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(unreachable)?
-        .text()
-        .await
-        .map_err(unreachable)
+/// The relay's Ed25519 identity pubkey (hex), which authenticates its side of
+/// the link handshake. It ships with the app rather than being asked of the
+/// relay, which anyone on the network path could answer with their own key.
+/// `SERVER_PUBKEY` set at launch wins; failing that, the value it had at
+/// build time is baked in, as for `server_addr_raw`. The relay prints it at
+/// startup ("Server Static Pubkey"), or with `--print-pubkey`.
+fn relay_pubkey_hex() -> Result<String, String> {
+    std::env::var("SERVER_PUBKEY")
+        .ok()
+        .or_else(|| option_env!("SERVER_PUBKEY").map(str::to_string))
+        .ok_or_else(|| {
+            "This build doesn't know the relay's public key. Set SERVER_PUBKEY to the \
+             \"Server Static Pubkey\" the relay prints, when building or launching the app."
+                .to_string()
+        })
 }
-
-/// Relay pubkeys this app has already trusted once, keyed by the
-/// `SERVER_ADDR` they were reached at: this app's equivalent of SSH's
-/// `known_hosts`. Shared by every identity, like `identities_root`.
-fn known_relays_path(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_local_data_dir()
-        .map(|dir| dir.join("known_relays.json"))
-        .map_err(|e| e.to_string())
-}
-
-fn load_known_relays(path: &Path) -> Result<BTreeMap<String, String>, String> {
-    match fs::read_to_string(path) {
-        Ok(json) => serde_json::from_str(&json).map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Trust-on-first-use check for a relay pubkey from `fetch_relay_pubkey`.
-/// `Ok(true)` if this exact key is already pinned for `server_addr_raw`,
-/// `Ok(false)` if nothing is pinned for it yet (the caller pins it with
-/// `pin_relay_pubkey` once a handshake has verified against it), and `Err`
-/// if a *different* key is pinned: either the relay's identity was reset,
-/// or something between us and the relay handed us its own key.
-fn check_relay_pin(path: &Path, server_addr_raw: &str, pubkey_hex: &str) -> Result<bool, String> {
-    match load_known_relays(path)?.get(server_addr_raw) {
-        None => Ok(false),
-        Some(pinned) if pinned == pubkey_hex => Ok(true),
-        Some(pinned) => Err(format!(
-            "The relay at {server_addr_raw} sent a different public key ({pubkey_hex}) \
-             than the one trusted on first connect ({pinned}). Refusing to connect. \
-             If the relay's identity was deliberately reset, remove its entry from {}.",
-            path.display()
-        )),
-    }
-}
-
-/// Record `pubkey_hex` as the trusted key for `server_addr_raw`. Re-reads
-/// the file first so a pin another peer process wrote meanwhile isn't lost.
-fn pin_relay_pubkey(path: &Path, server_addr_raw: &str, pubkey_hex: &str) -> Result<(), String> {
-    let mut known = load_known_relays(path)?;
-    known.insert(server_addr_raw.to_string(), pubkey_hex.to_string());
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string_pretty(&known).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
-}
-
-/// How often we send a presence ping to each established contact.
-/// Independent of `spawn_keepalive_loop`'s 15s NAT-mapping keepalive —
-/// that one's timing-critical against router UDP timeouts, this one is
-/// just a UI-freshness tradeoff and free to differ.
-const PRESENCE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// A contact counts as "online" if we've heard from them (ping or chat
-/// message) within this long. A little over 2x the ping interval, so one
-/// dropped UDP packet doesn't immediately flip the marker to offline.
-const PRESENCE_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(45);
 
 #[derive(Serialize, Clone)]
 pub struct IdentityDto {
@@ -830,48 +757,39 @@ mod tests {
         assert_eq!(names, vec!["dave".to_string(), "erin".to_string()]);
     }
 
-    const RELAY_KEY_A: &str = "aa00000000000000000000000000000000000000000000000000000000000000";
-    const RELAY_KEY_B: &str = "bb00000000000000000000000000000000000000000000000000000000000000";
-
     #[test]
-    fn test_relay_pubkey_is_trusted_on_first_use_then_pinned() {
-        let path = scratch_dir("relay_pin_first_use").join("known_relays.json");
-        assert!(!check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap());
-        pin_relay_pubkey(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap();
-        assert!(check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap());
-    }
+    fn test_notifications_name_senders_only_once_allowed() {
+        let root = scratch_dir("notification_sender");
+        let mut client = Client::new(test_addr());
+        client.state_path = root.join("state.json").to_string_lossy().into_owned();
+        let named = [1u8; 16];
+        let unnamed = [0xab; 16];
+        client.contact_names.insert(named, "bob".to_string());
 
-    #[test]
-    fn test_relay_pubkey_change_is_rejected() {
-        let path = scratch_dir("relay_pin_changed").join("known_relays.json");
-        pin_relay_pubkey(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap();
-        let err = check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_B).unwrap_err();
-        assert!(err.contains("different public key"), "{err}");
-    }
+        assert_eq!(notification_sender(&client, &named), None);
+        assert_eq!(notification_sender(&client, &unnamed), None);
 
-    #[test]
-    fn test_relay_pins_are_per_address() {
-        let path = scratch_dir("relay_pin_per_address").join("known_relays.json");
-        pin_relay_pubkey(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap();
-        pin_relay_pubkey(&path, "3.25.64.73:443", RELAY_KEY_B).unwrap();
-        assert!(check_relay_pin(&path, "127.0.0.1:4430", RELAY_KEY_A).unwrap());
-        assert!(check_relay_pin(&path, "3.25.64.73:443", RELAY_KEY_B).unwrap());
+        client.set_notify_with_names(true);
+        assert_eq!(notification_sender(&client, &named).as_deref(), Some("bob"));
+        assert_eq!(
+            notification_sender(&client, &unnamed).as_deref(),
+            Some("abababab")
+        );
     }
 }
 
 #[derive(Serialize, Clone)]
 pub struct ContactDto {
     pub token: String,
-    /// "established" once the PQXDH session handshake completed, otherwise
-    /// "pending" (KeyExchange sent/received, waiting on SessionEstablish).
+    /// "established" once both sides have the session and messages can be
+    /// sent (see `Client::is_connected`), "connecting" once they've added us
+    /// too and the session is being set up, otherwise "pending" (we've
+    /// added them, and are waiting for them to add us back). See
+    /// `Client::contact_status`.
     pub status: String,
     /// The display name this contact chose for themselves, learned from
     /// their KeyExchange (see `Client::contact_names`), if they set one.
     pub name: Option<String>,
-    /// True if we've heard a presence ping or chat message from this
-    /// contact within `PRESENCE_FRESHNESS`. Always false for a merely
-    /// "pending" contact — there's no session to ping over yet.
-    pub online: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -882,6 +800,36 @@ pub struct IncomingMessageDto {
     /// `send_message`'s doc comment for why the frontend needs this instead
     /// of minting its own id for a live-delivered message.
     pub id: Option<i64>,
+    /// When it arrived, in Unix milliseconds: the time its history row has.
+    pub timestamp_ms: i64,
+}
+
+/// What `send_message` reports about the message it sent.
+#[derive(Serialize, Clone)]
+pub struct SentMessageDto {
+    /// Its chat-history row id (see `send_message`).
+    pub id: Option<i64>,
+    /// When it was sent, in Unix milliseconds: the time its history row has.
+    pub timestamp_ms: i64,
+}
+
+/// What became of a message we sent (see `sent_message_updates`).
+#[derive(Serialize, Clone)]
+pub struct SentMessageUpdateDto {
+    /// Its chat-history row id.
+    pub id: i64,
+    /// `"sent"` once the relay confirms it has it, `"failed"` if it didn't
+    /// in time.
+    pub status: &'static str,
+}
+
+/// A send status as the frontend names it.
+fn status_name(status: SendStatus) -> &'static str {
+    match status {
+        SendStatus::Sending => "sending",
+        SendStatus::Sent => "sent",
+        SendStatus::Failed => "failed",
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -892,6 +840,10 @@ pub struct StoredMessageDto {
     pub from_me: bool,
     pub text: String,
     pub timestamp_ms: i64,
+    /// For a message we sent: `"sending"`, `"sent"` or `"failed"` (see
+    /// `SentMessageUpdateDto`). `None` for received ones, and ones sent
+    /// before statuses were kept.
+    pub status: Option<&'static str>,
 }
 
 fn identity_dto(client: &Client) -> IdentityDto {
@@ -906,18 +858,13 @@ fn identity_dto(client: &Client) -> IdentityDto {
 /// inbound packets. Must be called once before any other command will work.
 /// Mirrors what the CLI's `main()` does at startup, just triggered by a UI
 /// button instead of running unconditionally on process start — except the
-/// relay's pubkey is fetched from the relay and pinned on first use (see
-/// `fetch_relay_pubkey`, `check_relay_pin`) instead of passed in by hand.
+/// relay's pubkey comes with the app (see `relay_pubkey_hex`) instead of being
+/// passed in by hand.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<IdentityDto, String> {
+    let server_pub =
+        parse_verifying_key(&relay_pubkey_hex()?).map_err(|e| format!("SERVER_PUBKEY: {e}"))?;
     let server_addr_raw = server_addr_raw();
-    let server_pub = parse_verifying_key(&fetch_relay_pubkey(&server_addr_raw).await?)
-        .map_err(|e| format!("Relay public key: {e}"))?;
-    // Canonical lowercase hex, so the pin compares keys rather than spellings.
-    let server_pub_hex = hex::encode(server_pub.as_bytes());
-    let known_relays_path = known_relays_path(&app)?;
-    let already_pinned = check_relay_pin(&known_relays_path, &server_addr_raw, &server_pub_hex)?;
-
     let server_addr: SocketAddr = tokio::net::lookup_host(&server_addr_raw)
         .await
         .map_err(|e| e.to_string())?
@@ -961,11 +908,6 @@ pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Ide
     perform_handshake(&mut client, &socket, &server_pub)
         .await
         .map_err(|e| e.to_string())?;
-    // Pinned only now that a handshake has verified against it, so a bogus
-    // key from something that can't also answer as the relay is never kept.
-    if !already_pinned {
-        pin_relay_pubkey(&known_relays_path, &server_addr_raw, &server_pub_hex)?;
-    }
     client.save();
 
     let identity = identity_dto(&client);
@@ -976,7 +918,7 @@ pub async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Ide
     let tasks = vec![
         spawn_receive_loop(app.clone(), socket.clone()),
         spawn_keepalive_loop(app.clone(), socket.clone()),
-        spawn_presence_loop(app, socket.clone()),
+        spawn_tick_loop(app, socket.clone()),
     ];
 
     let bursts = BurstSender::spawn(socket.clone(), client.server_addr);
@@ -1024,21 +966,27 @@ async fn end_session(state: &AppState) {
     }
 }
 
-/// Background task: periodically resend an empty `sync` packet to the relay
-/// (the same packet type `perform_handshake` sends once at bootstrap).
+/// Background task: the keepalive (see `Client::keepalive`). Every 15s it
+/// resends a (signed) `sync` packet to the relay (the same packet type
+/// `perform_handshake` sends once at bootstrap), along with any KeyExchange
+/// due again to a contact we're still setting up a session with.
 ///
-/// This only matters once the relay and client are on different machines.
-/// The relay learns/refreshes our real `ip:port` purely from the source
-/// address of our packets, and its own record has a long TTL (see
-/// `METADATA_TTL` in `code/server/src/stores.rs`) — but that's irrelevant if
-/// our *own* NAT/router UDP mapping expires first, which home/campus
-/// routers typically do within 30-60s of silence. Without this, bootstrap
-/// (an immediate round trip on a fresh mapping) succeeds, but any peer
-/// packet routed to us minutes later gets silently dropped by our own
-/// router before it ever reaches this process. Resending well under that
-/// window keeps the mapping (and the relay's record) alive for as long as
-/// the app runs. Purely client-side — the relay already handles a resent
-/// sync packet identically to the first one.
+/// The sync only matters once the relay and client are on different
+/// machines. The relay learns/refreshes our real `ip:port` from where our
+/// syncs come from, and its own record has a long TTL (see `METADATA_TTL`
+/// in `code/server/src/main.rs`) — but that's irrelevant if our *own*
+/// NAT/router UDP mapping expires first, which home/campus routers
+/// typically do within 30-60s of silence. Without this, bootstrap (an
+/// immediate round trip on a fresh mapping) succeeds, but any peer packet
+/// routed to us minutes later gets silently dropped by our own router
+/// before it ever reaches this process. Resending well under that window
+/// keeps the mapping (and the relay's record) alive for as long as the app
+/// runs.
+///
+/// The relay acks every sync. If it stops (it restarted for a deploy, or
+/// forgot our link while the phone slept), `keepalive` redoes the handshake
+/// on this socket instead, and the receive loop finishes it, so the app
+/// reconnects by itself.
 fn spawn_keepalive_loop(
     app: AppHandle,
     socket: Arc<UdpSocket>,
@@ -1054,59 +1002,54 @@ fn spawn_keepalive_loop(
                 _ = ticker.tick() => {}
                 _ = background::RESYNC.notified() => {}
             }
-            let guard = state.runtime.lock().await;
-            let Some(rt) = guard.as_ref() else {
+            let mut guard = state.runtime.lock().await;
+            let Some(rt) = guard.as_mut() else {
                 continue;
             };
-            let sync_packet = rt.client.generate_sync_packet();
+            let packets = rt.client.keepalive();
             let server_addr = rt.client.server_addr;
-            drop(guard);
-            let _ = socket.send_to(&sync_packet, server_addr).await;
-        }
-    })
-}
-
-/// Background task: send a signed presence ping (see `PresencePayload`) to
-/// every established contact on a fixed interval, so peers can show an
-/// online/offline marker. Paused while the app is off screen (see
-/// `background::on_screen`), so contacts then show us offline; the
-/// keepalive loop keeps us reachable for messages regardless. Separate from `spawn_keepalive_loop` on purpose
-/// — that one sends a single fixed packet to the relay and touches no
-/// protocol state, this one fans out to N contacts and advances no ratchet
-/// state either (pings are signed, not E2E-encrypted), so the two loops
-/// have nothing meaningful to share beyond both being timers.
-fn spawn_presence_loop(
-    app: AppHandle,
-    socket: Arc<UdpSocket>,
-) -> tauri::async_runtime::JoinHandle<()> {
-    tauri::async_runtime::spawn(async move {
-        let state = app.state::<AppState>();
-        let mut ticker = tokio::time::interval(PRESENCE_PING_INTERVAL);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {}
-                _ = background::BACK_ON_SCREEN.notified() => {}
-            }
-            if !background::on_screen() {
-                continue;
-            }
-            let guard = state.runtime.lock().await;
-            let Some(rt) = guard.as_ref() else {
-                continue;
-            };
-            let server_addr = rt.client.server_addr;
-            let packets: Vec<Vec<u8>> = rt
-                .client
-                .e2e_sessions
-                .keys()
-                .map(|&token| rt.client.generate_presence_packet(token))
-                .collect();
             drop(guard);
             for packet in packets {
                 let _ = socket.send_to(&packet, server_addr).await;
             }
         }
     })
+}
+
+/// Background task, twice a second: ask the relay which of our messages it
+/// has (see `Client::receipt_requests`), and hand over any message held for
+/// one sent before it that has waited long enough (see
+/// `Client::release_held_messages`), with a notification, as the receive
+/// loop would have if a packet had come in.
+fn spawn_tick_loop(app: AppHandle, socket: Arc<UdpSocket>) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            ticker.tick().await;
+            let mut guard = state.runtime.lock().await;
+            let Some(rt) = guard.as_mut() else {
+                continue;
+            };
+            let inbox_before = rt.client.inbox.len();
+            rt.client.release_held_messages();
+            notify_new_messages(&rt.client, inbox_before);
+            let packets = rt.client.receipt_requests();
+            let server_addr = rt.client.server_addr;
+            drop(guard);
+            for packet in packets {
+                let _ = socket.send_to(&packet, server_addr).await;
+            }
+        }
+    })
+}
+
+/// Tell `background` about each message in the inbox from `inbox_before`
+/// on, so Android can show a notification while the app isn't on screen.
+fn notify_new_messages(client: &Client, inbox_before: usize) {
+    for message in client.inbox.iter().skip(inbox_before) {
+        background::message_received(notification_sender(client, &message.from).as_deref());
+    }
 }
 
 /// Background task: read inbound UDP packets for as long as the app runs
@@ -1141,9 +1084,7 @@ fn spawn_receive_loop(
             };
             let inbox_before = rt.client.inbox.len();
             let replies = rt.client.handle_relay_packet(&buf[..len]);
-            for (from, _, _) in &rt.client.inbox[inbox_before..] {
-                background::message_received(&contact_label(&rt.client, from));
-            }
+            notify_new_messages(&rt.client, inbox_before);
             for packet in replies {
                 let _ = socket.send_to(&packet, rt.client.server_addr).await;
             }
@@ -1151,19 +1092,24 @@ fn spawn_receive_loop(
     })
 }
 
-/// How a notification names a contact: their chosen name, or failing that
-/// the start of their routing token.
-fn contact_label(client: &Client, token: &RoutingToken) -> String {
-    client
-        .contact_names
-        .get(token)
-        .cloned()
-        .unwrap_or_else(|| hex::encode(&token[..4]))
+/// Who a new-message notification says a message is from: nobody, unless
+/// the user lets notifications name senders (see
+/// `Client::notify_with_names`). Then it's the contact's name, or failing
+/// that the start of their routing token.
+fn notification_sender(client: &Client, from: &RoutingToken) -> Option<String> {
+    client.notify_with_names().then(|| {
+        client
+            .contact_names
+            .get(from)
+            .cloned()
+            .unwrap_or_else(|| hex::encode(&from[..4]))
+    })
 }
 
 /// Union of `pending_contacts` (KeyExchange in flight) and `e2e_sessions`
-/// (fully established) — everyone the UI should show in the contact list,
-/// with a status badge for which stage they're at.
+/// — everyone the UI should show in the contact list, with a status badge
+/// for which stage they're at (see `ContactDto::status`): "established"
+/// only once both sides have the session (see `Client::is_connected`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>, String> {
     let guard = state.runtime.lock().await;
@@ -1177,19 +1123,15 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
         .collect();
     let mut contacts: Vec<ContactDto> = tokens
         .into_iter()
-        .map(|token| {
-            let established = client.e2e_sessions.contains_key(token);
-            ContactDto {
-                token: hex::encode(token),
-                status: if established {
-                    "established"
-                } else {
-                    "pending"
-                }
-                .to_string(),
-                name: client.contact_names.get(token).cloned(),
-                online: established && client.is_online(token, PRESENCE_FRESHNESS),
+        .map(|token| ContactDto {
+            token: hex::encode(token),
+            status: match client.contact_status(token) {
+                ContactStatus::Connected => "established",
+                ContactStatus::Connecting => "connecting",
+                ContactStatus::Pending => "pending",
             }
+            .to_string(),
+            name: client.contact_names.get(token).cloned(),
         })
         .collect();
     // A stable order (by name, then token) so the list doesn't reshuffle
@@ -1199,10 +1141,12 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
     Ok(contacts)
 }
 
-/// Start a key exchange with a peer identified by their QR-scanned
-/// `(routing_token, ed25519_public_key)` pair. Real trust anchor: the
-/// signature check against this exact key happens on the reply (see
-/// `Client::handle_incoming_packet`, 0x02 branch, initiator path).
+/// Add a contact by their QR-scanned `(routing_token, ed25519_public_key)`
+/// pair and send them a key exchange. Only contacts added this way can
+/// connect to us, so the session comes up once they've added us too. Real
+/// trust anchor: their KeyExchange must carry this exact key (see
+/// `Client::add_contact` and the 0x02 branch of
+/// `Client::handle_incoming_packet`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn connect_to_peer(
     state: State<'_, AppState>,
@@ -1216,13 +1160,105 @@ pub async fn connect_to_peer(
 
     let peer_ed25519 = parse_verifying_key(&ed25519_hex).map_err(|e| e.to_string())?;
 
-    rt.client.pending_contacts.insert(token, peer_ed25519);
-    let req_packet = rt.client.create_kx_request(token);
+    let req_packet = rt
+        .client
+        .add_contact(token, peer_ed25519)
+        .map_err(|e| e.to_string())?;
     rt.socket
         .send_to(&req_packet, rt.client.server_addr)
         .await
         .map_err(|e| e.to_string())?;
 
+    Ok(())
+}
+
+/// What `connection_requests` reports.
+#[derive(Serialize, Clone)]
+pub struct ConnectionRequestsDto {
+    /// People who tried to connect but aren't contacts yet, in the order
+    /// they first tried, as token hex. Empty while muted.
+    pub tokens: Vec<String>,
+    pub muted: bool,
+}
+
+/// People who tried to connect but aren't contacts yet (see
+/// `Client::connection_requests`), and whether requests are muted. Their
+/// request was dropped; the frontend asks the user to scan their code,
+/// which is what accepts it.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn connection_requests(
+    state: State<'_, AppState>,
+) -> Result<ConnectionRequestsDto, String> {
+    let guard = state.runtime.lock().await;
+    let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
+    Ok(ConnectionRequestsDto {
+        tokens: rt
+            .client
+            .connection_requests()
+            .iter()
+            .map(hex::encode)
+            .collect(),
+        muted: rt.client.requests_muted(),
+    })
+}
+
+/// Mute or unmute connection requests (see `Client::set_requests_muted`).
+/// Saved with the identity.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_connection_requests_muted(
+    state: State<'_, AppState>,
+    muted: bool,
+) -> Result<(), String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    rt.client.set_requests_muted(muted);
+    Ok(())
+}
+
+/// What `notification_settings` reports.
+#[derive(Serialize, Clone)]
+pub struct NotificationSettingsDto {
+    /// Whether this device posts new-message notifications at all. Only
+    /// Android does (see `background`).
+    pub posted: bool,
+    /// Whether they say who each message is from.
+    pub with_names: bool,
+}
+
+/// How new-message notifications work here (see `NotificationSettingsDto`).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn notification_settings(
+    state: State<'_, AppState>,
+) -> Result<NotificationSettingsDto, String> {
+    let guard = state.runtime.lock().await;
+    let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
+    Ok(NotificationSettingsDto {
+        posted: cfg!(target_os = "android"),
+        with_names: rt.client.notify_with_names(),
+    })
+}
+
+/// Let new-message notifications say who each message is from, or not (see
+/// `Client::set_notify_with_names`). Saved with the identity.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_notify_with_names(state: State<'_, AppState>, on: bool) -> Result<(), String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    rt.client.set_notify_with_names(on);
+    Ok(())
+}
+
+/// Stop listing a connection request ("Not now"), and don't list another
+/// from them for a day (see `Client::dismiss_connection_request`).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn dismiss_connection_request(
+    state: State<'_, AppState>,
+    token_hex: String,
+) -> Result<(), String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    rt.client
+        .dismiss_connection_request(&parse_token(&token_hex)?);
     Ok(())
 }
 
@@ -1255,13 +1291,15 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
 /// attached), so the frontend can label its own optimistic display of this
 /// message with the *same* id a later `chat_history` fetch would report for
 /// it — otherwise the two views disagree on what identifies "this message"
-/// and a merge between them can't tell they're the same one.
+/// and a merge between them can't tell they're the same one. And when it
+/// was sent, which the history has too. Whether the relay gets it comes
+/// later, from `sent_message_updates`.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn send_message(
     state: State<'_, AppState>,
     token_hex: String,
     text: String,
-) -> Result<Option<i64>, String> {
+) -> Result<SentMessageDto, String> {
     let mut guard = state.runtime.lock().await;
     let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
 
@@ -1271,19 +1309,45 @@ pub async fn send_message(
         .client
         .create_fec_packets(token, text.as_bytes())
         .map_err(|e| e.to_string())?;
-    let history_id = rt.client.last_recorded_id;
+    let sent = SentMessageDto {
+        id: rt.client.last_recorded_id,
+        timestamp_ms: rt.client.last_recorded_at_ms,
+    };
 
-    // The burst is paced out over a few hundred ms behind any earlier ones,
-    // so wait for it without holding the runtime lock (the receive loop
-    // needs it). Resolves once its first packet is out.
-    let bursts = rt.bursts.clone();
+    // Queued while we still hold the runtime lock, so bursts go out in the
+    // order they were made (see `BurstSender::queue`). It's paced out over a
+    // few hundred ms behind any earlier ones, so wait for it without holding
+    // the lock (the receive loop needs it). Resolves once its first packet
+    // is out.
+    let first_sent = rt.bursts.queue(packets);
     drop(guard);
-    bursts
-        .send(packets)
+    first_sent
         .await
         .map_err(|e| format!("Message not sent: {e}"))?;
 
-    Ok(history_id)
+    Ok(sent)
+}
+
+/// What became of messages we sent since the last call: confirmed by the
+/// relay, or not in time (see `Client::drain_send_updates`). The frontend
+/// polls this with `poll_inbox`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn sent_message_updates(
+    state: State<'_, AppState>,
+) -> Result<Vec<SentMessageUpdateDto>, String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    Ok(rt
+        .client
+        .drain_send_updates()
+        .into_iter()
+        .filter_map(|(id, status)| {
+            Some(SentMessageUpdateDto {
+                id: id?,
+                status: status_name(status),
+            })
+        })
+        .collect())
 }
 
 /// Collect any messages decrypted since the last poll. The frontend calls
@@ -1301,10 +1365,11 @@ pub async fn poll_inbox(state: State<'_, AppState>) -> Result<Vec<IncomingMessag
         .client
         .drain_inbox()
         .into_iter()
-        .map(|(token, bytes, id)| IncomingMessageDto {
-            from_token: hex::encode(token),
-            text: String::from_utf8_lossy(&bytes).into_owned(),
-            id,
+        .map(|message| IncomingMessageDto {
+            from_token: hex::encode(message.from),
+            text: String::from_utf8_lossy(&message.text).into_owned(),
+            id: message.history_id,
+            timestamp_ms: message.at_ms,
         })
         .collect())
 }
@@ -1335,6 +1400,7 @@ pub async fn chat_history(
             from_me: m.from_me,
             text: m.text,
             timestamp_ms: m.timestamp_ms,
+            status: m.status.map(status_name),
         })
         .collect())
 }

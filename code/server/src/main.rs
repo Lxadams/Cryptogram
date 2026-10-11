@@ -1,23 +1,25 @@
 use anyhow::{Result, anyhow};
-use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-use ed25519_dalek::{Signer, SigningKey};
-use hkdf::Hkdf;
+use ed25519_dalek::SigningKey;
+use hmac::{Hmac, Mac};
+use rand_core::{OsRng, RngCore};
+use relay_link::{
+    CHAT_INNER_PAYLOAD_LEN, Challenge, LinkEnd, REPLY_COPIES, SessionId, Sync, TYPE_ACK,
+    TYPE_ADMITTED_DATA, TYPE_DATA, TYPE_HANDSHAKE_INIT, TYPE_HANDSHAKE_RESP, TYPE_PATH_CHALLENGE,
+    TYPE_PATH_RESPONSE, TYPE_RECEIPT, TYPE_RECEIPT_REQUEST, TYPE_SYNC, TYPE_SYNC_ACK,
+};
 use sha2::Sha256;
 use std::{
-    fs,
-    net::SocketAddr,
+    fs, io,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    net::{TcpListener, UdpSocket},
-    sync::Notify,
-};
+use tokio::{net::UdpSocket, sync::Notify};
 use tracing::{debug, error, info, warn};
-use x25519_dalek::PublicKey as X25519PublicKey;
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 mod stores;
 
-use crate::stores::{DeliveryId, SessionId, Tables};
+use crate::stores::{MAX_ADMISSION_ENTRIES, MAX_LINKS, MAX_UNREGISTERED_QUEUED_BYTES, Tables};
 
 const METADATA_TTL: Duration = Duration::from_secs(1000);
 // How long a packet waits for an offline recipient to come back and
@@ -32,67 +34,156 @@ const MESSAGE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const RELAY_PACKET_SPACING: Duration = Duration::from_millis(5);
 const SWEEPING_TASK_INTERVAL: Duration = Duration::from_secs(120);
 
-// Domain-separation salt for HKDF derivations (must match client)
-const HKDF_SALT: &[u8] = b"e2e-messenger-v1";
+// Path challenges are answerable for this long (see `path_challenge`):
+// an answer is checked against this window's challenge and the previous
+// one's, so 10 to 20 seconds.
+const CHALLENGE_WINDOW_SECS: u64 = 10;
 
-// Request Types
-const TYPE_HANDSHAKE_INIT: u8 = 0;
-const TYPE_DATA: u8 = 1;
-const TYPE_HANDSHAKE_RESP: u8 = 2;
-// Recipient confirming it has forwarded packets, so they can leave its
-// queue. Format: [1 byte type] [4 byte SessionId] [24 byte Nonce]
-// [link-encrypted: 16 byte own routing token | 16 byte delivery ID ...]
-const TYPE_ACK: u8 = 3;
-
-// Relay cover traffic ("dummy packets") is shaped like a forwarded chat
-// packet so the two are the same size on the wire. Clients send chat as FEC
-// symbols (see code/client/src/transport.rs), and since every chunk inside
-// is padded to a fixed block (code/client/src/padding.rs), every symbol is
-// the maximum 1024 bytes. So a forwarded packet's inner payload is always
-//   1 type + 16 sender token + 24 nonce + 12 FEC header + 1024 symbol + 16 tag
-// = 1093 bytes, i.e. a 1154-byte UDP packet once wrapped for the recipient.
-// Keep this in step with the client if that layout changes.
-const CHAT_INNER_PAYLOAD_LEN: usize = 1 + 16 + 24 + 12 + 1024 + 16;
 // Inner type byte of a dummy packet, which the client ignores (the `0x00`
 // arm in `Client::handle_incoming_packet`).
 const INNER_TYPE_DUMMY: u8 = 0x00;
-// Inner type byte of a presence ping (`0x06` in the client). Useless once
-// stale, so it's never held for an offline recipient (see
-// `Tables::enqueue_ephemeral`).
-const INNER_TYPE_PRESENCE: u8 = 0x06;
+
+// The relay's Ed25519 identity, relative to where it runs (code/server
+// locally, /data in Docker).
+const IDENTITY_FILE: &str = "server_identity.json";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ServerIdentityDto {
     ed25519_secret: String,
 }
 
+/// The relay's static Ed25519 identity from `path`, or `None` if there
+/// isn't one there yet.
+fn load_identity(path: &str) -> Result<Option<SigningKey>> {
+    let json = match fs::read_to_string(path) {
+        Ok(json) => json,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let dto: ServerIdentityDto = serde_json::from_str(&json)?;
+    let mut sec_bytes = [0u8; 32];
+    hex::decode_to_slice(&dto.ed25519_secret, &mut sec_bytes)?;
+    Ok(Some(SigningKey::from_bytes(&sec_bytes)))
+}
+
+/// Load the relay's static Ed25519 identity from `path`, or generate one
+/// and save it there if there isn't one yet.
+fn load_or_create_identity(path: &str) -> Result<SigningKey> {
+    if let Some(identity) = load_identity(path)? {
+        make_private(path);
+        return Ok(identity);
+    }
+    info!("No existing server identity found. Generating new Ed25519 keypair...");
+    let mut identity_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut identity_bytes);
+    let dto = ServerIdentityDto {
+        ed25519_secret: hex::encode(identity_bytes),
+    };
+    write_private(path, serde_json::to_string_pretty(&dto)?.as_bytes())?;
+    Ok(SigningKey::from_bytes(&identity_bytes))
+}
+
+/// Write a new file only its owner can read (mode 0600 on Unix), for the
+/// relay's secret key: `fs::write` would leave it readable by every user.
+fn write_private(path: &str, contents: &[u8]) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    io::Write::write_all(&mut options.open(path)?, contents)
+}
+
+/// Make an existing identity file only its owner can read, if it isn't
+/// already: relays before 0600 identity files wrote it readable by every
+/// user. Best effort, as the relay may not own it (a root-run relay made it
+/// in a volume this one now runs on as its own user, say).
+fn make_private(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        if metadata.permissions().mode() & 0o077 == 0 {
+            return;
+        }
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            warn!(
+                "The identity file is readable by other users, and couldn't be made private: {e}"
+            );
+        }
+    }
+}
+
+/// Keep the relay's memory (link keys, queued messages, its identity key)
+/// out of core dumps, and out of reach of debuggers run as the same user: it
+/// only ever lives in RAM. Best effort: on other systems, the container's
+/// `--ulimit core=0` (see deploy.yml) does the first part.
+fn keep_memory_private() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: plain system calls on our own process, with valid arguments.
+    unsafe {
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::setrlimit(libc::RLIMIT_CORE, &none) != 0
+            || libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
+        {
+            warn!(
+                "Couldn't turn off core dumps: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// The relay's secrets: its identity, which clients pin, and the key its
+/// path challenges are made with (see `path_challenge`), which lives only as
+/// long as the process.
+struct RelayKeys {
+    identity: SigningKey,
+    challenge: [u8; 32],
+}
+
+impl RelayKeys {
+    fn new(identity: SigningKey) -> Self {
+        let mut challenge = [0u8; 32];
+        OsRng.fill_bytes(&mut challenge);
+        Self {
+            identity,
+            challenge,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt().with_env_filter("info").init();
-
-    // Generate server static identity
-
-    let identity_path = "server_identity.json";
-    let server_identity = if let Ok(json) = fs::read_to_string(identity_path) {
-        let dto: ServerIdentityDto = serde_json::from_str(&json)?;
-        let mut sec_bytes = [0u8; 32];
-        hex::decode_to_slice(&dto.ed25519_secret, &mut sec_bytes)?;
-        SigningKey::from_bytes(&sec_bytes)
-    } else {
-        info!("No existing server identity found. Generating new Ed25519 keypair...");
-        let mut identity_bytes = [0u8; 32];
-        let mut rng = rand_core::OsRng;
-        rand_core::RngCore::fill_bytes(&mut rng, &mut identity_bytes);
-        let key = SigningKey::from_bytes(&identity_bytes);
-        let dto = ServerIdentityDto {
-            ed25519_secret: hex::encode(identity_bytes),
+    // `--print-pubkey` prints the identity pubkey (hex) and exits, so build
+    // scripts can bake it into clients: they ship with it instead of asking
+    // the relay (see `relay_pubkey` in code/frontend/src-tauri/src/commands.rs).
+    // It never creates an identity: a key made up here would be one no
+    // running relay has, and every client built with it would be refused.
+    // No logging then, so stdout is just the key.
+    if std::env::args().nth(1).as_deref() == Some("--print-pubkey") {
+        let Some(identity) = load_identity(IDENTITY_FILE)? else {
+            let dir = std::env::current_dir()?;
+            eprintln!(
+                "error: no relay identity in {}. A relay makes one the first time it starts \
+                 (./runserver.sh or ./runserver-lan.sh). For a relay running anywhere else \
+                 (Docker, EC2), use the \"Server Static Pubkey\" it prints at startup.",
+                dir.join(IDENTITY_FILE).display()
+            );
+            std::process::exit(1);
         };
-        fs::write(identity_path, serde_json::to_string_pretty(&dto)?)?;
-        key
-    };
+        println!("{}", hex::encode(identity.verifying_key().as_bytes()));
+        return Ok(());
+    }
+    tracing_subscriber::fmt().with_env_filter("info").init();
+    keep_memory_private();
 
-    let server_pub = server_identity.verifying_key();
+    let keys = RelayKeys::new(load_or_create_identity(IDENTITY_FILE)?);
+    let server_pub_hex = hex::encode(keys.identity.verifying_key().as_bytes());
 
     let mut buffer = [0u8; 2048];
 
@@ -101,16 +192,7 @@ async fn main() -> Result<()> {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4430".to_string());
     let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
     info!("UDP server listening on {}", socket.local_addr()?);
-    let server_pub_hex = hex::encode(server_pub.as_bytes());
     info!("Server Static Pubkey: {}", server_pub_hex);
-
-    // TCP and UDP have separate port spaces, so the pubkey endpoint can
-    // share the relay's address and clients only need to know one.
-    let http_listener = TcpListener::bind(&bind_addr).await?;
-    info!(
-        "HTTP pubkey endpoint listening on http://{}/pubkey",
-        http_listener.local_addr()?
-    );
 
     let tables = Arc::new(Mutex::new(Tables::new()));
     // Wakes the outbound task the moment something may be ready to forward
@@ -123,30 +205,28 @@ async fn main() -> Result<()> {
         Arc::clone(&outbound_wake),
     );
     spawn_sweeping_task(Arc::clone(&tables));
-    spawn_pubkey_http_task(http_listener, server_pub_hex);
 
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
                 // Per-packet logging is debug-only: a message is tens to
-                // hundreds of packets, and this loop must keep draining.
-                debug!("Received {} bytes from {}", len, addr);
-                if let Err(e) =
-                    match handle_request(&tables, &server_identity, addr, &buffer[..len]) {
-                        Ok(Some(resp)) => {
-                            if let Err(send_err) = socket.send_to(&resp, addr).await {
-                                error!("Failed to send response: {}", send_err);
+                // hundreds of packets, and this loop must keep draining. So
+                // is a refused packet: anyone can send junk. Logs never name
+                // a client's address or routing token.
+                debug!("Received {} bytes", len);
+                match handle_request(&tables, &keys, addr, &buffer[..len]) {
+                    Ok(reply) => {
+                        if let Some(reply) = reply {
+                            for _ in 0..copies_of(&reply) {
+                                if let Err(e) = socket.send_to(&reply, addr).await {
+                                    error!("Failed to send response: {}", e);
+                                }
                             }
-                            Ok(())
                         }
-                        Ok(None) => {
-                            outbound_wake.notify_one();
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
+                        // A packet queued, or a recipient synced or moved.
+                        outbound_wake.notify_one();
                     }
-                {
-                    error!("Request handling error from {}: {}", addr, e);
+                    Err(e) => debug!("Refused a packet: {}", e),
                 }
             }
             Err(e) => {
@@ -156,150 +236,228 @@ async fn main() -> Result<()> {
     }
 }
 
+/// How many times to send `reply`: handshake replies, sync acks and
+/// receipts several times, to get through loss (`REPLY_COPIES`; an init is
+/// padded to more than all of its copies, so this never amplifies, and the
+/// others only go to where their link has shown it is), anything else once.
+fn copies_of(reply: &[u8]) -> usize {
+    match reply.first() {
+        Some(&TYPE_HANDSHAKE_RESP | &TYPE_SYNC_ACK | &TYPE_RECEIPT) => REPLY_COPIES,
+        _ => 1,
+    }
+}
+
+/// Handle one packet from `socket_address`. Returns the reply to send back
+/// there, if any: a handshake reply, a path challenge, a sync ack or a
+/// receipt.
 fn handle_request(
     tables: &Arc<Mutex<Tables>>,
-    server_identity: &SigningKey,
+    keys: &RelayKeys,
     socket_address: SocketAddr,
     payload: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    if payload.is_empty() {
+    let Some(&packet_type) = payload.first() else {
         return Err(anyhow!("Empty payload"));
+    };
+    if packet_type == TYPE_HANDSHAKE_INIT {
+        let client_ephemeral = relay_link::parse_handshake_init(payload)
+            .map_err(|e| anyhow!("Invalid handshake: {e}"))?;
+        {
+            let mut tables = tables.lock().unwrap();
+            // A copy of an init answered lately: the same reply, the same
+            // link. Clients send each init several times over. Only to the
+            // link's own address, though: the reply is what proves a link
+            // is at the address it handshook from. Sent anywhere else, an
+            // init from someone else's address (whose reply went there)
+            // would hand its sender a link to that address, and everything
+            // the relay sends it, receipts and forwarded packets included.
+            if let Some((session_id, reply)) =
+                tables.recent_handshake_reply(client_ephemeral.as_bytes())
+            {
+                if tables.link_addr(&session_id) != Some(socket_address) {
+                    return Err(anyhow!("A copy of an init answered at another address"));
+                }
+                return Ok(Some(reply));
+            }
+            if !tables.allow_handshake(socket_address.ip()) {
+                return Err(anyhow!("Too many handshakes from one address"));
+            }
+        }
+        let relay_secret = EphemeralSecret::random_from_rng(OsRng);
+        let relay_ephemeral = X25519PublicKey::from(&relay_secret);
+        let shared_secret = relay_secret.diffie_hellman(&client_ephemeral);
+        if !shared_secret.was_contributory() {
+            return Err(anyhow!("Handshake with a degenerate key"));
+        }
+        let link_keys = relay_link::derive_link_keys(shared_secret.as_bytes());
+        let mut tables = tables.lock().unwrap();
+        let session_id = tables
+            .register_link(link_keys, socket_address)
+            .ok_or_else(|| anyhow!("Link table full; refused a handshake"))?;
+        debug!("Registered a new link");
+        let reply = relay_link::handshake_resp(
+            &keys.identity,
+            &client_ephemeral,
+            &relay_ephemeral,
+            &session_id,
+        );
+        tables.remember_handshake(client_ephemeral.to_bytes(), session_id, reply.clone());
+        return Ok(Some(reply));
     }
 
-    match payload[0] {
-        TYPE_HANDSHAKE_INIT => {
-            // Handshake format: [1 byte type] [4 byte SessionId] [32 byte Ephemeral PubKey] [32 byte Client Ed25519 Pub] [64 byte Signature]
-            if payload.len() != 1 + 4 + 32 + 32 + 64 {
-                return Err(anyhow!("Invalid handshake length"));
+    // A link packet: refused unless it's for one of our links, authenticates
+    // and isn't a copy of one taken in already.
+    let opened = tables
+        .lock()
+        .unwrap()
+        .open(payload)
+        .map_err(|e| anyhow!("Refused a link packet: {e}"))?;
+    let session_id = opened.header.session_id;
+    let plaintext = opened.plaintext;
+    match packet_type {
+        TYPE_DATA | TYPE_ADMITTED_DATA => {
+            let (recipient, tag, inner) = relay_link::parse_data(packet_type, &plaintext)
+                .ok_or_else(|| anyhow!("Decrypted payload too small for routing token"))?;
+            if inner.is_empty() {
+                return Err(anyhow!("Data packet with nothing to forward"));
             }
-            let mut session_id = [0u8; 4];
-            session_id.copy_from_slice(&payload[1..5]);
-
-            let mut pubkey_bytes = [0u8; 32];
-            pubkey_bytes.copy_from_slice(&payload[5..37]);
-            let client_pub = X25519PublicKey::from(pubkey_bytes);
-
-            let mut client_ed_bytes = [0u8; 32];
-            client_ed_bytes.copy_from_slice(&payload[37..69]);
-            let client_ed_pub = ed25519_dalek::VerifyingKey::from_bytes(&client_ed_bytes)
-                .map_err(|_| anyhow!("Invalid client ed25519 key"))?;
-
-            let mut sig_bytes = [0u8; 64];
-            sig_bytes.copy_from_slice(&payload[69..133]);
-            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-            use ed25519_dalek::Verifier;
-            client_ed_pub
-                .verify(&pubkey_bytes, &signature)
-                .map_err(|_| anyhow!("Invalid client signature"))?;
-
-            let server_eph_secret =
-                x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
-            let server_eph_pub = X25519PublicKey::from(&server_eph_secret);
-
-            let shared_secret = server_eph_secret.diffie_hellman(&client_pub);
-            let mut link_master_key = [0u8; 32];
-            Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
-                .expand(b"wireguard-lite-link", &mut link_master_key)
-                .map_err(|e| anyhow!("HKDF error: {}", e))?;
-
-            let mut msg = Vec::new();
-            msg.extend_from_slice(client_pub.as_bytes());
-            msg.extend_from_slice(server_eph_pub.as_bytes());
-            let signature = server_identity.sign(&msg);
-
-            let mut resp = vec![TYPE_HANDSHAKE_RESP];
-            resp.extend_from_slice(&session_id);
-            resp.extend_from_slice(server_eph_pub.as_bytes());
-            resp.extend_from_slice(&signature.to_bytes());
-
+            debug!("Forward request");
             let mut tables = tables.lock().unwrap();
-            tables.register_link(session_id, link_master_key);
-            info!("Registered new link for Session ID: {:?}", session_id);
-
-            return Ok(Some(resp));
-        }
-        TYPE_DATA => {
-            // Data format: [1 byte type] [4 byte SessionId] [24 byte Nonce] [Ciphertext...]
-            let (session_id, plaintext) = open_link_payload(tables, payload)?;
-
-            if plaintext.len() < 16 {
-                return Err(anyhow!("Decrypted payload too small for routing token"));
-            }
-
-            let mut routing_token = [0u8; 16];
-            routing_token.copy_from_slice(&plaintext[0..16]);
-
-            let inner_payload = &plaintext[16..];
-
-            if inner_payload.is_empty() {
-                debug!("Sync Request mapped to token {:?}", routing_token);
-                let mut tables = tables.lock().unwrap();
-                tables.update_metadata(routing_token, socket_address, session_id, METADATA_TTL);
-            } else if inner_payload[0] == INNER_TYPE_PRESENCE {
-                let mut tables = tables.lock().unwrap();
-                tables.enqueue_ephemeral(routing_token, inner_payload.to_vec());
+            if tables
+                .enqueue_message(recipient, inner.to_vec(), MESSAGE_TTL, tag)
+                .is_none()
+            {
+                debug!("A recipient's queue is full; dropped a packet");
             } else {
-                debug!("Forward Request for token {:?}", routing_token);
-                let mut tables = tables.lock().unwrap();
-                if tables
-                    .enqueue_message(routing_token, inner_payload.to_vec(), MESSAGE_TTL)
-                    .is_none()
-                {
-                    warn!("Queue full for token {:?}; dropped packet", routing_token);
-                }
+                // So a receipt says the relay has it (and not if dropped).
+                tables.record_queued(&session_id, opened.header.packet_number);
             }
+        }
+        TYPE_SYNC => {
+            let sync = Sync::from_bytes(&plaintext).map_err(|e| anyhow!("Malformed sync: {e}"))?;
+            sync.verify(&opened.keys)
+                .map_err(|e| anyhow!("Rejected sync: {e}"))?;
+            let mut tables = tables.lock().unwrap();
+            if tables.link_addr(&session_id) != Some(socket_address) {
+                // From an address the link hasn't shown it's at: its NAT
+                // mapping changed, say. (A copy of a sync replayed from
+                // elsewhere was refused above.) Nothing moves until a
+                // challenge sent there comes back over the link.
+                debug!("Sync from a new address; challenging it");
+                let challenge =
+                    path_challenge(&keys.challenge, &session_id, &socket_address, unix_secs());
+                return Ok(tables.seal_for(&session_id, TYPE_PATH_CHALLENGE, &challenge));
+            }
+            debug!("Sync request");
+            tables
+                .apply_sync(sync.token, session_id, sync.admission, METADATA_TTL)
+                .map_err(|e| anyhow!("Rejected sync: {e}"))?;
+            // So the client knows its link is still here.
+            let ack = relay_link::sync_ack_plaintext(opened.header.packet_number);
+            return Ok(tables.seal_for(&session_id, TYPE_SYNC_ACK, &ack));
+        }
+        TYPE_PATH_RESPONSE => {
+            let challenge = relay_link::parse_challenge(&plaintext)
+                .ok_or_else(|| anyhow!("Malformed path response"))?;
+            if !answers_path_challenge(
+                &keys.challenge,
+                &session_id,
+                &socket_address,
+                &challenge,
+                unix_secs(),
+            ) {
+                return Err(anyhow!("Path response doesn't answer a challenge"));
+            }
+            debug!("Link moved to a new address");
+            tables
+                .lock()
+                .unwrap()
+                .move_link(&session_id, socket_address, METADATA_TTL);
+        }
+        TYPE_RECEIPT_REQUEST => {
+            let mut tables = tables.lock().unwrap();
+            // Only to where the link has shown it is, like everything else
+            // on it. A request replayed from elsewhere was refused above, but
+            // a copy raced there ahead of the real one mustn't send three
+            // receipts to someone else. The client asks again anyway.
+            if tables.link_addr(&session_id) != Some(socket_address) {
+                return Err(anyhow!("Receipt request from where its link isn't"));
+            }
+            debug!("Receipt request");
+            return Ok(tables.receipt_for(&session_id));
         }
         TYPE_ACK => {
-            let (session_id, plaintext) = open_link_payload(tables, payload)?;
-            // Our own routing token, then whole 16-byte delivery IDs.
-            let Some((routing_token, ids)) = plaintext.split_first_chunk::<16>() else {
-                return Err(anyhow!("Malformed ack"));
-            };
-            let (ids, rest) = ids.as_chunks::<16>();
-            if !rest.is_empty() {
-                return Err(anyhow!("Malformed ack"));
-            }
+            let (routing_token, ids) =
+                relay_link::parse_ack(&plaintext).ok_or_else(|| anyhow!("Malformed ack"))?;
             let removed = tables
                 .lock()
                 .unwrap()
-                .acknowledge(routing_token, &session_id, ids);
-            debug!("Ack for token {:?}: {} delivered", routing_token, removed);
+                .acknowledge(&routing_token, &session_id, ids);
+            debug!("Ack: {} delivered", removed);
         }
         _ => return Err(anyhow!("Unknown packet type")),
     }
     Ok(None)
 }
 
-/// Decrypt a link-encrypted packet (`TYPE_DATA` or `TYPE_ACK`):
-/// [1 byte type] [4 byte SessionId] [24 byte Nonce] [Ciphertext...].
-/// Returns its session ID and plaintext.
-fn open_link_payload(tables: &Arc<Mutex<Tables>>, payload: &[u8]) -> Result<(SessionId, Vec<u8>)> {
-    if payload.len() < 1 + 4 + 24 + 16 {
-        // 16 bytes for auth tag. If length is exactly 45, decrypted is 0 bytes (sync)
-        return Err(anyhow!("Data packet too small"));
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// The challenge for link `session_id` at `addr`, in the time window `now`
+/// falls in: an HMAC under the relay's challenge key, so the relay can check
+/// an answer without remembering what it sent, and nobody else can make
+/// one. It goes out sealed with the link's key, and only counts when it
+/// comes back over that link from that same address, so it proves the
+/// link's client really is there.
+fn path_challenge(
+    key: &[u8; 32],
+    session_id: &SessionId,
+    addr: &SocketAddr,
+    now: u64,
+) -> Challenge {
+    challenge_mac(key, session_id, addr, now / CHALLENGE_WINDOW_SECS)
+        .finalize()
+        .into_bytes()[..16]
+        .try_into()
+        .unwrap()
+}
+
+/// Whether `challenge` is link `session_id`'s challenge at `addr` from this
+/// time window or the one before.
+fn answers_path_challenge(
+    key: &[u8; 32],
+    session_id: &SessionId,
+    addr: &SocketAddr,
+    challenge: &Challenge,
+    now: u64,
+) -> bool {
+    let window = now / CHALLENGE_WINDOW_SECS;
+    [window, window.saturating_sub(1)].iter().any(|&window| {
+        challenge_mac(key, session_id, addr, window)
+            .verify_truncated_left(challenge)
+            .is_ok()
+    })
+}
+
+fn challenge_mac(
+    key: &[u8; 32],
+    session_id: &SessionId,
+    addr: &SocketAddr,
+    window: u64,
+) -> Hmac<Sha256> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
+    mac.update(session_id);
+    match addr.ip() {
+        IpAddr::V4(ip) => mac.update(&ip.to_ipv6_mapped().octets()),
+        IpAddr::V6(ip) => mac.update(&ip.octets()),
     }
-    let mut session_id = [0u8; 4];
-    session_id.copy_from_slice(&payload[1..5]);
-
-    let nonce = XNonce::from_slice(&payload[5..29]);
-    let ciphertext = &payload[29..];
-
-    let link_key = {
-        let tables = tables.lock().unwrap();
-        match tables.get_link_key(&session_id) {
-            Some(k) => *k,
-            None => return Err(anyhow!("Unknown Session ID")),
-        }
-    };
-
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow!("Invalid link encryption MAC"))?;
-    // Authentic traffic on this link, so keep it.
-    tables.lock().unwrap().touch_link(&session_id);
-    Ok((session_id, plaintext))
+    mac.update(&addr.port().to_be_bytes());
+    mac.update(&window.to_be_bytes());
+    mac
 }
 
 fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>, wake: Arc<Notify>) {
@@ -319,23 +477,6 @@ fn spawn_outbound_task(tables: Arc<Mutex<Tables>>, socket: Arc<UdpSocket>, wake:
     });
 }
 
-/// Serve the relay's Ed25519 identity pubkey (hex) at `GET /pubkey`, so
-/// clients can fetch it instead of copying it out of the boot log. This is
-/// plain HTTP, so the response is not authenticated: clients pin the key on
-/// first fetch and refuse a different one later (see `check_relay_pin` in
-/// code/frontend/src-tauri/src/commands.rs).
-fn spawn_pubkey_http_task(listener: TcpListener, server_pub_hex: String) {
-    let app = axum::Router::new().route(
-        "/pubkey",
-        axum::routing::get(move || std::future::ready(server_pub_hex.clone())),
-    );
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            error!("HTTP pubkey endpoint stopped: {}", e);
-        }
-    });
-}
-
 fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
     tokio::spawn(async move {
         loop {
@@ -344,80 +485,59 @@ fn spawn_sweeping_task(tables: Arc<Mutex<Tables>>) {
                 tables.sweep_active_links();
                 tables.sweep_metadata();
                 tables.sweep_expired_messages();
+                // Full tables refuse what doesn't fit rather than grow,
+                // which someone flooding the relay may be causing.
+                if tables.links_full() {
+                    warn!("Link table full ({MAX_LINKS}): refusing handshakes until links expire");
+                }
+                if tables.admission_full() {
+                    warn!(
+                        "Admission table full ({MAX_ADMISSION_ENTRIES}): new recipients' tags aren't kept"
+                    );
+                }
+                if tables.unregistered_queues_full() {
+                    warn!(
+                        "Queues for recipients without admission tags are full ({MAX_UNREGISTERED_QUEUED_BYTES} bytes): refusing more"
+                    );
+                }
             }
             tokio::time::sleep(SWEEPING_TASK_INTERVAL).await;
         }
     });
 }
 
-/// Link-encrypt `inner_payload` for the recipient behind `session_id`,
-/// behind a 16-byte prefix holding its delivery ID, which the client echoes
-/// back in its ack (all zeros for a dummy packet, which needs no ack). Real
-/// forwarded messages and dummy packets both go through this, so they're
-/// framed identically on the wire.
-fn wrap_for_recipient(
-    link_key: &[u8; 32],
-    session_id: &SessionId,
-    delivery_id: &DeliveryId,
-    inner_payload: &[u8],
-) -> Vec<u8> {
-    use rand_core::{OsRng, RngCore};
-
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(link_key));
-    let mut nonce_bytes = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = XNonce::from_slice(&nonce_bytes);
-
-    let mut full_inner = delivery_id.to_vec();
-    full_inner.extend_from_slice(inner_payload);
-
-    let ciphertext = cipher
-        .encrypt(nonce, full_inner.as_slice())
-        .expect("XChaCha20-Poly1305 encryption is infallible for in-memory buffers");
-
-    let mut packet = vec![TYPE_DATA];
-    packet.extend_from_slice(session_id);
-    packet.extend_from_slice(&nonce_bytes);
-    packet.extend_from_slice(&ciphertext);
-    packet
-}
-
-/// A dummy packet for the recipient behind `session_id`: the same size and
-/// framing as a forwarded chat packet, with an inner type the client drops.
-/// Cover traffic is switched off for now (nothing sends these), but this
-/// keeps them ready to match real traffic when it's turned back on.
+/// A dummy packet for the client on `link`: the same size and framing as a
+/// forwarded chat packet, with an all-zero delivery ID (nothing to ack) and
+/// an inner type the client drops. Cover traffic is switched off for now
+/// (nothing sends these), but this keeps them ready to match real traffic
+/// when it's turned back on.
 #[allow(dead_code)]
-fn dummy_packet(link_key: &[u8; 32], session_id: &SessionId) -> Vec<u8> {
+fn dummy_packet(link: &mut LinkEnd) -> Vec<u8> {
     let mut inner = vec![0u8; CHAT_INNER_PAYLOAD_LEN];
     inner[0] = INNER_TYPE_DUMMY;
-    wrap_for_recipient(link_key, session_id, &[0u8; 16], &inner)
+    relay_link::forwarded_packet(link, &[0u8; 16], &inner)
 }
 
 /// Forward every packet whose recipient's pacing slot is due (see
-/// `Tables::take_due`), re-encrypted under the recipient's link key.
-/// Returns when the next slot falls due, if anything is still waiting.
+/// `Tables::take_due`), sealed on the recipient's own link: its key, and a
+/// fresh packet number each time, resends included. Returns when the next
+/// slot falls due, if anything is still waiting.
 async fn send_due_packets(tables: &Mutex<Tables>, socket: &UdpSocket) -> Option<Instant> {
     let (due, next_due) = {
         let mut tables = tables.lock().unwrap();
         let (due, next_due) = tables.take_due(Instant::now(), RELAY_PACKET_SPACING);
         let due: Vec<_> = due
             .into_iter()
-            .filter_map(|packet| Some((*tables.get_link_key(&packet.session_id)?, packet)))
+            .filter_map(|packet| Some((packet.addr, tables.forward(&packet)?)))
             .collect();
         (due, next_due)
     };
-    for (link_key, due) in due {
-        let packet = wrap_for_recipient(&link_key, &due.session_id, &due.id, &due.payload);
+    for (addr, packet) in due {
         // Stays queued until acknowledged, so a failed send is resent like
         // a lost one.
-        match socket.send_to(&packet, due.addr).await {
-            Ok(_) => debug!("Sent {} bytes (re-encrypted) to {}", packet.len(), due.addr),
-            Err(e) => error!(
-                "Failed to forward {} bytes to {}: {}",
-                packet.len(),
-                due.addr,
-                e
-            ),
+        match socket.send_to(&packet, addr).await {
+            Ok(_) => debug!("Sent {} bytes (re-encrypted)", packet.len()),
+            Err(e) => error!("Failed to forward {} bytes: {}", packet.len(), e),
         }
     }
     next_due
@@ -426,101 +546,166 @@ async fn send_due_packets(tables: &Mutex<Tables>, socket: &UdpSocket) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_core::{OsRng, RngCore};
-    use x25519_dalek::EphemeralSecret;
+    use crate::stores::{MAX_QUEUED_BYTES_PER_TOKEN, MAX_UNADMITTED_BYTES_PER_TOKEN};
+    use relay_link::{
+        AdmissionTag, DeliveryId, Header, Lane, LinkError, LinkKeys, RoutingToken, Side,
+        routing_token_for,
+    };
 
-    fn create_handshake_packet(client_secret: &EphemeralSecret, session_id: [u8; 4]) -> Vec<u8> {
-        use ed25519_dalek::{Signer, SigningKey};
+    fn random_signing_key() -> SigningKey {
         let mut bytes = [0u8; 32];
         OsRng.fill_bytes(&mut bytes);
-        let client_ed = SigningKey::from_bytes(&bytes);
-        let client_ed_pub = client_ed.verifying_key();
-        let pubkey = X25519PublicKey::from(client_secret);
-        let signature = client_ed.sign(pubkey.as_bytes());
-
-        let mut packet = vec![TYPE_HANDSHAKE_INIT];
-        packet.extend_from_slice(&session_id);
-        packet.extend_from_slice(pubkey.as_bytes());
-        packet.extend_from_slice(client_ed_pub.as_bytes());
-        packet.extend_from_slice(&signature.to_bytes());
-        packet
+        SigningKey::from_bytes(&bytes)
     }
 
-    fn create_data_packet(
-        link_key: [u8; 32],
-        session_id: [u8; 4],
-        routing_token: [u8; 16],
-        payload: &[u8],
-    ) -> Vec<u8> {
-        let mut plaintext = Vec::new();
-        plaintext.extend_from_slice(&routing_token);
-        plaintext.extend_from_slice(payload);
+    fn relay() -> (Arc<Mutex<Tables>>, RelayKeys) {
+        (
+            Arc::new(Mutex::new(Tables::new())),
+            RelayKeys::new(random_signing_key()),
+        )
+    }
 
-        let mut nonce_bytes = [0u8; 24];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
 
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
-        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
+    /// An address on a host of its own, `host`.
+    fn host(host: u16) -> SocketAddr {
+        SocketAddr::from(([10, 0, (host >> 8) as u8, host as u8], 50000))
+    }
 
-        let mut packet = vec![TYPE_DATA];
-        packet.extend_from_slice(&session_id);
-        packet.extend_from_slice(&nonce_bytes);
-        packet.extend_from_slice(&ciphertext);
-        packet
+    /// A client's end of a link, as its handshake left it.
+    struct TestLink {
+        end: LinkEnd,
+    }
+
+    impl TestLink {
+        fn session(&self) -> SessionId {
+            self.end.session_id()
+        }
+
+        fn keys(&self) -> LinkKeys {
+            *self.end.keys()
+        }
+
+        fn data(&mut self, recipient: RoutingToken, inner: &[u8]) -> Vec<u8> {
+            relay_link::data_packet(&mut self.end, Lane::Direct, &recipient, None, inner)
+        }
+
+        fn admitted_data(
+            &mut self,
+            recipient: RoutingToken,
+            tag: AdmissionTag,
+            inner: &[u8],
+        ) -> Vec<u8> {
+            relay_link::data_packet(&mut self.end, Lane::Direct, &recipient, Some(&tag), inner)
+        }
+
+        /// The sync an honest client sends: for the token its key owns.
+        fn sync(&mut self, token_key: &SigningKey, admission: Vec<AdmissionTag>) -> Vec<u8> {
+            let sync = Sync::new(token_key, &self.keys(), admission);
+            self.end.seal(Lane::Direct, TYPE_SYNC, &sync.to_bytes())
+        }
+
+        fn ack(&mut self, own_token: &RoutingToken, ids: &[DeliveryId]) -> Vec<u8> {
+            let plaintext = relay_link::ack_plaintext(own_token, ids);
+            self.end.seal(Lane::Direct, TYPE_ACK, &plaintext)
+        }
+
+        /// Open what the relay sent this link.
+        fn receive(&mut self, packet: &[u8]) -> (Header, Vec<u8>) {
+            self.end.open(packet).unwrap()
+        }
+
+        /// The challenge in a path challenge the relay sent this link.
+        fn challenge(&mut self, packet: &[u8]) -> Challenge {
+            let (header, plaintext) = self.receive(packet);
+            assert_eq!(header.packet_type, TYPE_PATH_CHALLENGE);
+            relay_link::parse_challenge(&plaintext).unwrap()
+        }
+
+        /// What the client sends back to a challenge.
+        fn answer(&mut self, challenge: &Challenge) -> Vec<u8> {
+            self.end.seal(Lane::Direct, TYPE_PATH_RESPONSE, challenge)
+        }
+    }
+
+    /// Handshake a new client link from `addr`.
+    fn link_up(tables: &Arc<Mutex<Tables>>, keys: &RelayKeys, addr: SocketAddr) -> TestLink {
+        let client_secret = EphemeralSecret::random_from_rng(OsRng);
+        let client_ephemeral = X25519PublicKey::from(&client_secret);
+        let init = relay_link::handshake_init(&client_ephemeral);
+        let resp = handle_request(tables, keys, addr, &init).unwrap().unwrap();
+        let (session, relay_ephemeral) = relay_link::parse_handshake_resp(
+            &resp,
+            &keys.identity.verifying_key(),
+            &client_ephemeral,
+        )
+        .unwrap();
+        let link_keys =
+            relay_link::derive_link_keys(client_secret.diffie_hellman(&relay_ephemeral).as_bytes());
+        TestLink {
+            end: LinkEnd::new(Side::Client, link_keys, session),
+        }
+    }
+
+    /// Sync `token_key`'s token on `link` from `addr`, checking the relay
+    /// acks that very sync.
+    fn sync_acked(
+        tables: &Arc<Mutex<Tables>>,
+        keys: &RelayKeys,
+        addr: SocketAddr,
+        link: &mut TestLink,
+        token_key: &SigningKey,
+        admission: Vec<AdmissionTag>,
+    ) {
+        let sync = link.sync(token_key, admission);
+        let ack = handle_request(tables, keys, addr, &sync)
+            .unwrap()
+            .expect("acked");
+        let (header, plaintext) = link.receive(&ack);
+        assert_eq!(header.packet_type, TYPE_SYNC_ACK);
+        assert_eq!(
+            relay_link::parse_sync_ack(&plaintext),
+            relay_link::header(&sync).map(|sync| sync.packet_number)
+        );
+    }
+
+    /// `link_up`, then sync `token_key`'s token on the new link.
+    fn online(
+        tables: &Arc<Mutex<Tables>>,
+        keys: &RelayKeys,
+        addr: SocketAddr,
+        token_key: &SigningKey,
+    ) -> TestLink {
+        let mut link = link_up(tables, keys, addr);
+        sync_acked(tables, keys, addr, &mut link, token_key, Vec::new());
+        link
     }
 
     #[test]
     fn test_sync_then_forward() {
-        let tables = Arc::new(Mutex::new(Tables::new()));
-        let mut identity_bytes = [0u8; 32];
-        let mut rng = OsRng;
-        rng.fill_bytes(&mut identity_bytes);
-        let server_identity = SigningKey::from_bytes(&identity_bytes);
-        let client_secret = EphemeralSecret::random_from_rng(OsRng);
-        let session_id = [0xAA; 4];
-        let routing_token = [0xBB; 16];
-        let socket_address = SocketAddr::from(([127, 0, 0, 1], 50000));
+        let (tables, keys) = relay();
+        let token_key = random_signing_key();
+        let routing_token = routing_token_for(&token_key.verifying_key());
+        let socket_address = addr(50000);
 
-        // 1. Handshake
-        let handshake_pkt = create_handshake_packet(&client_secret, session_id);
-        let resp = handle_request(&tables, &server_identity, socket_address, &handshake_pkt)
-            .unwrap()
-            .unwrap();
-
-        // Calculate expected link key
-        let mut server_eph_pub_bytes = [0u8; 32];
-        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
-        let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
-
-        let shared_secret = client_secret.diffie_hellman(&server_eph_pub);
-        let mut link_key = [0u8; 32];
-        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
-            .expand(b"wireguard-lite-link", &mut link_key)
-            .unwrap();
-
-        // 2. Sync Request (empty payload)
-        let sync_pkt = create_data_packet(link_key, session_id, routing_token, b"");
-        handle_request(&tables, &server_identity, socket_address, &sync_pkt).unwrap();
-
+        let mut link = online(&tables, &keys, socket_address, &token_key);
         {
             let tables_lock = tables.lock().unwrap();
             let metadata = tables_lock.get_metadata(&routing_token).unwrap();
             assert_eq!(metadata.incoming_addr, socket_address);
-            assert_eq!(metadata.session_id, session_id);
+            assert_eq!(metadata.session_id, link.session());
         }
 
-        // 3. Forward Request (payload "Hello")
-        let forward_pkt = create_data_packet(link_key, session_id, routing_token, b"Hello");
-        handle_request(&tables, &server_identity, socket_address, &forward_pkt).unwrap();
+        let forward_pkt = link.data(routing_token, b"Hello");
+        handle_request(&tables, &keys, socket_address, &forward_pkt).unwrap();
 
-        {
-            let mut tables_lock = tables.lock().unwrap();
-            let (msgs, _) = tables_lock.take_due(Instant::now(), RELAY_PACKET_SPACING);
-            assert_eq!(msgs.len(), 1);
-            assert_eq!(msgs[0].addr, socket_address);
-            assert_eq!(msgs[0].payload, b"Hello");
-        }
+        let mut tables_lock = tables.lock().unwrap();
+        let (msgs, _) = tables_lock.take_due(Instant::now(), RELAY_PACKET_SPACING);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].addr, socket_address);
+        assert_eq!(msgs[0].payload, b"Hello");
     }
 
     // ==========================================
@@ -529,107 +714,123 @@ mod tests {
 
     #[test]
     fn test_dummy_packet_matches_forwarded_chat_packet() {
-        let mut link_key = [0u8; 32];
-        OsRng.fill_bytes(&mut link_key);
-        let session_id = [7u8; 4];
+        let link_keys = relay_link::derive_link_keys(&[9u8; 32]);
+        let mut relay_end = LinkEnd::new(Side::Relay, link_keys, [7u8; 4]);
+        let mut client_end = LinkEnd::new(Side::Client, link_keys, [7u8; 4]);
 
-        let dummy = dummy_packet(&link_key, &session_id);
-        let chat = wrap_for_recipient(
-            &link_key,
-            &session_id,
+        let dummy = dummy_packet(&mut relay_end);
+        let chat = relay_link::forwarded_packet(
+            &mut relay_end,
             &[0x42; 16],
             &[0x07; CHAT_INNER_PAYLOAD_LEN],
         );
-        assert_eq!(dummy.len(), 1154, "same size as a client's FEC chat packet");
+        assert_eq!(dummy.len(), 1138, "same size as a client's FEC chat packet");
         assert_eq!(dummy.len(), chat.len());
         assert_eq!(dummy[..5], chat[..5], "same packet type and session id");
 
         // Framed as the client expects: an all-zero delivery ID (nothing to
         // ack), then an inner payload starting with the type byte it ignores.
-        let plaintext = XChaCha20Poly1305::new(Key::from_slice(&link_key))
-            .decrypt(XNonce::from_slice(&dummy[5..29]), &dummy[29..])
-            .unwrap();
+        let (_, plaintext) = client_end.open(&dummy).unwrap();
         assert_eq!(plaintext[..16], [0u8; 16]);
         assert_eq!(plaintext[16], INNER_TYPE_DUMMY);
     }
 
     #[test]
     fn test_edge_case_invalid_handshake() {
-        let tables = Arc::new(Mutex::new(Tables::new()));
-        let mut identity_bytes = [0u8; 32];
-        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
-        let server_identity = SigningKey::from_bytes(&identity_bytes);
-        let socket_address = SocketAddr::from(([127, 0, 0, 1], 50000));
-
-        let res = handle_request(&tables, &server_identity, socket_address, &[]);
+        let (tables, keys) = relay();
+        let res = handle_request(&tables, &keys, addr(50000), &[]);
         assert!(res.is_err(), "Empty packet should fail");
 
-        let res = handle_request(
-            &tables,
-            &server_identity,
-            socket_address,
-            &[TYPE_HANDSHAKE_INIT, 0x01],
-        );
+        let res = handle_request(&tables, &keys, addr(50000), &[TYPE_HANDSHAKE_INIT, 0x01]);
         assert!(res.is_err(), "Invalid handshake length should fail");
+
+        // An old client's init (ephemeral key, Ed25519 key and signature)
+        // is the same length, but its padding isn't zeros.
+        let client_ephemeral = X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng));
+        let mut init = relay_link::handshake_init(&client_ephemeral);
+        let len = init.len();
+        init[len - 1] ^= 0x01;
+        let res = handle_request(&tables, &keys, addr(50000), &init);
+        assert!(res.is_err(), "Non-zero padding should fail");
     }
 
+    /// Session IDs are in the clear, so the relay picks them: replaying
+    /// someone's handshake, or handshaking at all, never gets you their
+    /// link.
     #[test]
-    fn test_edge_case_handshake_mutual_auth_failure() {
-        let tables = Arc::new(Mutex::new(Tables::new()));
-        let mut identity_bytes = [0u8; 32];
-        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
-        let server_identity = SigningKey::from_bytes(&identity_bytes);
-        let socket_address = SocketAddr::from(([127, 0, 0, 1], 50000));
+    fn test_a_handshake_never_takes_over_a_live_link() {
+        let (tables, keys) = relay();
+        let token_key = random_signing_key();
+        let token = routing_token_for(&token_key.verifying_key());
+        let mut victim = online(&tables, &keys, addr(50000), &token_key);
 
-        let client_secret = EphemeralSecret::random_from_rng(OsRng);
-        let mut hs_pkt = create_handshake_packet(&client_secret, [0xAA; 4]);
+        // A handshake, copied off the wire and replayed.
+        let client_ephemeral = X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng));
+        let init = relay_link::handshake_init(&client_ephemeral);
+        let first = handle_request(&tables, &keys, addr(50000), &init)
+            .unwrap()
+            .unwrap();
+        // A copy from another address gets nothing (see
+        // `test_a_copy_of_an_init_is_answered_only_where_its_link_is`), and
+        // doesn't move that link to the copy's address.
+        assert!(handle_request(&tables, &keys, addr(50001), &init).is_err());
+        assert_ne!(first[1..5], victim.session());
+        let session: SessionId = first[1..5].try_into().unwrap();
+        assert_eq!(
+            tables.lock().unwrap().link_addr(&session),
+            Some(addr(50000))
+        );
+        let other = relay_link::handshake_init(&X25519PublicKey::from(
+            &EphemeralSecret::random_from_rng(OsRng),
+        ));
+        let other = handle_request(&tables, &keys, addr(50001), &other)
+            .unwrap()
+            .unwrap();
+        assert_ne!(other[1..5], first[1..5], "a new session ID each handshake");
+        assert_ne!(other[1..5], victim.session());
 
-        // Corrupt the client's signature
-        let len = hs_pkt.len();
-        hs_pkt[len - 1] ^= 0x01;
+        // The victim's link still works, and is still where its packets go.
+        let ack = victim.ack(&token, &[[0; 16]]);
+        handle_request(&tables, &keys, addr(50000), &ack).unwrap();
+        let tables = tables.lock().unwrap();
+        assert_eq!(
+            tables.get_link_keys(&victim.session()),
+            Some(&victim.keys())
+        );
+        assert_eq!(
+            tables.get_metadata(&token).unwrap().session_id,
+            victim.session()
+        );
+    }
 
-        let res = handle_request(&tables, &server_identity, socket_address, &hs_pkt);
-        assert!(res.is_err(), "Invalid client signature must fail");
+    /// Once the link table is full, handshakes are refused rather than
+    /// growing it, so a flood of handshakes can't run the relay out of
+    /// memory. Links that never sync make room again within a minute.
+    #[test]
+    fn test_handshakes_are_refused_while_the_link_table_is_full() {
+        let (tables, keys) = relay();
+        for n in 0..MAX_LINKS {
+            link_up(&tables, &keys, host(n as u16));
+        }
+        let init = relay_link::handshake_init(&X25519PublicKey::from(
+            &EphemeralSecret::random_from_rng(OsRng),
+        ));
+        let err = handle_request(&tables, &keys, addr(1), &init).unwrap_err();
+        assert!(err.to_string().contains("full"), "{err}");
     }
 
     #[test]
     fn test_edge_case_offline_queuing_and_sync() {
-        let tables = Arc::new(Mutex::new(Tables::new()));
-        let mut identity_bytes = [0u8; 32];
-        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
-        let server_identity = SigningKey::from_bytes(&identity_bytes);
-        let sender_addr = SocketAddr::from(([127, 0, 0, 1], 50001));
-        let receiver_addr = SocketAddr::from(([127, 0, 0, 1], 50002));
+        let (tables, keys) = relay();
+        let sender_addr = addr(50001);
+        let receiver_addr = addr(50002);
+        let receiver_token_key = random_signing_key();
+        let receiver_token = routing_token_for(&receiver_token_key.verifying_key());
 
-        let sender_secret = EphemeralSecret::random_from_rng(OsRng);
-        let receiver_secret = EphemeralSecret::random_from_rng(OsRng);
-        let sender_session = [0xAA; 4];
-        let receiver_session = [0xBB; 4];
-        let receiver_token = [0xCC; 16];
-
-        // 1. Sender does handshake
-        let hs_pkt = create_handshake_packet(&sender_secret, sender_session);
-        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt)
-            .unwrap()
-            .unwrap();
-
-        let mut server_eph_pub_bytes = [0u8; 32];
-        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
-        let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
-        let shared_secret = sender_secret.diffie_hellman(&server_eph_pub);
-        let mut sender_link_key = [0u8; 32];
-        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
-            .expand(b"wireguard-lite-link", &mut sender_link_key)
-            .unwrap();
-
-        // 2. Sender sends message to receiver (receiver is OFFLINE, not synced)
-        let forward_pkt = create_data_packet(
-            sender_link_key,
-            sender_session,
-            receiver_token,
-            b"QueuedMsg",
-        );
-        handle_request(&tables, &server_identity, sender_addr, &forward_pkt).unwrap();
+        // 1. Sender handshakes and sends to the offline receiver
+        let mut sender = link_up(&tables, &keys, sender_addr);
+        let forward_pkt = sender.data(receiver_token, b"QueuedMsg");
+        handle_request(&tables, &keys, sender_addr, &forward_pkt).unwrap();
 
         // Ensure it's in the offline queue, NOT the outbound queue
         {
@@ -646,27 +847,11 @@ mod tests {
             );
         }
 
-        // 3. Receiver comes online and handshakes
-        let hs_pkt = create_handshake_packet(&receiver_secret, receiver_session);
-        let resp = handle_request(&tables, &server_identity, receiver_addr, &hs_pkt)
-            .unwrap()
-            .unwrap();
+        // 2. Receiver comes online: handshake, then sync
+        let mut receiver = online(&tables, &keys, receiver_addr, &receiver_token_key);
 
-        let mut server_eph_pub_bytes = [0u8; 32];
-        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
-        let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
-        let shared_secret = receiver_secret.diffie_hellman(&server_eph_pub);
-        let mut receiver_link_key = [0u8; 32];
-        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
-            .expand(b"wireguard-lite-link", &mut receiver_link_key)
-            .unwrap();
-
-        // 4. Receiver sends sync packet
-        let sync_pkt = create_data_packet(receiver_link_key, receiver_session, receiver_token, b"");
-        handle_request(&tables, &server_identity, receiver_addr, &sync_pkt).unwrap();
-
-        // 5. Check that the queued packet was flushed to the outbound queue
-        {
+        // 3. Check that the queued packet was flushed to the outbound queue
+        let delivered_id = {
             let mut tables_lock = tables.lock().unwrap();
             let (msgs, _) = tables_lock.take_due(Instant::now(), RELAY_PACKET_SPACING);
             assert_eq!(
@@ -683,23 +868,12 @@ mod tests {
                     .len(),
                 1
             );
-        }
+            msgs[0].id
+        };
 
-        // 6. Receiver acks it, which removes it from the queue
-        let delivered_id = tables
-            .lock()
-            .unwrap()
-            .get_queued_packets(&receiver_token)
-            .unwrap()[0]
-            .id;
-        let mut ack_pkt = create_data_packet(
-            receiver_link_key,
-            receiver_session,
-            receiver_token,
-            &delivered_id,
-        );
-        ack_pkt[0] = TYPE_ACK;
-        handle_request(&tables, &server_identity, receiver_addr, &ack_pkt).unwrap();
+        // 4. Receiver acks it, which removes it from the queue
+        let ack_pkt = receiver.ack(&receiver_token, &[delivered_id]);
+        handle_request(&tables, &keys, receiver_addr, &ack_pkt).unwrap();
         assert!(
             tables
                 .lock()
@@ -709,101 +883,399 @@ mod tests {
         );
     }
 
+    /// Someone with their own link session can't sync a routing token they
+    /// don't own, so they can't redirect its owner's queued packets to
+    /// themselves (or ack them away).
     #[test]
-    fn test_presence_ping_not_queued_for_offline_recipient() {
-        let tables = Arc::new(Mutex::new(Tables::new()));
-        let mut identity_bytes = [0u8; 32];
-        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
-        let server_identity = SigningKey::from_bytes(&identity_bytes);
-        let sender_addr = SocketAddr::from(([127, 0, 0, 1], 50001));
-        let sender_secret = EphemeralSecret::random_from_rng(OsRng);
-        let sender_session = [0xAA; 4];
-        let receiver_token = [0xCC; 16];
+    fn test_sync_for_someone_elses_token_is_rejected() {
+        let (tables, keys) = relay();
+        let mut link = link_up(&tables, &keys, addr(50001));
+        let victim_key = random_signing_key();
+        let victim_token = routing_token_for(&victim_key.verifying_key());
+        let attacker_key = random_signing_key();
 
-        let hs_pkt = create_handshake_packet(&sender_secret, sender_session);
-        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt)
+        // Their own key, claiming the victim's token.
+        let mut claim = Sync::new(&attacker_key, &link.keys(), Vec::new());
+        claim.token = victim_token;
+        let claim = link.end.seal(Lane::Direct, TYPE_SYNC, &claim.to_bytes());
+        let err = handle_request(&tables, &keys, addr(50001), &claim).unwrap_err();
+        assert!(err.to_string().contains("doesn't own"), "{err}");
+
+        // The victim's public key (it's no secret), but not its signature.
+        let mut forged = Sync::new(&attacker_key, &link.keys(), Vec::new());
+        forged.token = victim_token;
+        forged.token_public = victim_key.verifying_key();
+        let forged = link.end.seal(Lane::Direct, TYPE_SYNC, &forged.to_bytes());
+        let err = handle_request(&tables, &keys, addr(50001), &forged).unwrap_err();
+        assert!(err.to_string().contains("signature"), "{err}");
+
+        assert!(tables.lock().unwrap().get_metadata(&victim_token).is_none());
+    }
+
+    /// A sync is signed for one link, so a copy of it can't be replayed on
+    /// another.
+    #[test]
+    fn test_sync_signed_for_another_link_is_rejected() {
+        let (tables, keys) = relay();
+        let first_link = link_up(&tables, &keys, addr(50001));
+        let mut second_link = link_up(&tables, &keys, addr(50001));
+        let token_key = random_signing_key();
+        let token = routing_token_for(&token_key.verifying_key());
+
+        let signed_for_first = Sync::new(&token_key, &first_link.keys(), Vec::new());
+        let replayed = second_link
+            .end
+            .seal(Lane::Direct, TYPE_SYNC, &signed_for_first.to_bytes());
+        assert!(handle_request(&tables, &keys, addr(50001), &replayed).is_err());
+        assert!(tables.lock().unwrap().get_metadata(&token).is_none());
+
+        sync_acked(
+            &tables,
+            &keys,
+            addr(50001),
+            &mut second_link,
+            &token_key,
+            Vec::new(),
+        );
+        assert_eq!(
+            tables
+                .lock()
+                .unwrap()
+                .get_metadata(&token)
+                .unwrap()
+                .session_id,
+            second_link.session()
+        );
+    }
+
+    /// A copy of any packet taken in already is refused, wherever it comes
+    /// from: a sync replayed from elsewhere doesn't even get a challenge
+    /// sent there, and a data packet replayed doesn't queue it again.
+    #[test]
+    fn test_replayed_packets_are_refused() {
+        let (tables, keys) = relay();
+        let token_key = random_signing_key();
+        let token = routing_token_for(&token_key.verifying_key());
+        let mut victim = link_up(&tables, &keys, addr(50000));
+        let sync = victim.sync(&token_key, Vec::new());
+        handle_request(&tables, &keys, addr(50000), &sync).unwrap();
+
+        for from in [addr(60000), addr(50000)] {
+            let err = handle_request(&tables, &keys, from, &sync).unwrap_err();
+            assert!(err.to_string().contains("replayed"), "{err}");
+        }
+        assert_eq!(
+            tables
+                .lock()
+                .unwrap()
+                .get_metadata(&token)
+                .unwrap()
+                .incoming_addr,
+            addr(50000)
+        );
+
+        let data = victim.data(token, b"once");
+        handle_request(&tables, &keys, addr(50000), &data).unwrap();
+        assert!(handle_request(&tables, &keys, addr(60000), &data).is_err());
+        let tables = tables.lock().unwrap();
+        assert_eq!(tables.get_queued_packets(&token).unwrap().len(), 1);
+    }
+
+    /// A phone's NAT mapping changes: its next sync comes from a new
+    /// address, the relay challenges it there, and once it answers from
+    /// there everything goes to the new address, unacknowledged packets
+    /// first. An answer from any other address doesn't count, and nor does
+    /// a copy of the real one replayed from somewhere else afterwards.
+    #[test]
+    fn test_link_moves_once_it_answers_a_challenge_from_its_new_address() {
+        let (tables, keys) = relay();
+        let token_key = random_signing_key();
+        let token = routing_token_for(&token_key.verifying_key());
+        let mut link = online(&tables, &keys, addr(50000), &token_key);
+        tables
+            .lock()
+            .unwrap()
+            .enqueue_message(token, b"queued".to_vec(), MESSAGE_TTL, None);
+        let now = Instant::now();
+        tables.lock().unwrap().take_due(now, RELAY_PACKET_SPACING);
+
+        let sync = link.sync(&token_key, Vec::new());
+        let challenge_packet = handle_request(&tables, &keys, addr(50001), &sync)
             .unwrap()
             .unwrap();
-        let mut server_eph_pub_bytes = [0u8; 32];
-        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
-        let shared_secret =
-            sender_secret.diffie_hellman(&X25519PublicKey::from(server_eph_pub_bytes));
-        let mut sender_link_key = [0u8; 32];
-        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
-            .expand(b"wireguard-lite-link", &mut sender_link_key)
-            .unwrap();
-
-        let ping = create_data_packet(
-            sender_link_key,
-            sender_session,
-            receiver_token,
-            &[INNER_TYPE_PRESENCE, 1, 2, 3],
+        let challenge = link.challenge(&challenge_packet);
+        // An answer from anywhere else doesn't count.
+        let elsewhere = link.answer(&challenge);
+        assert!(handle_request(&tables, &keys, addr(50002), &elsewhere).is_err());
+        assert_eq!(
+            tables
+                .lock()
+                .unwrap()
+                .get_metadata(&token)
+                .unwrap()
+                .incoming_addr,
+            addr(50000)
         );
-        handle_request(&tables, &server_identity, sender_addr, &ping).unwrap();
+
+        let answer = link.answer(&challenge);
+        assert!(
+            handle_request(&tables, &keys, addr(50001), &answer)
+                .unwrap()
+                .is_none()
+        );
+        // A copy of the answer, replayed from elsewhere, moves nothing.
+        assert!(handle_request(&tables, &keys, addr(60000), &answer).is_err());
+        let mut tables = tables.lock().unwrap();
+        assert_eq!(tables.link_addr(&link.session()), Some(addr(50001)));
+        assert_eq!(
+            tables.get_metadata(&token).unwrap().incoming_addr,
+            addr(50001)
+        );
+        let (resent, _) =
+            tables.take_due(Instant::now() + RELAY_PACKET_SPACING, RELAY_PACKET_SPACING);
+        assert_eq!(resent.len(), 1, "resent at once");
+        assert_eq!(resent[0].addr, addr(50001));
+    }
+
+    #[test]
+    fn test_path_challenges_expire_and_are_bound_to_their_link_and_address() {
+        let key = [5u8; 32];
+        let (session, at) = ([1u8; 4], addr(50000));
+        let now = 1_000_000;
+        let challenge = path_challenge(&key, &session, &at, now);
+        assert!(answers_path_challenge(&key, &session, &at, &challenge, now));
+        assert!(answers_path_challenge(
+            &key,
+            &session,
+            &at,
+            &challenge,
+            now + CHALLENGE_WINDOW_SECS
+        ));
+        assert!(!answers_path_challenge(
+            &key,
+            &session,
+            &at,
+            &challenge,
+            now + 2 * CHALLENGE_WINDOW_SECS
+        ));
+        assert!(!answers_path_challenge(&key, &[2; 4], &at, &challenge, now));
+        assert!(!answers_path_challenge(
+            &key,
+            &session,
+            &addr(50001),
+            &challenge,
+            now
+        ));
+        assert!(!answers_path_challenge(
+            &[6; 32], &session, &at, &challenge, now
+        ));
+    }
+
+    /// Syncing on a new link retires the old one, so nothing from the old
+    /// link can move the token back to a link its owner no longer has the
+    /// key for.
+    #[test]
+    fn test_old_links_sync_cannot_move_a_token_back() {
+        let (tables, keys) = relay();
+        let token_key = random_signing_key();
+        let token = routing_token_for(&token_key.verifying_key());
+        let mut old = link_up(&tables, &keys, addr(50000));
+        let old_sync = old.sync(&token_key, Vec::new());
+        handle_request(&tables, &keys, addr(50000), &old_sync).unwrap();
+        let new = online(&tables, &keys, addr(50000), &token_key);
+
+        assert!(handle_request(&tables, &keys, addr(50000), &old_sync).is_err());
+        let fresh_from_old = old.sync(&token_key, Vec::new());
+        assert!(handle_request(&tables, &keys, addr(50000), &fresh_from_old).is_err());
+        assert_eq!(
+            tables
+                .lock()
+                .unwrap()
+                .get_metadata(&token)
+                .unwrap()
+                .session_id,
+            new.session()
+        );
+    }
+
+    /// The same when the token's metadata had expired before its new link
+    /// synced (a phone offline for a while, then relaunched): the old link
+    /// is still retired, so it can't take the token back and cut the new
+    /// one off.
+    #[test]
+    fn test_old_link_cannot_reclaim_its_token_after_metadata_expires() {
+        let (tables, keys) = relay();
+        let token_key = random_signing_key();
+        let token = routing_token_for(&token_key.verifying_key());
+        let mut old = online(&tables, &keys, addr(50000), &token_key);
+        {
+            let mut t = tables.lock().unwrap();
+            t.update_metadata(token, addr(50000), old.session(), Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(2));
+            t.sweep_metadata();
+            assert!(t.get_metadata(&token).is_none());
+        }
+        let new = online(&tables, &keys, addr(50001), &token_key);
         assert!(
             tables
                 .lock()
                 .unwrap()
-                .get_queued_packets(&receiver_token)
+                .get_link_keys(&old.session())
+                .is_none(),
+            "the old link was retired"
+        );
+
+        let from_old = old.sync(&token_key, Vec::new());
+        assert!(handle_request(&tables, &keys, addr(50000), &from_old).is_err());
+        let t = tables.lock().unwrap();
+        assert_eq!(t.get_metadata(&token).unwrap().session_id, new.session());
+        assert!(t.get_link_keys(&new.session()).is_some());
+    }
+
+    /// A link carries one token, so one link can't register any number of
+    /// made-up tokens, each leaving admission tags behind for days.
+    #[test]
+    fn test_a_link_syncs_one_token() {
+        let (tables, keys) = relay();
+        let first_key = random_signing_key();
+        let mut link = online(&tables, &keys, addr(50000), &first_key);
+        let second_key = random_signing_key();
+        let second = link.sync(&second_key, vec![[1; 8]; 64]);
+        let err = handle_request(&tables, &keys, addr(50000), &second).unwrap_err();
+        assert!(err.to_string().contains("another token"), "{err}");
+        assert!(
+            tables
+                .lock()
+                .unwrap()
+                .get_metadata(&routing_token_for(&second_key.verifying_key()))
                 .is_none()
         );
+        sync_acked(
+            &tables,
+            &keys,
+            addr(50000),
+            &mut link,
+            &first_key,
+            Vec::new(),
+        );
+    }
+
+    /// A packet the relay forwarded, bounced back to it, isn't taken for
+    /// one from the client: each direction has its own key.
+    #[test]
+    fn test_a_forwarded_packet_bounced_back_is_refused() {
+        let (tables, keys) = relay();
+        let token_key = random_signing_key();
+        let token = routing_token_for(&token_key.verifying_key());
+        let link = online(&tables, &keys, addr(50000), &token_key);
+        let forwarded = {
+            let mut t = tables.lock().unwrap();
+            t.enqueue_message(token, vec![7u8; 100], MESSAGE_TTL, None);
+            let (due, _) = t.take_due(Instant::now(), RELAY_PACKET_SPACING);
+            t.forward(&due[0]).unwrap()
+        };
+        assert_eq!(forwarded[1..5], link.session());
+        let err = handle_request(&tables, &keys, addr(60000), &forwarded).unwrap_err();
+        assert!(err.to_string().contains("authenticate"), "{err}");
+        let t = tables.lock().unwrap();
+        assert_eq!(t.get_queued_packets(&token).unwrap().len(), 1);
+    }
+
+    /// Anyone who knows a token (it's in its owner's QR code) can send to
+    /// it, but once its owner has registered its contacts' admission tags,
+    /// that only fills a small queue of its own: contacts' messages still
+    /// get in.
+    #[test]
+    fn test_flooding_a_token_cannot_block_its_contacts() {
+        let (tables, keys) = relay();
+        let token_key = random_signing_key();
+        let token = routing_token_for(&token_key.verifying_key());
+        let mut owner = link_up(&tables, &keys, addr(50000));
+        let contact_tag = [0x5A; 8];
+        sync_acked(
+            &tables,
+            &keys,
+            addr(50000),
+            &mut owner,
+            &token_key,
+            vec![contact_tag],
+        );
+
+        let mut flooder = link_up(&tables, &keys, addr(60000));
+        for i in 0..(MAX_QUEUED_BYTES_PER_TOKEN / 1000 + 10) {
+            let mut junk = vec![0xAB; 1000];
+            junk[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let tag = [(i % 256) as u8; 8]; // guessing, or no tag at all
+            let packet = if i % 2 == 0 {
+                flooder.data(token, &junk)
+            } else {
+                flooder.admitted_data(token, tag, &junk)
+            };
+            handle_request(&tables, &keys, addr(60000), &packet).unwrap();
+        }
+        let mut contact = link_up(&tables, &keys, addr(50001));
+        let message = contact.admitted_data(token, contact_tag, b"from a contact");
+        handle_request(&tables, &keys, addr(50001), &message).unwrap();
+
+        let tables = tables.lock().unwrap();
+        let queue = tables.get_queued_packets(&token).unwrap();
+        let junk_bytes: usize = queue
+            .iter()
+            .filter(|p| !p.admitted)
+            .map(|p| p.payload.len())
+            .sum();
+        assert!(junk_bytes <= MAX_UNADMITTED_BYTES_PER_TOKEN);
+        assert_eq!(queue.back().unwrap().payload, b"from a contact");
+        assert!(queue.back().unwrap().admitted);
+    }
+
+    /// An empty data packet used to be how a client synced, unsigned. It's
+    /// refused now, rather than queued or treated as a sync.
+    #[test]
+    fn test_empty_data_packet_is_not_a_sync() {
+        let (tables, keys) = relay();
+        let mut link = link_up(&tables, &keys, addr(50001));
+        let token = [0xCC; 16];
+
+        let old_style_sync = link.data(token, b"");
+        assert!(handle_request(&tables, &keys, addr(50001), &old_style_sync).is_err());
+        let tables = tables.lock().unwrap();
+        assert!(tables.get_metadata(&token).is_none());
+        assert!(tables.get_queued_packets(&token).is_none());
     }
 
     #[test]
     fn test_edge_case_offline_queue_dos_bounds() {
-        let tables = Arc::new(Mutex::new(Tables::new()));
-        let mut identity_bytes = [0u8; 32];
-        rand_core::RngCore::fill_bytes(&mut OsRng, &mut identity_bytes);
-        let server_identity = SigningKey::from_bytes(&identity_bytes);
-        let sender_addr = SocketAddr::from(([127, 0, 0, 1], 50001));
-
-        let sender_secret = EphemeralSecret::random_from_rng(OsRng);
-        let sender_session = [0xAA; 4];
+        let (tables, keys) = relay();
+        let sender_addr = addr(50001);
         let receiver_token = [0xCC; 16];
+        let mut sender = link_up(&tables, &keys, sender_addr);
 
-        // 1. Sender handshakes
-        let hs_pkt = create_handshake_packet(&sender_secret, sender_session);
-        let resp = handle_request(&tables, &server_identity, sender_addr, &hs_pkt)
-            .unwrap()
-            .unwrap();
-
-        let mut server_eph_pub_bytes = [0u8; 32];
-        server_eph_pub_bytes.copy_from_slice(&resp[5..37]);
-        let server_eph_pub = X25519PublicKey::from(server_eph_pub_bytes);
-        let shared_secret = sender_secret.diffie_hellman(&server_eph_pub);
-        let mut sender_link_key = [0u8; 32];
-        Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes())
-            .expand(b"wireguard-lite-link", &mut sender_link_key)
-            .unwrap();
-
-        // 2. Spam an offline token with more than its queue holds
-        let cap = crate::stores::MAX_QUEUED_BYTES_PER_TOKEN;
+        // Spam an offline token with more than its queue holds
+        let cap = MAX_QUEUED_BYTES_PER_TOKEN;
         let packet = vec![0xAB; 1000];
         let fits = cap / packet.len();
         for i in 0..fits + 5 {
             let mut msg = packet.clone();
             msg[..8].copy_from_slice(&(i as u64).to_be_bytes());
-            let forward_pkt =
-                create_data_packet(sender_link_key, sender_session, receiver_token, &msg);
-            handle_request(&tables, &server_identity, sender_addr, &forward_pkt).unwrap();
+            let forward_pkt = sender.data(receiver_token, &msg);
+            handle_request(&tables, &keys, sender_addr, &forward_pkt).unwrap();
         }
 
-        // 3. The queue is bounded by bytes, and keeps the *oldest* packets:
+        // The queue is bounded by bytes, and keeps the *oldest* packets:
         // later ones are refused, rather than earlier ones evicted.
-        {
-            let tables_lock = tables.lock().unwrap();
-            let queue = tables_lock.get_queued_packets(&receiver_token).unwrap();
-            assert_eq!(
-                queue.len(),
-                fits,
-                "Offline queue must refuse packets beyond limit"
-            );
-            assert_eq!(queue.front().unwrap().payload[..8], 0u64.to_be_bytes());
-            assert_eq!(
-                queue.back().unwrap().payload[..8],
-                (fits as u64 - 1).to_be_bytes()
-            );
-        }
+        let tables_lock = tables.lock().unwrap();
+        let queue = tables_lock.get_queued_packets(&receiver_token).unwrap();
+        assert_eq!(
+            queue.len(),
+            fits,
+            "Offline queue must refuse packets beyond limit"
+        );
+        assert_eq!(queue.front().unwrap().payload[..8], 0u64.to_be_bytes());
+        assert_eq!(
+            queue.back().unwrap().payload[..8],
+            (fits as u64 - 1).to_be_bytes()
+        );
     }
 
     /// A backlog for an online recipient comes out whole, in order, and one
@@ -813,10 +1285,9 @@ mod tests {
     fn test_backlog_is_paced_out_whole_and_in_order() {
         let mut tables = Tables::new();
         let token = [0xDD; 16];
-        let addr = SocketAddr::from(([127, 0, 0, 1], 50003));
-        tables.update_metadata(token, addr, [0xEE; 4], METADATA_TTL);
+        tables.update_metadata(token, addr(50003), [0xEE; 4], METADATA_TTL);
         for i in 0..300u32 {
-            tables.enqueue_message(token, i.to_be_bytes().to_vec(), MESSAGE_TTL);
+            tables.enqueue_message(token, i.to_be_bytes().to_vec(), MESSAGE_TTL, None);
         }
         let start = Instant::now();
         let mut now = start;
@@ -845,22 +1316,12 @@ mod tests {
     fn test_recipients_are_paced_independently() {
         let mut tables = Tables::new();
         let (a, b) = ([0xA1; 16], [0xB1; 16]);
-        tables.update_metadata(
-            a,
-            SocketAddr::from(([127, 0, 0, 1], 1)),
-            [1; 4],
-            METADATA_TTL,
-        );
-        tables.update_metadata(
-            b,
-            SocketAddr::from(([127, 0, 0, 1], 2)),
-            [2; 4],
-            METADATA_TTL,
-        );
+        tables.update_metadata(a, addr(1), [1; 4], METADATA_TTL);
+        tables.update_metadata(b, addr(2), [2; 4], METADATA_TTL);
         for _ in 0..10 {
-            tables.enqueue_message(a, vec![0xA], MESSAGE_TTL);
+            tables.enqueue_message(a, vec![0xA], MESSAGE_TTL, None);
         }
-        tables.enqueue_message(b, vec![0xB], MESSAGE_TTL);
+        tables.enqueue_message(b, vec![0xB], MESSAGE_TTL, None);
         let (due, _) = tables.take_due(Instant::now(), RELAY_PACKET_SPACING);
         let mut payloads: Vec<_> = due.iter().map(|p| p.payload.clone()).collect();
         payloads.sort();
@@ -868,9 +1329,9 @@ mod tests {
     }
 
     /// The whole forwarding path: packets queued for an online recipient are
-    /// re-encrypted under *their* link key, prefixed with their delivery ID,
-    /// and sent over UDP — all of them, in order, paced, as soon as the
-    /// outbound task is woken. They stay queued until acked.
+    /// sealed on *their* link, prefixed with their delivery ID, and sent
+    /// over UDP — all of them, in order, paced, as soon as the outbound task
+    /// is woken. They stay queued until acked.
     #[tokio::test]
     async fn test_outbound_forwarding_reencrypts_and_paces_every_packet() {
         let tables = Arc::new(Mutex::new(Tables::new()));
@@ -878,34 +1339,30 @@ mod tests {
         let recipient = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let wake = Arc::new(Notify::new());
         spawn_outbound_task(Arc::clone(&tables), relay, Arc::clone(&wake));
-        let (session, token, link_key) = ([0x11; 4], [0x22; 16], [0x33; 32]);
-        {
+        let (token, link_keys) = ([0x22; 16], relay_link::derive_link_keys(&[0x33; 32]));
+        let session = {
             let mut t = tables.lock().unwrap();
-            t.register_link(session, link_key);
-            t.update_metadata(
-                token,
-                recipient.local_addr().unwrap(),
-                session,
-                METADATA_TTL,
-            );
+            let session = t
+                .register_link(link_keys, recipient.local_addr().unwrap())
+                .unwrap();
+            t.apply_sync(token, session, Vec::new(), METADATA_TTL)
+                .unwrap();
             for i in 0..60u8 {
-                t.enqueue_message(token, vec![i; 40], MESSAGE_TTL);
+                t.enqueue_message(token, vec![i; 40], MESSAGE_TTL, None);
             }
-        }
+            session
+        };
+        let mut client_end = LinkEnd::new(Side::Client, link_keys, session);
         let started = Instant::now();
         wake.notify_one();
 
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&link_key));
         let mut buf = [0u8; 2048];
         let mut ids = Vec::new();
         for i in 0..60u8 {
             let (len, _) = recipient.recv_from(&mut buf).await.unwrap();
-            let packet = &buf[..len];
-            assert_eq!(packet[0], TYPE_DATA);
-            assert_eq!(packet[1..5], session);
-            let inner = cipher
-                .decrypt(XNonce::from_slice(&packet[5..29]), &packet[29..])
-                .unwrap();
+            let (header, inner) = client_end.open(&buf[..len]).unwrap();
+            assert_eq!(header.packet_type, TYPE_DATA);
+            assert_eq!(header.session_id, session);
             ids.push(DeliveryId::try_from(&inner[..16]).unwrap());
             assert_eq!(inner[16..], [i; 40]);
         }
@@ -934,6 +1391,7 @@ mod tests {
             receiver_token,
             b"ExpiredMsg".to_vec(),
             std::time::Duration::from_secs(0),
+            None,
         );
 
         // Wait 1 ms to ensure 'now' is past the expiry
@@ -944,6 +1402,7 @@ mod tests {
             receiver_token,
             b"ValidMsg".to_vec(),
             std::time::Duration::from_secs(3600),
+            None,
         );
 
         assert_eq!(tables.get_queued_packets(&receiver_token).unwrap().len(), 2);
@@ -955,5 +1414,237 @@ mod tests {
         let queue = tables.get_queued_packets(&receiver_token).unwrap();
         assert_eq!(queue.len(), 1, "Expired message should be swept");
         assert_eq!(queue[0].payload, b"ValidMsg");
+    }
+
+    /// `--print-pubkey` must never make up an identity: a key no running
+    /// relay has would be baked into every client built with it.
+    #[test]
+    fn test_loading_a_missing_identity_creates_nothing() {
+        let path = std::env::temp_dir().join(format!("relay-identity-test-{}", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        let _ = fs::remove_file(&path);
+        assert!(load_identity(&path).unwrap().is_none());
+        assert!(!std::path::Path::new(&path).exists());
+
+        let created = load_or_create_identity(&path).unwrap();
+        let loaded = load_identity(&path).unwrap().unwrap();
+        assert_eq!(created.verifying_key(), loaded.verifying_key());
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// Refused link packets say why, which is what the relay's (debug) log
+    /// shows: unknown links, forgeries and replays alike.
+    #[test]
+    fn test_refused_link_packets_say_why() {
+        let (tables, keys) = relay();
+        let mut link = link_up(&tables, &keys, addr(50000));
+        let mut stranger = TestLink {
+            end: LinkEnd::new(Side::Client, LinkKeys::default(), [0xAA; 4]),
+        };
+        let unknown = stranger.data([1; 16], b"x");
+        let err = handle_request(&tables, &keys, addr(50000), &unknown).unwrap_err();
+        assert!(err.to_string().contains(&LinkError::WrongLink.to_string()));
+
+        let mut forged = link.data([1; 16], b"x");
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        let err = handle_request(&tables, &keys, addr(50000), &forged).unwrap_err();
+        assert!(err.to_string().contains(&LinkError::Forged.to_string()));
+    }
+
+    /// A client sends each handshake init several times over: every copy
+    /// gets the same reply, for the same one link.
+    #[test]
+    fn test_copies_of_a_handshake_init_get_one_link() {
+        let (tables, keys) = relay();
+        let client_ephemeral = X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng));
+        let init = relay_link::handshake_init(&client_ephemeral);
+        let replies: Vec<_> = (0..3)
+            .map(|_| {
+                handle_request(&tables, &keys, addr(50000), &init)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        assert!(replies.iter().all(|reply| *reply == replies[0]));
+        assert_eq!(tables.lock().unwrap().link_count(), 1);
+        assert_eq!(copies_of(&replies[0]), REPLY_COPIES);
+
+        // Once that link is gone, the same init is a new handshake.
+        let session: SessionId = replies[0][1..5].try_into().unwrap();
+        tables.lock().unwrap().expire_link(&session);
+        let again = handle_request(&tables, &keys, addr(50000), &init)
+            .unwrap()
+            .unwrap();
+        assert_ne!(again[1..5], replies[0][1..5]);
+    }
+
+    /// Someone can send an init with someone else's source address, whose
+    /// reply goes there. A copy of it from their own address must not get
+    /// them that reply: with it, they'd have the keys to a link the relay
+    /// thinks is at the victim's address, and could have it send receipts
+    /// (three for each small request) and forwarded packets there.
+    #[test]
+    fn test_a_copy_of_an_init_is_answered_only_where_its_link_is() {
+        let (tables, keys) = relay();
+        let (victim, attacker) = (host(1), host(2));
+        let client_secret = EphemeralSecret::random_from_rng(OsRng);
+        let client_ephemeral = X25519PublicKey::from(&client_secret);
+        let init = relay_link::handshake_init(&client_ephemeral);
+        let to_victim = handle_request(&tables, &keys, victim, &init)
+            .unwrap()
+            .unwrap();
+        let err = handle_request(&tables, &keys, attacker, &init).unwrap_err();
+        assert!(err.to_string().contains("another address"), "{err}");
+        assert_eq!(tables.lock().unwrap().link_count(), 1, "no second link");
+
+        // Had it got the reply, the attacker could ask for receipts as the
+        // victim. (Its own copies still get it where it is.)
+        let (session, relay_ephemeral) = relay_link::parse_handshake_resp(
+            &to_victim,
+            &keys.identity.verifying_key(),
+            &client_ephemeral,
+        )
+        .unwrap();
+        let link_keys =
+            relay_link::derive_link_keys(client_secret.diffie_hellman(&relay_ephemeral).as_bytes());
+        let mut stolen = LinkEnd::new(Side::Client, link_keys, session);
+        let request = stolen.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]);
+        assert!(
+            handle_request(&tables, &keys, victim, &request)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            handle_request(&tables, &keys, victim, &init).unwrap(),
+            Some(to_victim)
+        );
+    }
+
+    /// A receipt only counts message packets the relay queued: one dropped
+    /// as its recipient's queue was full mustn't show as delivered.
+    #[test]
+    fn test_receipts_do_not_count_packets_dropped_for_a_full_queue() {
+        let (tables, keys) = relay();
+        let mut link = link_up(&tables, &keys, addr(50000));
+        let first = link.end.next_packet_number(Lane::Paced);
+        let inner = vec![0xAB; 64 * 1024];
+        let fits = (MAX_QUEUED_BYTES_PER_TOKEN / inner.len()) as u64;
+        for _ in 0..fits + 2 {
+            let packet =
+                relay_link::data_packet(&mut link.end, Lane::Paced, &[7; 16], None, &inner);
+            handle_request(&tables, &keys, addr(50000), &packet).unwrap();
+        }
+        let request = link.end.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]);
+        let reply = handle_request(&tables, &keys, addr(50000), &request)
+            .unwrap()
+            .unwrap();
+        let receipt = relay_link::Receipt::from_bytes(&link.receive(&reply).1).unwrap();
+        for i in 0..fits + 2 {
+            assert_eq!(receipt.taken_in(first + i), Some(i < fits), "packet {i}");
+        }
+    }
+
+    /// Each address gets a burst of handshakes, then a steady trickle, so
+    /// no one sender can take the relay's CPU. Others aren't held up.
+    #[test]
+    fn test_handshakes_from_one_address_are_rate_limited() {
+        let (tables, keys) = relay();
+        let new_init = || {
+            relay_link::handshake_init(&X25519PublicKey::from(&EphemeralSecret::random_from_rng(
+                OsRng,
+            )))
+        };
+        let mut allowed = 0;
+        while handle_request(&tables, &keys, addr(50000), &new_init()).is_ok() {
+            allowed += 1;
+            assert!(allowed <= 21, "never stops");
+        }
+        assert!(allowed >= 20, "a burst first: {allowed}");
+        let err = handle_request(&tables, &keys, addr(50001), &new_init()).unwrap_err();
+        assert!(err.to_string().contains("Too many"), "{err}");
+        assert!(handle_request(&tables, &keys, host(1), &new_init()).is_ok());
+    }
+
+    /// Sync acks go out several times, like handshake replies; challenges,
+    /// which the client's next sync asks for again anyway, go once.
+    #[test]
+    fn test_sync_acks_go_out_several_times() {
+        let (tables, keys) = relay();
+        let token_key = random_signing_key();
+        let mut link = link_up(&tables, &keys, addr(50000));
+        let sync = link.sync(&token_key, Vec::new());
+        let ack = handle_request(&tables, &keys, addr(50000), &sync)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copies_of(&ack), REPLY_COPIES);
+        let moved = link.sync(&token_key, Vec::new());
+        let challenge = handle_request(&tables, &keys, addr(50001), &moved)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copies_of(&challenge), 1);
+    }
+
+    /// A client asking which of its message packets arrived gets a receipt
+    /// saying so, several times over, at its link's address only.
+    #[test]
+    fn test_receipt_requests_say_which_message_packets_arrived() {
+        let (tables, keys) = relay();
+        let mut link = link_up(&tables, &keys, addr(50000));
+        let first = link.end.next_packet_number(Lane::Paced);
+        for i in 0..6u64 {
+            let packet = relay_link::data_packet(&mut link.end, Lane::Paced, &[7; 16], None, b"x");
+            if i != 2 {
+                let _ = handle_request(&tables, &keys, addr(50000), &packet).unwrap();
+            }
+        }
+
+        let request = link.end.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]);
+        let reply = handle_request(&tables, &keys, addr(50000), &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copies_of(&reply), REPLY_COPIES);
+        let (header, plaintext) = link.end.open(&reply).unwrap();
+        assert_eq!(header.packet_type, TYPE_RECEIPT);
+        let receipt = relay_link::Receipt::from_bytes(&plaintext).unwrap();
+        for i in 0..6 {
+            assert_eq!(receipt.taken_in(first + i), Some(i != 2), "packet {i}");
+        }
+
+        // Not to another address, even with a fresh request.
+        let elsewhere = link.end.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]);
+        assert!(handle_request(&tables, &keys, addr(50001), &elsewhere).is_err());
+    }
+
+    /// The relay's identity key is written for its owner's eyes only.
+    #[cfg(unix)]
+    #[test]
+    fn test_identity_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("relay-identity-mode-{}", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        let _ = fs::remove_file(&path);
+        load_or_create_identity(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// An identity file an older relay left readable by everyone is made
+    /// private when the relay loads it.
+    #[cfg(unix)]
+    #[test]
+    fn test_an_existing_identity_file_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("relay-identity-old-{}", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        let _ = fs::remove_file(&path);
+        let created = load_or_create_identity(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let loaded = load_or_create_identity(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(created.verifying_key(), loaded.verifying_key());
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

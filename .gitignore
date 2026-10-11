@@ -10,3 +10,7 @@
 
 # Stray npm installs (nothing in this repo uses npm)
 node_modules/
+/.repowise/
+/.claude/
+/.vscode/
+.mcp.json

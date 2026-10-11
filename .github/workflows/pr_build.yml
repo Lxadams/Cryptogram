@@ -25,6 +25,7 @@ jobs:
         # Add all your subfolder paths containing a Cargo.toml here
         project-path:
           - "code/server"
+          - "code/relay-link"
           - "code/fec"
           - "code/client"
           - "code/frontend"
@@ -64,6 +65,17 @@ jobs:
 
       - name: Check code formatting
         run: cargo fmt --check
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # Known vulnerabilities (the RustSec database, as `cargo audit` uses),
+      # unmaintained or yanked crates, licences and where crates come from.
+      # The rules are in code/deny.toml.
+      - name: Check dependencies
+        run: cargo deny --config "${{ github.workspace }}/code/deny.toml" check
 
       - name: Run Clippy (Linter)
         run: cargo clippy -- -D warnings

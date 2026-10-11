@@ -10,7 +10,12 @@
 #
 # --mobile bakes the address into the app (see server_addr_raw() in
 # code/frontend/src-tauri/src/commands.rs), so build again if the relay's IP
-# changes. It needs the Android toolchain from code/frontend/ANDROID.md
+# changes. The relay's public key is baked in too (relay_pubkey_hex()): read
+# from the relay's identity file when it runs on this machine, otherwise
+# pass the "Server Static Pubkey" it prints as SERVER_PUBKEY:
+#
+#   SERVER_PUBKEY=<hex> ./runpeer-lan.sh --mobile 192.168.1.20
+# It needs the Android toolchain from code/frontend/ANDROID.md
 # steps 1-4, and does the rest of that guide itself.
 set -euo pipefail
 
@@ -32,6 +37,15 @@ lan_ip() {
 mode="$1"
 server="${2:-}"
 case "$mode" in --pc | --mobile) ;; *) usage ;; esac
+
+if [ -z "${SERVER_PUBKEY:-}" ]; then
+  if [ -n "$server" ]; then
+    echo "error: set SERVER_PUBKEY to the \"Server Static Pubkey\" the relay at $server prints." >&2
+    exit 1
+  fi
+  SERVER_PUBKEY="$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-pubkey)"
+fi
+export SERVER_PUBKEY
 
 if [ -z "$server" ]; then
   if command -v wslinfo >/dev/null && [ "$(wslinfo --networking-mode)" != mirrored ]; then
@@ -76,7 +90,7 @@ fi
 
 cargo tauri android build --debug --apk --target aarch64
 apk="$(find src-tauri/gen/android/app/build/outputs/apk -name '*debug*.apk' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)"
-echo "Built $apk (relay $SERVER_ADDR baked in)."
+echo "Built $apk (relay $SERVER_ADDR and its public key baked in)."
 
 # Install over USB if a phone is connected; otherwise leave the APK where
 # it's easy to get onto the phone (ANDROID.md step 8).

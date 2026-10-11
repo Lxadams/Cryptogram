@@ -115,15 +115,21 @@ from git afterwards. They're all under
 
 The folder's own `.gitignore` already excludes build output.
 
-## 6. Set the relay address
+## 6. Set the relay address and key
 
 An Android app can't be launched with environment variables. Instead, the
-relay address is read when you **build** the app and baked into it (see
-`server_addr_raw()` in `src-tauri/src/commands.rs`):
+relay address and its public key are read when you **build** the app and
+baked into it (see `server_addr_raw()` and `relay_pubkey_hex()` in
+`src-tauri/src/commands.rs`):
 
 ```bash
 export SERVER_ADDR=relay.example.com:443   # TODO: replace with the production relay
+export SERVER_PUBKEY=<hex>                 # the relay's "Server Static Pubkey"
 ```
+
+The app only connects to a relay with that key; it never asks the relay
+for it. `./runpeer-lan.sh --mobile` sets `SERVER_PUBKEY` itself when the
+relay runs on the same machine.
 
 - The format is `host:port`, using a hostname or an IP. Don't include
   `https://`: the app talks to the relay over a raw UDP socket.
@@ -193,12 +199,13 @@ cargo tauri android build --debug --apk --target aarch64
    them, the app still receives messages in the background but can't tell
    you about them.
 2. **Create identity**, then log in, the same way as on desktop.
-3. On the **Connect** screen, paste the relay's public key. It's the
-   `Server Static Pubkey:` line the server prints when it starts. Typing 64
-   hex characters on a phone is painful, so send it to yourself through a
-   notes or chat app and paste it.
+3. Press **Connect**. The relay's public key is already built in (step 6).
 4. Add contacts with **Scan QR code** (Android asks for camera permission
-   the first time) or by pasting a routing token and Ed25519 key.
+   the first time) or by pasting a routing token and Ed25519 key. You each
+   add the other; a contact stays "pending" until both have, then shows
+   "connecting" while the session is set up. The app sends its
+   KeyExchange again by itself if a packet goes missing, and adding them
+   again, from either side, restarts the setup where it stopped.
 
 ## Receiving in the background
 
@@ -207,11 +214,10 @@ that keeps it connected to the relay when it's not on screen. Android
 shows this as an ongoing "Connected" notification.
 
 - A message that arrives while the app is in the background shows a "New
-  message" notification. It names the sender but never shows the text.
-  Opening the app clears it.
-- While the app isn't on screen, it stops telling your contacts you're
-  online, to save battery. They see you as offline until you open it
-  again, but their messages still reach you.
+  message" notification. It never shows the text. It says who the message
+  is from only if you turn that on, under **Settings** on your identity
+  card, since notifications can show on the lock screen. Opening the app
+  clears it.
 - Swiping the app away from the recent-apps screen doesn't log you out. The
   app keeps receiving, and reopening it goes straight back to your chats.
 - **Log out** stops the service and the notification.
@@ -234,6 +240,18 @@ shows this as an ongoing "Connected" notification.
   delete the identity you're logged into.
 - **No backups.** Android's cloud backup and phone-to-phone transfer are
   switched off for this app, so identities never leave the phone.
+- **Message marks.** A message you send gets a ✓ once the relay has it, or
+  a red ! if it didn't get there within 30 seconds (send it again). The ✓
+  doesn't mean they've read it, or even received it yet: the relay holds it
+  until their phone takes it. Every message shows the time it was sent or
+  arrived.
+- **No screenshots.** The app blocks screenshots and screen recording, and
+  shows as blank on the recent-apps screen, so no other app can capture
+  your chats. That includes your QR code: show it to people in person.
+- **No Google scanner unless you want it.** The QR scanner decodes with the
+  app's own code. Ticking "Also use this device's own scanner" adds
+  Android's (Google Play services' ML Kit), which copes better with blur
+  and glare.
 
 ## Updating the app
 
@@ -277,6 +295,20 @@ must be on the same Wi-Fi.
    talking to each other. This is common on campus and office networks.
    Turn on the phone's hotspot, connect the PC to it, and run steps 1 and 3
    again.
+
+**Over a bad network.** Start the relay with `./runserver-lan-lossy.sh`
+instead of `./runserver-lan.sh` in step 1. It drops 70% of packets each
+way, and phones connect to it the same way.
+- **Changing the loss:** type a new one and press Enter, `0` for none.
+  Adding a contact at 70% can take many minutes, as its packets are only
+  resent after 30 s, then 60 s and so on. So add contacts at `0`, then type
+  `0.7`.
+- **Jamming only one phone:** port 4431 reaches the relay with no loss.
+  Build the other phone with the `:4431` command `./runserver-lan-lossy.sh`
+  prints, `SERVER_PUBKEY=<key> ./runpeer-lan.sh --mobile <this PC's IP>:4431`
+  (with an address, it needs the key).
+  On WSL, also allow UDP 4431 as in step 2.3, with another `-Name` and
+  `-LocalPorts 4431`.
 
 ## Troubleshooting
 

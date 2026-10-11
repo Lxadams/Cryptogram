@@ -6,13 +6,22 @@ services:
     container_name: server
     ports:
       - "443:443/udp"
-      # GET /pubkey (see spawn_pubkey_http_task in server/src/main.rs)
-      - "443:443/tcp"
     environment:
       - RUST_LOG=info
     volumes:
       - server_identity:/data
     restart: unless-stopped
+    # Locked down as in deploy.yml: read-only apart from /data, no
+    # capabilities, no core dumps, and its unprivileged user may bind 443.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
 
   client:
     build:

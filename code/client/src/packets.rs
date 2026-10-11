@@ -1,8 +1,7 @@
+use crate::pq::{Ciphertext, PublicKey};
 use crate::{RoutingToken, UserIdentity};
 use anyhow::{Result, anyhow};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
-use pqcrypto_kyber::kyber768::{Ciphertext, PublicKey};
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
@@ -79,14 +78,18 @@ fn unsigned() -> Signature {
 }
 
 // ============================================================
-// KeyExchangePayload (0x02) — 1384 bytes
+// KeyExchangePayload (0x02) — 1393 bytes
 // ============================================================
 
 /// Fixed on-wire width of the self-chosen display name carried in
 /// `KeyExchangePayload`. Plenty for a pseudonym (e.g. "alice"); longer
 /// names are truncated by `encode_name`.
 const NAME_LEN: usize = 32;
-const KX_LEN: usize = HEADER_LEN + 32 + 32 + KYBER_PUB_LEN + NAME_LEN + SIG_LEN;
+const KX_LEN: usize = HEADER_LEN + 32 + 32 + KYBER_PUB_LEN + NAME_LEN + 1 + 4 + 4 + SIG_LEN;
+
+// Bits of a KeyExchange's flags byte.
+const KX_HAS_PEER_KEYS: u8 = 1;
+const KX_HAS_SESSION: u8 = 2;
 
 /// Right-pads `name`'s UTF-8 bytes into a fixed `NAME_LEN` buffer,
 /// truncating on a char boundary if it doesn't fit.
@@ -119,6 +122,17 @@ pub struct KeyExchangePayload {
     /// none was set. Part of the signed message, so a blind relay can't
     /// tamper with or inject one.
     pub name: String,
+    /// Whether the sender already has the target's KeyExchange. `false`
+    /// asks the target to send theirs (again); see
+    /// `Client::handle_key_exchange`.
+    pub has_peer_keys: bool,
+    /// The sender's add ID for the target (see `AddIds` in lib.rs).
+    pub add_id: u32,
+    /// The session the sender has with the target, named by the target's
+    /// add ID it was made for, or `None` if it has none. From the
+    /// responder, `None` asks for a session, and the establisher's own add
+    /// ID confirms the one it offered.
+    pub session: Option<u32>,
     pub signature: Signature,
 }
 
@@ -135,6 +149,16 @@ impl KeyExchangePayload {
         out.extend_from_slice(self.x25519_public.as_bytes());
         out.extend_from_slice(self.kyber_public.as_bytes());
         out.extend_from_slice(&encode_name(&self.name));
+        let mut flags = 0;
+        if self.has_peer_keys {
+            flags |= KX_HAS_PEER_KEYS;
+        }
+        if self.session.is_some() {
+            flags |= KX_HAS_SESSION;
+        }
+        out.push(flags);
+        out.extend_from_slice(&self.add_id.to_be_bytes());
+        out.extend_from_slice(&self.session.unwrap_or(0).to_be_bytes());
         out
     }
 
@@ -145,6 +169,13 @@ impl KeyExchangePayload {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let (routing_token, target_token, timestamp, body, signature) =
             split_payload(bytes, KX_LEN, "key exchange")?;
+        let (body, ids) = body.split_at(body.len() - 8);
+        let (body, flags) = body.split_at(body.len() - 1);
+        if flags[0] & !(KX_HAS_PEER_KEYS | KX_HAS_SESSION) != 0 {
+            return Err(anyhow!("Invalid key exchange flags"));
+        }
+        let add_id = u32::from_be_bytes(ids[..4].try_into().unwrap());
+        let session_add_id = u32::from_be_bytes(ids[4..].try_into().unwrap());
         let ed25519_public = VerifyingKey::from_bytes(body[0..32].try_into().unwrap())
             .map_err(|_| anyhow!("Invalid Ed25519"))?;
         let x25519_public = X25519PublicKey::from(<[u8; 32]>::try_from(&body[32..64]).unwrap());
@@ -159,11 +190,21 @@ impl KeyExchangePayload {
             x25519_public,
             kyber_public,
             name,
+            has_peer_keys: flags[0] & KX_HAS_PEER_KEYS != 0,
+            add_id,
+            session: (flags[0] & KX_HAS_SESSION != 0).then_some(session_add_id),
             signature,
         })
     }
 
-    pub fn generate(identity: &UserIdentity, target_token: RoutingToken, name: &str) -> Self {
+    pub fn generate(
+        identity: &UserIdentity,
+        target_token: RoutingToken,
+        name: &str,
+        has_peer_keys: bool,
+        add_id: u32,
+        session: Option<u32>,
+    ) -> Self {
         let mut payload = Self {
             routing_token: identity.routing_token,
             target_token,
@@ -172,6 +213,9 @@ impl KeyExchangePayload {
             x25519_public: identity.x25519_public,
             kyber_public: identity.kyber_public,
             name: name.to_string(),
+            has_peer_keys,
+            add_id,
+            session,
             signature: unsigned(),
         };
         payload.signature = identity.ed25519_secret.sign(&payload.signed_bytes());
@@ -184,10 +228,10 @@ impl KeyExchangePayload {
 }
 
 // ============================================================
-// SessionEstablishPayload (0x04) — 1224 bytes
+// SessionEstablishPayload (0x04) — 1232 bytes
 // ============================================================
 
-const EST_LEN: usize = HEADER_LEN + KYBER_CT_LEN + 32 + SIG_LEN;
+const EST_LEN: usize = HEADER_LEN + KYBER_CT_LEN + 32 + 4 + 4 + SIG_LEN;
 
 pub struct SessionEstablishPayload {
     pub routing_token: RoutingToken,
@@ -195,6 +239,10 @@ pub struct SessionEstablishPayload {
     pub timestamp: u64,
     pub kyber_ct: Ciphertext,
     pub eph_x25519_pub: X25519PublicKey,
+    /// The add IDs (see `AddIds` in lib.rs) this session was made for: the
+    /// establisher's (the sender's) and the responder's.
+    pub establisher_add_id: u32,
+    pub responder_add_id: u32,
     pub signature: Signature,
 }
 
@@ -209,6 +257,8 @@ impl SessionEstablishPayload {
         );
         out.extend_from_slice(self.kyber_ct.as_bytes());
         out.extend_from_slice(self.eph_x25519_pub.as_bytes());
+        out.extend_from_slice(&self.establisher_add_id.to_be_bytes());
+        out.extend_from_slice(&self.responder_add_id.to_be_bytes());
         out
     }
 
@@ -221,14 +271,18 @@ impl SessionEstablishPayload {
             split_payload(bytes, EST_LEN, "session establish")?;
         let kyber_ct = Ciphertext::from_bytes(&body[..KYBER_CT_LEN])
             .map_err(|_| anyhow!("Invalid Kyber CT"))?;
-        let eph_x25519_pub =
-            X25519PublicKey::from(<[u8; 32]>::try_from(&body[KYBER_CT_LEN..]).unwrap());
+        let ids = &body[KYBER_CT_LEN + 32..];
+        let eph_x25519_pub = X25519PublicKey::from(
+            <[u8; 32]>::try_from(&body[KYBER_CT_LEN..KYBER_CT_LEN + 32]).unwrap(),
+        );
         Ok(Self {
             routing_token,
             target_token,
             timestamp,
             kyber_ct,
             eph_x25519_pub,
+            establisher_add_id: u32::from_be_bytes(ids[..4].try_into().unwrap()),
+            responder_add_id: u32::from_be_bytes(ids[4..].try_into().unwrap()),
             signature,
         })
     }
@@ -238,6 +292,8 @@ impl SessionEstablishPayload {
         target_token: RoutingToken,
         kyber_ct: Ciphertext,
         eph_x25519_pub: X25519PublicKey,
+        establisher_add_id: u32,
+        responder_add_id: u32,
     ) -> Self {
         let mut payload = Self {
             routing_token: identity.routing_token,
@@ -245,6 +301,8 @@ impl SessionEstablishPayload {
             timestamp: now_secs(),
             kyber_ct,
             eph_x25519_pub,
+            establisher_add_id,
+            responder_add_id,
             signature: unsigned(),
         };
         payload.signature = identity.ed25519_secret.sign(&payload.signed_bytes());
@@ -352,70 +410,6 @@ impl PQInjectPayload {
     }
 }
 
-// ============================================================
-// PresencePayload (0x06) — 104 bytes
-// ============================================================
-
-const PRESENCE_LEN: usize = HEADER_LEN + SIG_LEN;
-
-/// A lightweight "I'm still here" signal sent periodically to each
-/// established contact so their client can show an online/offline marker.
-/// Deliberately outside the E2E double ratchet (unlike 0x01 Msg) — it
-/// doesn't need confidentiality (liveness isn't secret, and the relay
-/// already sees routing-token traffic patterns), only authenticity and
-/// freshness, so it's just signed like KeyExchange/PQInject rather than
-/// consuming a ratchet step (which would also trigger PQ re-injection
-/// every `PQ_INJECT_INTERVAL` pings for no reason).
-pub struct PresencePayload {
-    pub routing_token: RoutingToken,
-    pub target_token: RoutingToken,
-    pub timestamp: u64,
-    pub signature: Signature,
-}
-
-impl PresencePayload {
-    fn signed_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(PRESENCE_LEN);
-        write_header(
-            &mut out,
-            &self.routing_token,
-            &self.target_token,
-            self.timestamp,
-        );
-        out
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        with_signature(self.signed_bytes(), &self.signature)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let (routing_token, target_token, timestamp, _body, signature) =
-            split_payload(bytes, PRESENCE_LEN, "presence")?;
-        Ok(Self {
-            routing_token,
-            target_token,
-            timestamp,
-            signature,
-        })
-    }
-
-    pub fn generate(identity: &UserIdentity, target_token: RoutingToken) -> Self {
-        let mut payload = Self {
-            routing_token: identity.routing_token,
-            target_token,
-            timestamp: now_secs(),
-            signature: unsigned(),
-        };
-        payload.signature = identity.ed25519_secret.sign(&payload.signed_bytes());
-        payload
-    }
-
-    pub fn verify(&self, ed25519_pub: &VerifyingKey) -> Result<()> {
-        check_signature(&self.signed_bytes(), &self.signature, ed25519_pub)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,10 +418,15 @@ mod tests {
     /// must still parse these), so pin them against the documented values.
     #[test]
     fn payload_sizes_match_the_wire_format() {
-        assert_eq!(KX_LEN, 1384);
-        assert_eq!(EST_LEN, 1224);
+        assert_eq!(KX_LEN, 1393);
+        assert_eq!(EST_LEN, 1232);
         assert_eq!(PQI_LEN, 1200);
-        assert_eq!(PRESENCE_LEN, 104);
+        // ML-KEM-768 (FIPS 203) has the sizes round-3 Kyber-768 had, and the
+        // same key layout, so payloads kept their sizes and identities saved
+        // with Kyber keys still load: they're valid ML-KEM keys.
+        assert_eq!(crate::pq::PUBLIC_KEY_LEN, KYBER_PUB_LEN);
+        assert_eq!(crate::pq::CIPHERTEXT_LEN, KYBER_CT_LEN);
+        assert_eq!(crate::pq::SECRET_KEY_LEN, 2400);
     }
 
     /// Byte-for-byte layout pin: the same fields concatenated by hand, in
@@ -436,7 +435,7 @@ mod tests {
     fn key_exchange_bytes_match_the_original_layout() {
         let identity = UserIdentity::generate();
         let target = [9u8; 16];
-        let kx = KeyExchangePayload::generate(&identity, target, "alice");
+        let kx = KeyExchangePayload::generate(&identity, target, "alice", true, 7, Some(9));
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&identity.routing_token);
@@ -446,6 +445,9 @@ mod tests {
         expected.extend_from_slice(identity.x25519_public.as_bytes());
         expected.extend_from_slice(identity.kyber_public.as_bytes());
         expected.extend_from_slice(&encode_name("alice"));
+        expected.push(KX_HAS_PEER_KEYS | KX_HAS_SESSION);
+        expected.extend_from_slice(&7u32.to_be_bytes());
+        expected.extend_from_slice(&9u32.to_be_bytes());
         identity
             .ed25519_public
             .verify(&expected, &kx.signature)
@@ -455,6 +457,25 @@ mod tests {
         assert_eq!(kx.to_bytes(), expected);
         let parsed = KeyExchangePayload::from_bytes(&expected).unwrap();
         assert_eq!(parsed.name, "alice");
+        assert!(parsed.has_peer_keys);
+        assert_eq!((parsed.add_id, parsed.session), (7, Some(9)));
         assert!(parsed.verify(&identity.ed25519_public).is_ok());
+
+        let mut bad_flag = expected;
+        bad_flag[KX_LEN - SIG_LEN - 9] = 4;
+        assert!(KeyExchangePayload::from_bytes(&bad_flag).is_err());
+    }
+
+    /// No session is `None`, not a session for add ID 0 (which a contact
+    /// added before add IDs existed has).
+    #[test]
+    fn key_exchange_tells_no_session_from_add_id_zero() {
+        let identity = UserIdentity::generate();
+        for session in [None, Some(0), Some(u32::MAX)] {
+            let kx = KeyExchangePayload::generate(&identity, [9u8; 16], "", false, 0, session);
+            let parsed = KeyExchangePayload::from_bytes(&kx.to_bytes()).unwrap();
+            assert_eq!(parsed.session, session);
+            assert!(!parsed.has_peer_keys);
+        }
     }
 }

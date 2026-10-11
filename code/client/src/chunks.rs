@@ -80,6 +80,12 @@ struct Chunk<'a> {
     data: &'a [u8],
 }
 
+/// Which chunk of its message `chunk` is: `(index, count)`.
+pub fn position(chunk: &[u8]) -> Result<(usize, usize)> {
+    let chunk = parse(chunk)?;
+    Ok((chunk.index, chunk.count))
+}
+
 fn parse(chunk: &[u8]) -> Result<Chunk<'_>> {
     if chunk.len() < HEADER_LEN {
         return Err(anyhow!("Chunk is shorter than its header"));

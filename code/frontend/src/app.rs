@@ -7,7 +7,7 @@
 //! Screens:
 //! 1. Login    — choose a username + passcode, resolving which saved
 //!    identity (if any) to use. See `LoginScreen`'s doc comment.
-//! 2. Connect  — fetch the relay's Ed25519 pubkey, perform the link handshake.
+//! 2. Connect  — perform the link handshake with the relay.
 //! 3. Main     — show our own identity, manage contacts, chat with one peer.
 //!
 //! State lives in a handful of top-level signals passed down as props,
@@ -39,6 +39,69 @@ struct ChatMessage {
     id: u64,
     from_me: bool,
     text: String,
+    /// When it was sent or arrived, in Unix milliseconds.
+    timestamp_ms: Option<i64>,
+    /// For a message we sent, whether the relay has confirmed it has it.
+    status: Option<SendStatus>,
+}
+
+/// What became of a message we sent: shown as nothing yet, a check mark, or
+/// a red exclamation mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SendStatus {
+    /// Waiting for the relay to confirm it has it.
+    Sending,
+    /// The relay has enough of it to deliver.
+    Sent,
+    /// The relay didn't confirm it in time.
+    Failed,
+}
+
+impl SendStatus {
+    /// From its name in `api::StoredMessageDto` and
+    /// `api::SentMessageUpdateDto`.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "sending" => Some(SendStatus::Sending),
+            "sent" => Some(SendStatus::Sent),
+            "failed" => Some(SendStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// `timestamp_ms` as the time of day in the user's locale ("14:05", or
+/// "2:05 pm"), with the date in front if it isn't today.
+fn format_time(timestamp_ms: i64) -> String {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(timestamp_ms as f64));
+    let options = |fields: &[(&str, &str)]| {
+        let object = js_sys::Object::new();
+        for (key, value) in fields {
+            let _ = js_sys::Reflect::set(&object, &(*key).into(), &(*value).into());
+        }
+        wasm_bindgen::JsValue::from(object)
+    };
+    let time: String = date
+        .to_locale_time_string_with_options(
+            "default",
+            &options(&[("hour", "2-digit"), ("minute", "2-digit")]),
+        )
+        .into();
+    let now = js_sys::Date::new_0();
+    let today = date.get_full_year() == now.get_full_year()
+        && date.get_month() == now.get_month()
+        && date.get_date() == now.get_date();
+    if today {
+        time
+    } else {
+        let day: String = date
+            .to_locale_date_string(
+                "default",
+                &options(&[("day", "numeric"), ("month", "short")]),
+            )
+            .into();
+        format!("{day}, {time}")
+    }
 }
 
 fn next_message_id() -> u64 {
@@ -655,8 +718,8 @@ fn CreateIdentityScreen(
 }
 
 /// Screen 1: perform the link handshake with the relay. The relay's Ed25519
-/// pubkey is fetched from the relay itself and pinned on first connect (see
-/// `bootstrap` in src-tauri/src/commands.rs), so there's nothing to paste.
+/// pubkey is built into the app (see `relay_pubkey_hex` in
+/// src-tauri/src/commands.rs), so there's nothing to paste.
 #[component]
 fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
@@ -678,8 +741,8 @@ fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView 
         <section class="connect-screen">
             <p>"Connect to the relay server to generate/load your identity."</p>
             <p class="hint">
-                "Run the server (runserver.sh) first. Its public key is fetched "
-                "automatically and remembered after the first connect."
+                "Run the server (runserver.sh) first. The app checks it against "
+                "the public key it was built with."
             </p>
             <button
                 disabled=move || connecting.get()
@@ -698,6 +761,12 @@ fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView 
 #[component]
 fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     let contacts = RwSignal::new(Vec::<api::ContactDto>::new());
+    // People who tried to connect but aren't contacts yet, and whether
+    // requests are muted (see `ConnectionRequestNotice`), and whether the QR
+    // scanner is open. All live here so the notice can open the contact
+    // panel's scanner, and the panel can unmute.
+    let requests = RwSignal::new(api::ConnectionRequestsDto::default());
+    let scanning = RwSignal::new(false);
     let selected = RwSignal::new(None::<String>);
     // token_hex -> transcript. Populated by both outgoing sends (added
     // immediately, optimistically), incoming polls (added on arrival), and
@@ -708,6 +777,11 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     // state, deleted the conversation, or reconnected from scratch.
     let messages = RwSignal::new(HashMap::<String, Vec<ChatMessage>>::new());
     let history_loaded_for = RwSignal::new(HashSet::<String>::new());
+    // Send statuses that came before their message was added: `send_message`
+    // returns only once the first packet is out, and a short message can be
+    // confirmed by then. Keyed by message id; the send takes its status
+    // from here (see `ChatPanel`).
+    let early_updates = StoredValue::new(HashMap::<u64, SendStatus>::new());
 
     Effect::new(move |_| {
         let Some(token) = selected.get() else {
@@ -737,6 +811,8 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                             id: history_message_id(m.id),
                             from_me: m.from_me,
                             text: m.text,
+                            timestamp_ms: Some(m.timestamp_ms),
+                            status: m.status.as_deref().and_then(SendStatus::from_name),
                         })
                         .filter(|m| !existing_ids.contains(&m.id))
                         .collect();
@@ -764,6 +840,11 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
             {
                 contacts.set(list);
             }
+            if let Ok(list) = api::connection_requests().await
+                && requests.try_with_untracked(|current| current != &list) == Some(true)
+            {
+                requests.set(list);
+            }
             if let Ok(incoming) = api::poll_inbox().await
                 && !incoming.is_empty()
             {
@@ -785,7 +866,33 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                                 .unwrap_or_else(next_message_id),
                             from_me: false,
                             text: msg.text,
+                            timestamp_ms: Some(msg.timestamp_ms),
+                            status: None,
                         });
+                    }
+                });
+            }
+            // Whether the relay got what we sent: a check mark, or a red
+            // exclamation mark if it didn't in time.
+            if let Ok(updates) = api::sent_message_updates().await
+                && !updates.is_empty()
+            {
+                messages.update(|map| {
+                    for update in updates {
+                        let id = history_message_id(update.id);
+                        let status = SendStatus::from_name(&update.status);
+                        if let Some(message) = map.values_mut().flatten().find(|m| m.id == id) {
+                            message.status = status;
+                        } else if let Some(status) = status {
+                            // Its `send_message` hasn't returned yet (or
+                            // failed, so it's never added: hence the bound).
+                            let _ = early_updates.try_update_value(|early| {
+                                if early.len() >= 64 {
+                                    early.clear();
+                                }
+                                early.insert(id, status);
+                            });
+                        }
                     }
                 });
             }
@@ -803,9 +910,20 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         <section class="main-screen" class:chat-open=move || selected.get().is_some()>
             <IdentityCard identity=identity />
             <div class="columns">
-                <ContactPanel contacts=contacts selected=selected />
-                <ChatPanel contacts=contacts selected=selected messages=messages />
+                <ContactPanel
+                    contacts=contacts
+                    selected=selected
+                    requests=requests
+                    scanning=scanning
+                />
+                <ChatPanel
+                    contacts=contacts
+                    selected=selected
+                    messages=messages
+                    early_updates=early_updates
+                />
             </div>
+            <ConnectionRequestNotice requests=requests scanning=scanning selected=selected />
         </section>
     }
 }
@@ -819,12 +937,22 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
 /// automatically as part of the KeyExchange once you connect to someone,
 /// so peers see "alice" in their contact list without typing anything
 /// themselves (see `Client::local_name` / `contact_names` in
-/// code/client/src/lib.rs).
+/// code/client/src/lib.rs). Settings fold away under it too, where there
+/// are any: so far just whether notifications name senders, on devices
+/// that post them.
 #[component]
 fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
     let show_qr = RwSignal::new(false);
-    let code = contact_code::encode(&identity.routing_token, &identity.ed25519_public);
-    let qr_svg = StoredValue::new(qr::svg_for(&code));
+    let qr_svg = StoredValue::new(
+        contact_code::encode(&identity.routing_token, &identity.ed25519_public)
+            .and_then(|code| qr::svg_for(&code)),
+    );
+    let notifications = RwSignal::new(None::<api::NotificationSettingsDto>);
+    leptos::task::spawn_local(async move {
+        if let Ok(settings) = api::notification_settings().await {
+            notifications.try_set(Some(settings));
+        }
+    });
 
     view! {
         <div class="identity-card">
@@ -857,6 +985,29 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
                     <CopyButton value=identity.ed25519_public />
                 </p>
             </details>
+            // Read once it's loaded, then left to the checkbox: setting the
+            // signal again would redraw the panel and fold it shut.
+            {move || notifications.get().filter(|n| n.posted).map(|n| view! {
+                <details class="identity-details">
+                    <summary>"Settings"</summary>
+                    <label class="setting">
+                        <input
+                            type="checkbox"
+                            prop:checked=n.with_names
+                            on:change=move |ev| {
+                                let on = event_target_checked(&ev);
+                                leptos::task::spawn_local(async move {
+                                    let _ = api::set_notify_with_names(on).await;
+                                });
+                            }
+                        />
+                        "Say who each message is from in notifications"
+                    </label>
+                    <p class="hint">
+                        "Off by default: notifications can show on the lock screen, where anyone holding your phone can read them."
+                    </p>
+                </details>
+            })}
             <Show when=move || show_qr.get()>
                 <Modal title="Your QR code" on_close=Callback::new(move |()| show_qr.set(false))>
                     {match qr_svg.get_value() {
@@ -864,11 +1015,97 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
                         Err(e) => view! { <p class="error">"Couldn't draw QR code: " {e}</p> }.into_any(),
                     }}
                     <p class="hint">
-                        "Have your contact tap \"Scan QR code\" and point their camera here."
+                        "Have your contact tap \"Scan QR code\" and point their camera here, "
+                        "then scan theirs."
                     </p>
                 </Modal>
             </Show>
         </div>
+    }
+}
+
+/// Pops up when someone who isn't a contact tries to connect (see
+/// `Client::connection_requests`): the first one waiting, unless requests
+/// are muted. Their request was ignored, and scanning their code is how to
+/// accept it, so this only offers the scanner. "Not now" keeps that person
+/// from popping up again for a day, and muting stops them all until it's
+/// undone in the contact list; the client also caps how many new ones it
+/// lists, so nobody can keep these coming by making new identities. Just
+/// closing it (the X, a click outside it, or Escape) only hides that
+/// request until the app restarts, as a stray tap shouldn't put someone
+/// off for a day. Just the start of their token is shown: anything else
+/// they sent, like a name, is unverified until that scan. Hidden while the
+/// scanner is open.
+#[component]
+fn ConnectionRequestNotice(
+    requests: RwSignal<api::ConnectionRequestsDto>,
+    scanning: RwSignal<bool>,
+    selected: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let closed = RwSignal::new(HashSet::<String>::new());
+    move || {
+        let (first, waiting) = requests.with(|r| {
+            let open: Vec<&String> = r
+                .tokens
+                .iter()
+                .filter(|token| !closed.with(|closed| closed.contains(*token)))
+                .collect();
+            (open.first().map(|token| (*token).clone()), open.len())
+        });
+        let token = first.filter(|_| !scanning.get())?;
+        let short = format!("{}...", token.chars().take(8).collect::<String>());
+        let token_to_close = token.clone();
+        let close = Callback::new(move |()| {
+            closed.update(|closed| {
+                closed.insert(token_to_close.clone());
+            });
+        });
+        let dismiss = Callback::new(move |()| {
+            let token = token.clone();
+            requests.update(|r| r.tokens.retain(|t| *t != token));
+            leptos::task::spawn_local(async move {
+                let _ = api::dismiss_connection_request(&token).await;
+            });
+        });
+        let mute = move |_| {
+            requests.update(|r| {
+                r.tokens.clear();
+                r.muted = true;
+            });
+            leptos::task::spawn_local(async move {
+                let _ = api::set_connection_requests_muted(true).await;
+            });
+        };
+        Some(view! {
+            <Modal title="Connection request" on_close=close>
+                <p>"Someone (" <code>{short}</code> ") wants to connect with you."</p>
+                <p class="hint">
+                    "To accept, scan the QR code on their screen. If you don't know who this is, ignore it."
+                </p>
+                {(waiting > 1).then(|| view! {
+                    <p class="hint">{format!("{} more waiting.", waiting - 1)}</p>
+                })}
+                <div class="modal-actions">
+                    <button
+                        type="button"
+                        on:click=move |_| {
+                            // On a phone the scanner lives in the contact list,
+                            // which an open chat hides.
+                            selected.set(None);
+                            scanning.set(true);
+                        }
+                    >
+                        "Scan their code"
+                    </button>
+                    <button type="button" class="secondary" on:click=move |_| dismiss.run(())>
+                        "Not now"
+                    </button>
+                </div>
+                <button type="button" class="link-btn" on:click=mute>
+                    "Mute connection requests"
+                </button>
+            </Modal>
+        })
     }
 }
 
@@ -909,6 +1146,8 @@ fn Modal(title: &'static str, on_close: Callback<()>, children: Children) -> imp
 fn ContactPanel(
     contacts: RwSignal<Vec<api::ContactDto>>,
     selected: RwSignal<Option<String>>,
+    requests: RwSignal<api::ConnectionRequestsDto>,
+    scanning: RwSignal<bool>,
 ) -> impl IntoView {
     let token_input = RwSignal::new(String::new());
     let key_input = RwSignal::new(String::new());
@@ -919,13 +1158,25 @@ fn ContactPanel(
     // screen's identity delete. `None` means no confirm is open.
     let remove_confirm = RwSignal::new(None::<String>);
     let remove_busy = RwSignal::new(false);
-    let scanning = RwSignal::new(false);
+    // Adding someone accepts their connection request, so stop showing it
+    // now rather than at the next poll.
+    let clear_request = move |token: &str| {
+        let token = token.trim().to_ascii_lowercase();
+        requests.update(|r| r.tokens.retain(|t| *t != token));
+    };
+    let unmute = move |_| {
+        requests.update(|r| r.muted = false);
+        leptos::task::spawn_local(async move {
+            let _ = api::set_connection_requests_muted(false).await;
+        });
+    };
 
     // Runs for every QR code the scanner decodes. Anything that isn't a
     // contact code goes back to the scanner as an error so it keeps
     // looking; a valid one closes the scanner and sends the request.
     let on_scan = Callback::new(move |raw: String| {
         let code = contact_code::parse(&raw)?;
+        clear_request(&code.token_hex);
         scanning.set(false);
         error.set(None);
         leptos::task::spawn_local(async move {
@@ -948,6 +1199,7 @@ fn ContactPanel(
             if let Err(e) = api::connect_to_peer(&token, &key).await {
                 error.set(Some(e));
             } else {
+                clear_request(&token);
                 token_input.set(String::new());
                 key_input.set(String::new());
             }
@@ -988,25 +1240,6 @@ fn ContactPanel(
                     {
                         let token = contact.token.clone();
                         let token_for_click = token.clone();
-                        // Deliberately NOT read from the `contact` snapshot `<For>`
-                        // handed us: its `key` above is (token, status, name), so
-                        // `online` flipping on its own wouldn't change the key and
-                        // `<For>` would never re-render this item — the dot would
-                        // freeze at whatever `online` was the instant this contact
-                        // first became "established" (almost always false, since
-                        // that happens well before the first presence ping). Look
-                        // it up live from `contacts` instead, same pattern as
-                        // `chat_label` below, so it updates every poll regardless
-                        // of what `<For>` thinks changed.
-                        let token_for_dot = token.clone();
-                        let dot_status = move || {
-                            contacts
-                                .get()
-                                .into_iter()
-                                .find(|c| c.token == token_for_dot)
-                                .filter(|c| c.status == "established")
-                                .map(|c| c.online)
-                        };
                         let token_for_remove = token.clone();
                         let token_for_confirm = token.clone();
                         view! {
@@ -1015,14 +1248,6 @@ fn ContactPanel(
                                 on:click=move |_| selected.set(Some(token_for_click.clone()))
                             >
                                 <span class="contact-label">
-                                    {move || dot_status().map(|online| view! {
-                                        <span
-                                            class="presence-dot"
-                                            class:online=online
-                                            class:offline=!online
-                                            title=if online { "Online" } else { "Offline" }
-                                        ></span>
-                                    })}
                                     {match &contact.name {
                                         Some(name) => view! { <span class="contact-name">{name.clone()}</span> }.into_any(),
                                         None => view! {
@@ -1073,13 +1298,31 @@ fn ContactPanel(
                                         }.into_any()
                                     }
                                 }}
+                                {match contact.status.as_str() {
+                                    "pending" => Some(view! {
+                                        <span class="contact-hint">"Waiting for them to scan your code"</span>
+                                    }.into_any()),
+                                    "connecting" => Some(view! {
+                                        <span class="contact-hint">"They've added you. Connecting..."</span>
+                                    }.into_any()),
+                                    _ => None,
+                                }}
                             </li>
                         }
                     }
                 </For>
             </ul>
 
+            {move || requests.with(|r| r.muted).then(|| view! {
+                <p class="hint">
+                    "Connection requests are muted. "
+                    <button type="button" class="link-btn" on:click=unmute>"Unmute"</button>
+                </p>
+            })}
             <h3>"Add contact"</h3>
+            <p class="hint">
+                "You each add the other. A contact stays pending until they've added you too."
+            </p>
             <button type="button" class="scan-btn" on:click=move |_| scanning.set(true)>
                 "Scan QR code"
             </button>
@@ -1110,13 +1353,14 @@ fn ContactPanel(
 /// Message transcript + send box for whichever contact is selected. Shows
 /// a placeholder state until a contact is picked and until that contact's
 /// session has finished the PQXDH handshake ("established" status) —
-/// sending to a merely "pending" contact would fail server-side since
-/// there's no ratchet key yet.
+/// sending to a "pending" or "connecting" contact fails, since there's no
+/// session both sides have yet.
 #[component]
 fn ChatPanel(
     contacts: RwSignal<Vec<api::ContactDto>>,
     selected: RwSignal<Option<String>>,
     messages: RwSignal<HashMap<String, Vec<ChatMessage>>>,
+    early_updates: StoredValue<HashMap<u64, SendStatus>>,
 ) -> impl IntoView {
     let draft = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
@@ -1140,19 +1384,29 @@ fn ChatPanel(
         let text_for_history = text.clone();
         leptos::task::spawn_local(async move {
             match api::send_message(&token_for_task, &text).await {
-                Ok(history_id) => {
+                Ok(sent) => {
+                    // Same reasoning as the incoming side in
+                    // `MainScreen::refresh` — use the backend's own
+                    // chat-history row id so this optimistic display
+                    // agrees with a later `chat_history` fetch on what
+                    // identifies this message.
+                    let id = sent
+                        .id
+                        .map(history_message_id)
+                        .unwrap_or_else(next_message_id);
+                    // Its check mark (or not) comes later, from
+                    // `api::sent_message_updates`, unless it came already.
+                    let status = early_updates
+                        .try_update_value(|early| early.remove(&id))
+                        .flatten()
+                        .unwrap_or(SendStatus::Sending);
                     messages.update(|map| {
                         map.entry(token_for_task).or_default().push(ChatMessage {
-                            // Same reasoning as the incoming side in
-                            // `MainScreen::refresh` — use the backend's own
-                            // chat-history row id so this optimistic
-                            // display agrees with a later `chat_history`
-                            // fetch on what identifies this message.
-                            id: history_id
-                                .map(history_message_id)
-                                .unwrap_or_else(next_message_id),
+                            id,
                             from_me: true,
                             text: text_for_history,
+                            timestamp_ms: Some(sent.timestamp_ms),
+                            status: Some(status),
                         });
                     });
                 }
@@ -1178,6 +1432,13 @@ fn ChatPanel(
                 Some(token) => {
                     let header_token = token.clone();
                     let len_token = token.clone();
+                    let status_token = token.clone();
+                    let status = move || {
+                        contacts.get()
+                            .iter()
+                            .find(|c| c.token == status_token)
+                            .map(|c| c.status.clone())
+                    };
                     let history = move || messages.get().get(&token).cloned().unwrap_or_default();
                     let chat_label = move || {
                         contacts.get()
@@ -1223,14 +1484,43 @@ fn ChatPanel(
                             </button>
                             <h3>"Chat with " {chat_label}</h3>
                         </div>
+                        {move || match status().as_deref() {
+                            Some("pending") => Some(view! {
+                                <p class="hint chat-pending">
+                                    "Waiting for them to scan your code. You can chat once they have."
+                                </p>
+                            }.into_any()),
+                            Some("connecting") => Some(view! {
+                                <p class="hint chat-pending">
+                                    "They've added you. Setting up a secure session; you can chat in a moment."
+                                </p>
+                            }.into_any()),
+                            _ => None,
+                        }}
                         <div class="transcript" node_ref=transcript_ref>
+                            // Keyed on the status too, so a message is drawn
+                            // again when its check mark comes.
                             <For
                                 each=history
-                                key=|m| m.id
+                                key=|m| (m.id, m.status)
                                 let(msg)
                             >
                                 <p class:from-me=msg.from_me class:from-peer=!msg.from_me>
                                     {msg.text.clone()}
+                                    <span class="msg-meta">
+                                        {msg.timestamp_ms.map(|ms| view! {
+                                            <span class="msg-time">{format_time(ms)}</span>
+                                        })}
+                                        {match msg.status {
+                                            Some(SendStatus::Sent) => Some(view! {
+                                                <span class="msg-status sent" title="The relay has it">"✓"</span>
+                                            }.into_any()),
+                                            Some(SendStatus::Failed) => Some(view! {
+                                                <span class="msg-status failed" title="It didn't get to the relay. Try sending it again.">"!"</span>
+                                            }.into_any()),
+                                            _ => None,
+                                        }}
+                                    </span>
                                 </p>
                             </For>
                         </div>
