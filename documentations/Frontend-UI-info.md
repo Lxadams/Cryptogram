@@ -338,7 +338,7 @@ The UI code is identical; what differs is around it (`src-tauri/src/background.r
 
 | Piece | What it does |
 |---|---|
-| `MainActivity.kt` | Sets `FLAG_SECURE` (no screenshots, blank recents thumbnail). Pads the webview by the status bar, navigation bar and **keyboard** insets, so the composer stays visible while typing (done natively because older WebViews report CSS safe-area insets as zero). Asks for notification permission on Android 13+. Starts `NativeBridge`. |
+| `MainActivity.kt` | Allows screen capture (no `FLAG_SECURE`), so the phone can be mirrored for demos. Pads the webview by the status bar, navigation bar and **keyboard** insets, so the composer stays visible while typing (done natively because older WebViews report CSS safe-area insets as zero). Asks for notification permission on Android 13+. Starts `NativeBridge`. |
 | `NativeBridge.kt` | A thread blocks in the JNI call `nextEvent()` and reacts to strings the Rust side emits: `session_started`, `session_ended`, `message`, `message\t<from>`. |
 | `MessageService.kt` | A foreground service that runs while someone is logged in. It does no work; it exists so Android doesn't freeze the process and its UDP socket. Also posts the "N new messages" notification, only when the app isn't on screen, and never with message text. |
 | `background.rs` | The Rust half: `session_started` (from `bootstrap`), `session_ended` (from logout), `message_received` (from the receive and tick loops). No-ops on desktop. |
