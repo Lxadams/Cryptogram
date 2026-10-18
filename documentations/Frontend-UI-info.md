@@ -209,7 +209,7 @@ Both people must add each other. Adding someone only sends them a KeyExchange; t
 ### `ChatPanel`
 
 - Nothing selected: *"Select a contact to start chatting."*
-- Header: a **← Contacts** back button (only visible in the one-column layout) and "Chat with *name*".
+- Header: a **←** back button (only visible in the one-column layout, with the total of new messages from other contacts), the contact's name centred, and a **⋮** menu (`ChatMenu`, hidden while `pending`) holding **Repair session**.
 - A hint while the contact is still `pending` or `connecting`. The composer is still there, but sending fails until the session is established and the backend's error is shown.
 - **Transcript.** One `<p>` per message, `from-me` (right, accent colour) or `from-peer` (left). Under the text: the time (`format_time`: locale time, with the date in front if it isn't today) and, for your own messages, nothing while sending, **✓** once the relay has it, or a red **!** if it didn't confirm in time. Both marks have tooltips.
 - **Auto-scroll.** A `Memo` tracks only *this* chat's message count; when it changes, the transcript scrolls to the bottom on the next task (after the DOM has updated). Traffic in other chats doesn't move it.
@@ -327,7 +327,7 @@ One hand-written stylesheet, `style.css` (no framework, no component-scoped CSS)
 - **Page layout:** `body` doesn't scroll. `.app` is a full-height flex column (max width 1100 px); the panels inside scroll on their own, so the composer stays put while the transcript scrolls.
 - **Login / Create / Connect** are a centred column, max 440 px.
 - **Main screen, wide:** a two-column grid, contacts (220–300 px) beside the chat.
-- **Main screen, narrow** (`max-width: 719px`): one column. `MainScreen` adds the class `chat-open` when a contact is selected, and CSS shows *either* the identity card and contact list *or* the chat. The **← Contacts** button sets `selected` back to `None`. No JavaScript-side layout logic is involved.
+- **Main screen, narrow** (`max-width: 719px`): one column. `MainScreen` adds the class `chat-open` when a contact is selected, and CSS shows *either* the identity card and contact list *or* the chat. The **←** button sets `selected` back to `None`. No JavaScript-side layout logic is involved. Each layer open over the contact list (a chat, your QR code, the scanner) also gets a browser-history entry, so Android's back button (which goes back in the web view's history before leaving the app) closes the topmost one (scanner, then QR code, then chat) and only leaves the app when none is open. A layer closed any other way (its X, **←**, a scan) pops its entry again.
 - **Touch** (`pointer: coarse`): 16 px text in fields (stops mobile webviews zooming on focus) and bigger tap targets.
 
 ---

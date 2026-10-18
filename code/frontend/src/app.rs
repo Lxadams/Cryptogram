@@ -874,6 +874,69 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         });
     });
 
+    // Android's back button goes back in the web view's history, and only
+    // leaves the app when there's none (see Tauri's `AppPlugin`). So each
+    // layer open over the contact list (an open chat, our QR code, the
+    // scanner) gets a history entry, and going back closes the topmost
+    // one: back steps out of the scanner, then the QR code, then the chat,
+    // as on a phone it should, and only then out of the app. A layer that
+    // closes any other way (its X, the ← button, a scan) takes its entry
+    // back off, so the two stay in step.
+    let layers_open = move || {
+        usize::from(selected.get().is_some())
+            + usize::from(show_qr.get())
+            + usize::from(scanning.get())
+    };
+    // Entries pushed for open layers, and how many of our own trips back
+    // through them (when layers closed some other way) are still to land.
+    let pushed = StoredValue::new(0usize);
+    let pending_pops = StoredValue::new(0usize);
+    // Push or pop entries until there's one per open layer. Waits while one
+    // of our pops is still on its way: history moves asynchronously, and
+    // pushing meanwhile would muddle which entry it lands on.
+    let sync_history = move || {
+        if pending_pops.get_value() > 0 {
+            return;
+        }
+        let Ok(history) = window().history() else {
+            return;
+        };
+        let open = untrack(layers_open);
+        let have = pushed.get_value();
+        if open > have {
+            for _ in have..open {
+                let _ = history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", None);
+            }
+        } else if open < have {
+            pending_pops.set_value(1);
+            let _ = history.go_with_delta(-((have - open) as i32));
+        }
+        pushed.set_value(open);
+    };
+    Effect::new(move |_| {
+        layers_open();
+        sync_history();
+    });
+    let popstate = window_event_listener(leptos::ev::popstate, move |_| {
+        if pending_pops.get_value() > 0 {
+            // One of ours: catch up on anything that changed meanwhile.
+            pending_pops.set_value(0);
+            sync_history();
+            return;
+        }
+        // The back button: that entry is gone, so close its layer.
+        pushed.update_value(|n| *n = n.saturating_sub(1));
+        if scanning.get_untracked() {
+            scanning.set(false);
+        } else if show_qr.get_untracked() {
+            show_qr.set(false);
+            qr_waiting_for.set(None);
+        } else if selected.get_untracked().is_some() {
+            selected.set(None);
+        }
+    });
+    on_cleanup(move || popstate.remove());
+
     // They've scanned our code once they're past "pending": their side has
     // reached ours (see `Client::contact_status`).
     Effect::new(move |_| {
@@ -1743,9 +1806,11 @@ fn ChatPanel(
                             <button
                                 type="button"
                                 class="back-btn secondary"
+                                title="Back to contacts"
+                                aria-label="Back to contacts"
                                 on:click=move |_| selected.set(None)
                             >
-                                "← Contacts"
+                                "←"
                                 // From the others: in the one-column layout,
                                 // the list (and their badges) is hidden while
                                 // a chat is open.
