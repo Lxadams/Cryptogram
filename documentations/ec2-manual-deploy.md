@@ -5,9 +5,9 @@ Docker image and ship it to EC2 — but run by hand from WSL Ubuntu. Useful
 for a first deploy, or when you want to test a change before pushing to
 `production`.
 
-Assumes the one-time EC2 setup (Docker installed, security group open on
-UDP 443 + SSH 22) from [`ec2-deployment.md`](ec2-deployment.md) is already
-done.
+Assumes the instance's security group is already open on UDP 443 + SSH 22
+(see [`ec2-deployment.md`](ec2-deployment.md)). If Docker isn't installed on
+the instance yet, start with step 0.
 
 ## Prerequisites on WSL
 
@@ -21,6 +21,32 @@ readable by anyone else:
 ```
 chmod 400 /path/to/your-key.pem
 ```
+
+## 0. Install Docker on the instance (first time only)
+
+A fresh EC2 instance doesn't come with Docker. SSH in:
+```
+ssh -i /path/to/your-key.pem ubuntu@<EC2_HOST>
+```
+
+Then, on the instance (standard Ubuntu AMI):
+```
+sudo apt-get update && sudo apt-get install -y docker.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker ubuntu
+exit
+```
+
+`systemctl enable` starts Docker on every boot, which is what lets
+`--restart unless-stopped` (step 4) bring the relay back after the instance
+reboots. The `usermod` lets you run `docker` without `sudo`, but only takes
+effect on a new login — hence the `exit`. SSH back in and check:
+```
+docker ps
+```
+
+An empty table means you're set. `permission denied ... docker.sock` means
+the group change hasn't applied yet — log out and back in again.
 
 ## 1. Build the image
 
