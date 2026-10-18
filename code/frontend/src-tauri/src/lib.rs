@@ -23,6 +23,7 @@ pub fn run() {
             commands::list_contacts,
             commands::connect_to_peer,
             commands::remove_contact,
+            commands::repair_session,
             commands::connection_requests,
             commands::set_connection_requests_muted,
             commands::dismiss_connection_request,

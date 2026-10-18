@@ -524,6 +524,11 @@ button.danger {
   white-space: nowrap;
 }
 
+.chat-header .repair-btn {
+  flex: none;
+  margin-left: auto;
+}
+
 /* Back to the contact list. Only exists in the one-column layout. */
 .back-btn {
   display: none;

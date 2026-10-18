@@ -1433,6 +1433,7 @@ fn ChatPanel(
 ) -> impl IntoView {
     let draft = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
+    let repairing = RwSignal::new(false);
 
     // Zero-arg closure so it can be called uniformly from both a click
     // handler (which Leptos passes a MouseEvent to) and a keydown handler
@@ -1500,6 +1501,7 @@ fn ChatPanel(
                 None => view! { <p class="hint">"Select a contact to start chatting."</p> }.into_any(),
                 Some(token) => {
                     let header_token = token.clone();
+                    let repair_token = token.clone();
                     let len_token = token.clone();
                     let status_token = token.clone();
                     let status = move || {
@@ -1552,6 +1554,35 @@ fn ChatPanel(
                                 "← Contacts"
                             </button>
                             <h3>"Chat with " {chat_label}</h3>
+                            // For when one side can no longer read the
+                            // other's messages: both drop the session and
+                            // set up a new one (see `api::repair_session`).
+                            {move || contacts.with(|list| {
+                                list.iter().any(|c| c.token == repair_token && c.status != "pending")
+                            }).then(|| {
+                                let repair_token = repair_token.clone();
+                                view! {
+                                    <button
+                                        type="button"
+                                        class="secondary repair-btn"
+                                        title="Set up a new secure session with them, if messages aren't getting through"
+                                        disabled=move || repairing.get()
+                                        on:click=move |_| {
+                                            let token = repair_token.clone();
+                                            error.set(None);
+                                            repairing.set(true);
+                                            leptos::task::spawn_local(async move {
+                                                if let Err(e) = api::repair_session(&token).await {
+                                                    error.try_set(Some(e));
+                                                }
+                                                repairing.try_set(false);
+                                            });
+                                        }
+                                    >
+                                        "Repair session"
+                                    </button>
+                                }
+                            })}
                         </div>
                         {move || match status().as_deref() {
                             Some("pending") => Some(view! {

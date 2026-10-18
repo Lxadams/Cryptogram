@@ -1305,6 +1305,24 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
     Ok(())
 }
 
+/// Throw away the E2E session with a contact and set up a new one, for
+/// when it has broken, e.g. one side can't decrypt the other's messages
+/// any more (see `Client::repair_session`). Keeps the contact and the chat
+/// history; the contact shows as connecting until the new session is up.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn repair_session(state: State<'_, AppState>, token_hex: String) -> Result<(), String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+
+    let token = parse_token(&token_hex)?;
+
+    let kx_packet = rt.client.repair_session(token).map_err(|e| e.to_string())?;
+    netsim::send_to(&rt.socket, &kx_packet, rt.client.server_addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Encrypt and send an E2E message to an already-established session, as a
 /// burst of FEC packets sized to survive heavy loss (see `client`'s
 /// `create_fec_packets`/`BurstSender`). A long message's chunks, and the PQ

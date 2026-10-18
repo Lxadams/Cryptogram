@@ -926,6 +926,36 @@ impl Client {
         }
     }
 
+    /// Throw away our E2E session with the contact `token` and set up a new
+    /// one, for when it has broken (say a lost PQ inject has left one side
+    /// unable to decrypt). Returns the KeyExchange to send them. The contact
+    /// stays, with their name and chat history; only the session goes.
+    ///
+    /// It works as removing and re-adding them would: the KeyExchange
+    /// carries a new add ID (see `AddIds`), so they drop their side of the
+    /// old session when it arrives (see `set_their_add_id`), and the two of
+    /// us set up a fresh one, PQ keys and all, the usual way. Either side
+    /// can do it. Messages held for one sent before them are handed over
+    /// first; anything else still in flight on the old session is lost.
+    pub fn repair_session(&mut self, token: RoutingToken) -> Result<Vec<u8>> {
+        if !self.pending_contacts.contains_key(&token) {
+            return Err(anyhow!("That's not one of your contacts."));
+        }
+        self.hand_over_held(&token);
+        self.e2e_sessions.remove(&token);
+        self.session_setups.remove(&token);
+        self.reassembler.forget(&token);
+        let mine = self.next_add_id;
+        self.next_add_id = self.next_add_id.saturating_add(1);
+        self.add_ids.entry(token).or_default().mine = mine;
+        self.setup_retries.insert(
+            token,
+            SetupRetry::starting(Instant::now(), FIRST_SETUP_RETRY),
+        );
+        self.save();
+        Ok(self.create_kx_request(token))
+    }
+
     /// Persist identity/session state to `identity_store` if one is
     /// attached (the SQLCipher-encrypted path), otherwise fall back to the
     /// legacy plaintext `client_state.json` at `state_path` — mirrors how
@@ -3519,6 +3549,66 @@ mod tests {
             assert_ne!(session(&e, &r).root_key, old_root, "a new session");
             cleanup(&[&e, &r]);
         }
+    }
+
+    /// One side's session is broken (here: the other side's decrypt state
+    /// is lost) and either side repairs it: both drop the old session, set
+    /// up a new one, and can message each other again, still contacts with
+    /// their names.
+    #[test]
+    fn test_repair_session_replaces_a_broken_session() {
+        for repairer_is_establisher in [true, false] {
+            let (mut e, mut r) = establisher_and_responder();
+            connect(&mut e, &mut r);
+            let old_root = session(&e, &r).root_key;
+            let (repairer, other) = if repairer_is_establisher {
+                (&mut e, &mut r)
+            } else {
+                (&mut r, &mut e)
+            };
+            let other_token = other.identity.routing_token;
+            let repairer_token = repairer.identity.routing_token;
+            repairer.local_name = "repairer".into();
+            // Break it: the other side can no longer decrypt.
+            other
+                .e2e_sessions
+                .get_mut(&repairer_token)
+                .unwrap()
+                .recv_chain_key = [0; 32];
+
+            let kx = repairer.repair_session(other_token).unwrap();
+            exchange(repairer, other, kx);
+            assert_one_session_with_pq_keys(&e, &r);
+            assert_ne!(session(&e, &r).root_key, old_root, "a new session");
+
+            let (repairer, other) = if repairer_is_establisher {
+                (&mut e, &mut r)
+            } else {
+                (&mut r, &mut e)
+            };
+            assert_eq!(
+                other.contact_names.get(&repairer_token).map(String::as_str),
+                Some("repairer")
+            );
+            fn send(from: &mut Client, to: &mut Client, text: &str) {
+                let (packets, _) = from
+                    .create_encrypted_packets(to.identity.routing_token, text.as_bytes())
+                    .unwrap();
+                let inner = strip_link(&packets[0], &from.link.keys().to_relay);
+                to.handle_incoming_packet(&inner).unwrap();
+                assert_eq!(inbox_texts(to), [text]);
+            }
+            send(repairer, other, "there");
+            send(other, repairer, "back");
+            cleanup(&[&e, &r]);
+        }
+    }
+
+    #[test]
+    fn test_repair_session_refuses_someone_not_a_contact() {
+        let (mut alice, bob) = (new_client(), new_client());
+        assert!(alice.repair_session(bob.identity.routing_token).is_err());
+        cleanup(&[&alice, &bob]);
     }
 
     /// One side removes the other, then both add each other again at once.

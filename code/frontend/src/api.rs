@@ -216,6 +216,12 @@ pub async fn remove_contact(token_hex: &str) -> Result<(), String> {
     call("remove_contact", &RemoveContactArgs { token_hex }).await
 }
 
+/// Replace a broken session with a contact with a new one, keeping the
+/// contact and chat history (see `repair_session` in commands.rs).
+pub async fn repair_session(token_hex: &str) -> Result<(), String> {
+    call("repair_session", &RemoveContactArgs { token_hex }).await
+}
+
 /// Mirrors `ConnectionRequestsDto` in `src-tauri/src/commands.rs`.
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct ConnectionRequestsDto {
