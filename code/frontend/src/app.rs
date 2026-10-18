@@ -1800,6 +1800,29 @@ fn ChatPanel(
                             Duration::ZERO,
                         );
                     });
+                    // Whether the transcript is scrolled to its newest
+                    // message. Opening the keyboard shrinks the whole web
+                    // view (see `keepClearOfSystemBars` in MainActivity.kt),
+                    // and the transcript with it, but its scroll position
+                    // counts from the top, so the newest messages would
+                    // slip out of sight below the composer. If it was at
+                    // the newest, keep it there through any resize; if
+                    // they've scrolled up to read, leave them be.
+                    let at_bottom = StoredValue::new(true);
+                    let on_transcript_scroll = move |_| {
+                        if let Some(el) = transcript_ref.get_untracked() {
+                            let below = el.scroll_height() - el.scroll_top() - el.client_height();
+                            at_bottom.set_value(below < 24);
+                        }
+                    };
+                    let resize = window_event_listener(leptos::ev::resize, move |_| {
+                        if at_bottom.get_value()
+                            && let Some(el) = transcript_ref.get_untracked()
+                        {
+                            el.set_scroll_top(el.scroll_height());
+                        }
+                    });
+                    on_cleanup(move || resize.remove());
 
                     view! {
                         <div class="chat-header">
@@ -1836,7 +1859,7 @@ fn ChatPanel(
                             }.into_any()),
                             _ => None,
                         }}
-                        <div class="transcript" node_ref=transcript_ref>
+                        <div class="transcript" node_ref=transcript_ref on:scroll=on_transcript_scroll>
                             // Keyed on the status too, so a message is drawn
                             // again when its check mark comes.
                             <For
