@@ -428,6 +428,11 @@ button.danger {
   margin-top: 0.5rem;
 }
 
+.identity-details .setting input[type="number"] {
+  width: 5rem;
+  margin-left: auto;
+}
+
 .copy-btn.copied {
   color: var(--ok);
   border-color: var(--ok);

@@ -28,6 +28,8 @@ pub fn run() {
             commands::dismiss_connection_request,
             commands::notification_settings,
             commands::set_notify_with_names,
+            commands::simulated_loss,
+            commands::set_simulated_loss,
             commands::send_message,
             commands::sent_message_updates,
             commands::poll_inbox,

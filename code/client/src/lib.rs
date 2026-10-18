@@ -29,6 +29,7 @@ mod chunks;
 mod confirmations;
 mod deliveries;
 mod history;
+pub mod netsim;
 mod ordering;
 mod padding;
 pub mod pq;
@@ -2457,10 +2458,10 @@ pub async fn perform_handshake(
             if copy > 0 {
                 tokio::time::sleep(HANDSHAKE_COPY_SPACING).await;
             }
-            socket.send_to(&init, client.server_addr).await?;
+            netsim::send_to(socket, &init, client.server_addr).await?;
         }
         loop {
-            match tokio::time::timeout_at(attempt_ends, socket.recv_from(&mut buf)).await {
+            match tokio::time::timeout_at(attempt_ends, netsim::recv_from(socket, &mut buf)).await {
                 Err(_) => break, // this attempt's time is up
                 Ok(Err(_)) => {
                     // A receive error, like an ICMP "port unreachable" while
@@ -2498,7 +2499,7 @@ pub async fn perform_handshake(
     };
     client.complete_handshake(client_secret, server_pub, &reply)?;
     for sync in client.sync_packets() {
-        socket.send_to(&sync, client.server_addr).await?;
+        netsim::send_to(socket, &sync, client.server_addr).await?;
     }
     Ok(())
 }

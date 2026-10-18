@@ -7,9 +7,9 @@
 use crate::background;
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use client::{
-    derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
-    BurstSender, ChatHistory, Client, ClientStateDto, ContactStatus, IdentityStateStore,
-    RoutingToken, SendStatus,
+    derive_vault_key, hash_passcode, netsim, parse_routing_token, parse_verifying_key,
+    perform_handshake, BurstSender, ChatHistory, Client, ClientStateDto, ContactStatus,
+    IdentityStateStore, RoutingToken, SendStatus,
 };
 use serde::Serialize;
 use std::{
@@ -1010,7 +1010,7 @@ fn spawn_keepalive_loop(
             let server_addr = rt.client.server_addr;
             drop(guard);
             for packet in packets {
-                let _ = socket.send_to(&packet, server_addr).await;
+                let _ = netsim::send_to(&socket, &packet, server_addr).await;
             }
         }
     })
@@ -1038,7 +1038,7 @@ fn spawn_tick_loop(app: AppHandle, socket: Arc<UdpSocket>) -> tauri::async_runti
             let server_addr = rt.client.server_addr;
             drop(guard);
             for packet in packets {
-                let _ = socket.send_to(&packet, server_addr).await;
+                let _ = netsim::send_to(&socket, &packet, server_addr).await;
             }
         }
     })
@@ -1067,7 +1067,7 @@ fn spawn_receive_loop(
         let state = app.state::<AppState>();
         let mut buf = [0u8; 4096];
         loop {
-            let len = match socket.recv_from(&mut buf).await {
+            let len = match netsim::recv_from(&socket, &mut buf).await {
                 Ok((len, _addr)) => len,
                 // Back off briefly rather than spinning a core if the
                 // socket keeps erroring (e.g. repeated ICMP "port
@@ -1086,7 +1086,7 @@ fn spawn_receive_loop(
             let replies = rt.client.handle_relay_packet(&buf[..len]);
             notify_new_messages(&rt.client, inbox_before);
             for packet in replies {
-                let _ = socket.send_to(&packet, rt.client.server_addr).await;
+                let _ = netsim::send_to(&socket, &packet, rt.client.server_addr).await;
             }
         }
     })
@@ -1164,8 +1164,7 @@ pub async fn connect_to_peer(
         .client
         .add_contact(token, peer_ed25519)
         .map_err(|e| e.to_string())?;
-    rt.socket
-        .send_to(&req_packet, rt.client.server_addr)
+    netsim::send_to(&rt.socket, &req_packet, rt.client.server_addr)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1245,6 +1244,33 @@ pub async fn set_notify_with_names(state: State<'_, AppState>, on: bool) -> Resu
     let mut guard = state.runtime.lock().await;
     let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
     rt.client.set_notify_with_names(on);
+    Ok(())
+}
+
+/// What `simulated_loss` reports: the percentage of packets this device
+/// drops on purpose in each direction (see `client::netsim`).
+#[derive(Serialize, Clone)]
+pub struct SimulatedLossDto {
+    pub send: u8,
+    pub receive: u8,
+}
+
+/// The simulated network loss on this device (see `client::netsim`).
+#[tauri::command(rename_all = "snake_case")]
+pub fn simulated_loss() -> SimulatedLossDto {
+    let (send, receive) = netsim::loss();
+    SimulatedLossDto { send, receive }
+}
+
+/// Drop `send`% of outgoing packets and `receive`% of incoming ones, to
+/// test on a bad connection without making the relay lossy for everyone.
+/// Lasts until changed or the app closes.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_simulated_loss(send: u8, receive: u8) -> Result<(), String> {
+    if send > 100 || receive > 100 {
+        return Err("Loss is a percentage, from 0 to 100".into());
+    }
+    netsim::set_loss(send, receive);
     Ok(())
 }
 

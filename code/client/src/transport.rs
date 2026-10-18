@@ -22,7 +22,7 @@
 //! messages are parked: the seal proves the sender, so strangers can't fill
 //! the queue.
 
-use crate::{HKDF_SALT, RoutingToken};
+use crate::{HKDF_SALT, RoutingToken, netsim};
 use anyhow::Result;
 use chacha20poly1305::{
     Key, KeyInit, XChaCha20Poly1305, XNonce,
@@ -330,7 +330,7 @@ async fn send_paced(
 ) {
     for packet in packets {
         ticker.tick().await; // the first tick after idling is immediate
-        let _ = socket.send_to(packet, addr).await;
+        let _ = netsim::send_to(socket, packet, addr).await;
     }
 }
 
@@ -350,7 +350,7 @@ pub async fn send_burst(
     };
     let mut ticker = pacer();
     ticker.tick().await;
-    socket.send_to(first, addr).await?;
+    netsim::send_to(socket, first, addr).await?;
     send_paced(&mut ticker, socket, addr, rest).await;
     Ok(())
 }
@@ -378,7 +378,7 @@ impl BurstSender {
                     continue;
                 };
                 ticker.tick().await;
-                let result = socket.send_to(first, addr).await.map(drop);
+                let result = netsim::send_to(&socket, first, addr).await.map(drop);
                 let failed = result.is_err();
                 let _ = first_sent.send(result);
                 if !failed {

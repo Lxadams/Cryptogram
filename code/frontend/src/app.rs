@@ -938,8 +938,8 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
 /// so peers see "alice" in their contact list without typing anything
 /// themselves (see `Client::local_name` / `contact_names` in
 /// code/client/src/lib.rs). Settings fold away under it too, where there
-/// are any: so far just whether notifications name senders, on devices
-/// that post them.
+/// are any: whether notifications name senders, on devices that post them,
+/// and the simulated network loss (see `SimulatedLoss`).
 #[component]
 fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
     let show_qr = RwSignal::new(false);
@@ -1008,6 +1008,7 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
                     </p>
                 </details>
             })}
+            <SimulatedLoss />
             <Show when=move || show_qr.get()>
                 <Modal title="Your QR code" on_close=Callback::new(move |()| show_qr.set(false))>
                     {match qr_svg.get_value() {
@@ -1021,6 +1022,74 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
                 </Modal>
             </Show>
         </div>
+    }
+}
+
+/// Two percentages of packets this device drops on purpose, one for
+/// sending and one for receiving, to try the app on a bad connection
+/// without making the relay lossy for everyone (see `client::netsim`).
+/// Each takes effect as soon as it's changed, and lasts until the app
+/// closes.
+#[component]
+fn SimulatedLoss() -> impl IntoView {
+    let loss = RwSignal::new(api::SimulatedLossDto::default());
+    let error = RwSignal::new(None::<String>);
+    leptos::task::spawn_local(async move {
+        if let Ok(current) = api::simulated_loss().await {
+            loss.try_set(current);
+        }
+    });
+
+    let apply = move |ev: leptos::ev::Event, outgoing: bool| {
+        let Some(percent) = event_target_value(&ev)
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|p| *p <= 100)
+        else {
+            error.set(Some("Enter a whole percentage from 0 to 100.".into()));
+            return;
+        };
+        error.set(None);
+        loss.update(|l| {
+            if outgoing {
+                l.send = percent;
+            } else {
+                l.receive = percent;
+            }
+        });
+        let api::SimulatedLossDto { send, receive } = loss.get_untracked();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = api::set_simulated_loss(send, receive).await {
+                error.try_set(Some(e));
+            }
+        });
+    };
+
+    view! {
+        <details class="identity-details">
+            <summary>"Simulated network loss"</summary>
+            <label class="setting">
+                "Sending loss (%)"
+                <input
+                    type="number" min="0" max="100" step="1"
+                    prop:value=move || loss.get().send.to_string()
+                    on:change=move |ev| apply(ev, true)
+                />
+            </label>
+            <label class="setting">
+                "Receiving loss (%)"
+                <input
+                    type="number" min="0" max="100" step="1"
+                    prop:value=move || loss.get().receive.to_string()
+                    on:change=move |ev| apply(ev, false)
+                />
+            </label>
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+            <p class="hint">
+                "Drops that share of this device's packets at random, as a bad connection would. Resets to 0 when the app closes."
+            </p>
+        </details>
     }
 }
 

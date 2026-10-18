@@ -283,6 +283,26 @@ pub async fn set_notify_with_names(on: bool) -> Result<(), String> {
     call("set_notify_with_names", &NotifyWithNamesArgs { on }).await
 }
 
+/// Mirrors `SimulatedLossDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct SimulatedLossDto {
+    /// Percentage of outgoing packets dropped.
+    pub send: u8,
+    /// Percentage of incoming packets dropped.
+    pub receive: u8,
+}
+
+/// The network loss this device is simulating.
+pub async fn simulated_loss() -> Result<SimulatedLossDto, String> {
+    call("simulated_loss", &()).await
+}
+
+/// Drop `send`% of outgoing packets and `receive`% of incoming ones on this
+/// device, until changed or the app closes.
+pub async fn set_simulated_loss(send: u8, receive: u8) -> Result<(), String> {
+    call("set_simulated_loss", &SimulatedLossDto { send, receive }).await
+}
+
 #[derive(Serialize)]
 struct SendMessageArgs<'a> {
     token_hex: &'a str,
