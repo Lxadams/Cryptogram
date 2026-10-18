@@ -1,53 +1,88 @@
 #!/usr/bin/env bash
-# Rebuilds the Android APK for LAN testing against the relay on this
-# computer: bakes in this machine's network IP as the relay address and the
-# local relay's public key (see server_addr_raw() and relay_pubkey_hex() in
+# Rebuilds the Android APK with a relay's address and public key baked in
+# (see server_addr_raw() and relay_pubkey_hex() in
 # code/frontend/src-tauri/src/commands.rs). Builds only; install the result
 # with ./install-apk.sh.
 #
-#   ./build-apk.sh
-#   ./build-apk.sh --emulator        # also runs on the Android emulator
-#   RELAY_PORT=5000 ./build-apk.sh   # if the relay isn't on port 4430
+#   ./build-apk.sh                                  # the relay on this computer
+#   ./build-apk.sh -ip 3.24.135.209 -p 443 -pk <hex>   # a relay elsewhere
+#   ./build-apk.sh --emulator                       # also runs on the emulator
+#
+#   -ip <ip>    the relay's IP or hostname (default: this machine's network IP)
+#   -p <port>   the relay's UDP port (default: 4430)
+#   -pk <hex>   the relay's "Server Static Pubkey" (default: the local
+#               relay's; required with -ip, as the app refuses any relay but
+#               the one it was built for)
 #
 # --emulator adds x86_64 code (the emulator's CPU) next to the phones'
 # arm64, so one APK installs on both. See ./run-emulator.sh.
 #
-# Run the relay with ./runserver-lan.sh so the phone can reach it. Rebuild
-# whenever this machine's IP changes. Uses JAVA_HOME, ANDROID_HOME and
-# NDK_HOME if set (code/frontend/ANDROID.md step 4), otherwise looks for
-# them in their usual places.
+# Without -ip, run the relay with ./runserver-lan.sh so the phone can reach
+# it, and rebuild whenever this machine's IP changes. Uses JAVA_HOME,
+# ANDROID_HOME and NDK_HOME if set (code/frontend/ANDROID.md step 4),
+# otherwise looks for them in their usual places.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FRONTEND_DIR="$REPO_ROOT/code/frontend"
-RELAY_PORT="${RELAY_PORT:-4430}"
+
+usage() {
+  echo "usage: $0 [-ip <ip> -pk <pubkey-hex>] [-p <port>] [--emulator]" >&2
+  exit 1
+}
 
 targets=(aarch64)
-case "${1:-}" in
-  "") ;;
-  --emulator) targets+=(x86_64) ;;
-  *) echo "usage: $0 [--emulator]" >&2; exit 1 ;;
-esac
+ip=""
+port=4430
+pubkey=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -ip) [ $# -ge 2 ] || usage; ip="$2"; shift 2 ;;
+    -p) [ $# -ge 2 ] || usage; port="$2"; shift 2 ;;
+    -pk) [ $# -ge 2 ] || usage; pubkey="$2"; shift 2 ;;
+    --emulator) targets+=(x86_64); shift ;;
+    *) usage ;;
+  esac
+done
+case "$port" in '' | *[!0-9]*) echo "error: -p needs a port number, not '$port'." >&2; exit 1 ;; esac
+if [ -n "$pubkey" ] && ! [[ "$pubkey" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  echo "error: -pk needs the relay's 64-character hex public key." >&2
+  exit 1
+fi
+if [ -n "$ip" ] && [ -z "$pubkey" ]; then
+  echo "error: -ip needs -pk too: the \"Server Static Pubkey\" that relay prints." >&2
+  exit 1
+fi
 
 # This machine's address on the network: the source IP of its default route.
 lan_ip() {
   ip route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}'
 }
 
-if command -v wslinfo >/dev/null && [ "$(wslinfo --networking-mode)" != mirrored ]; then
-  echo "error: WSL is in NAT mode, so a phone can't reach a relay on this machine." >&2
-  echo "Switch WSL to mirrored networking (./runserver-lan.sh prints how)." >&2
-  exit 1
+remote=false
+if [ -n "$ip" ]; then
+  remote=true
+else
+  if command -v wslinfo >/dev/null && [ "$(wslinfo --networking-mode)" != mirrored ]; then
+    echo "error: WSL is in NAT mode, so a phone can't reach a relay on this machine." >&2
+    echo "Switch WSL to mirrored networking (./runserver-lan.sh prints how), or pass -ip." >&2
+    exit 1
+  fi
+  ip="$(lan_ip)"
+  if [ -z "$ip" ]; then
+    echo "error: couldn't work out this machine's IP. Is it on a network? Or pass -ip." >&2
+    exit 1
+  fi
 fi
-ip="$(lan_ip)"
-if [ -z "$ip" ]; then
-  echo "error: couldn't work out this machine's IP. Is it on a network?" >&2
-  exit 1
+export SERVER_ADDR="$ip:$port"
+# The key given with -pk, else the local relay's; never one left in the
+# environment for another relay: the app refuses any relay but the one it
+# was built for.
+if [ -n "$pubkey" ]; then
+  SERVER_PUBKEY="$pubkey"
+else
+  SERVER_PUBKEY="$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-pubkey)"
 fi
-export SERVER_ADDR="$ip:$RELAY_PORT"
-# Always the local relay's key, never one left in the environment for
-# another relay: the app refuses any relay but the one it was built for.
-SERVER_PUBKEY="$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-pubkey)"
 export SERVER_PUBKEY
 echo "Relay: $SERVER_ADDR"
 echo "Key:   $SERVER_PUBKEY"
@@ -95,4 +130,8 @@ apk="$(find src-tauri/gen/android/app/build/outputs/apk -name '*debug*.apk' -pri
 echo
 echo "Built $FRONTEND_DIR/$apk"
 echo "  relay $SERVER_ADDR and its key baked in"
-echo "Install it with ./install-apk.sh, and run the relay with ./runserver-lan.sh."
+if $remote; then
+  echo "Install it with ./install-apk.sh."
+else
+  echo "Install it with ./install-apk.sh, and run the relay with ./runserver-lan.sh."
+fi
