@@ -509,24 +509,79 @@ button.danger {
   color: var(--muted);
 }
 
+/* Back button, contact's name, "⋮" menu. The two side columns share the
+   room left over equally, so the name stays centred whether or not the
+   back button (one-column layout only) or the menu (not for a pending
+   contact) is there. A long name is cut short with an ellipsis. */
 .chat-header {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr minmax(0, auto) 1fr;
   align-items: center;
   gap: 0.5rem;
   margin: 0 0 0.75rem 0;
   min-width: 0;
 }
 
+.chat-header .back-btn {
+  grid-column: 1;
+  justify-self: start;
+}
+
 .chat-header h3 {
+  grid-column: 2;
   margin: 0;
+  text-align: center;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.chat-header .repair-btn {
-  flex: none;
-  margin-left: auto;
+/* The "⋮" menu at the header's right end (see `ChatMenu`). Its dropdown
+   hangs below the button, lined up with its right edge. */
+.chat-menu {
+  grid-column: 3;
+  justify-self: end;
+  position: relative;
+}
+
+/* Opening a menu isn't destructive: no red hover. */
+.icon-btn.menu-btn:hover {
+  color: var(--text);
+}
+
+/* Catches a click anywhere outside an open menu, to close it. */
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+}
+
+.menu {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  right: 0;
+  z-index: 101;
+  min-width: 10rem;
+  padding: 0.25rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.25);
+}
+
+.menu button {
+  display: block;
+  width: 100%;
+  background: transparent;
+  color: var(--text);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  font-weight: normal;
+  white-space: nowrap;
+}
+
+.menu button:hover:not(:disabled) {
+  background: var(--hover);
 }
 
 /* Back to the contact list. Only exists in the one-column layout. */

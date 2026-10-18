@@ -196,6 +196,18 @@ fn TrashIcon() -> impl IntoView {
     }
 }
 
+/// Three dots, for a button that opens a menu (see `Menu`).
+#[component]
+fn MenuIcon() -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+            <circle cx="8" cy="3.5" r="1.4" />
+            <circle cx="8" cy="8" r="1.4" />
+            <circle cx="8" cy="12.5" r="1.4" />
+        </svg>
+    }
+}
+
 /// Clears a polling interval when the component that started it unmounts.
 /// A `set_interval` otherwise outlives its screen: after logging in, the
 /// Login screen's poll kept firing against disposed signals (panicking), and
@@ -1178,6 +1190,25 @@ fn ConnectionRequestNotice(
     }
 }
 
+/// A dropdown of actions under the button that opened it (put both in a
+/// `position: relative` box). Closes on a click anywhere outside it,
+/// caught by a transparent backdrop the way `Modal` catches one, or on
+/// Escape; each item closes it too, when chosen.
+#[component]
+fn Menu(on_close: Callback<()>, children: Children) -> impl IntoView {
+    let escape = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" {
+            on_close.run(());
+        }
+    });
+    on_cleanup(move || escape.remove());
+
+    view! {
+        <div class="menu-backdrop" on:click=move |_| on_close.run(())></div>
+        <div class="menu" role="menu">{children()}</div>
+    }
+}
+
 /// Centered dialog over a dimmed backdrop. Closes on the X button, a click
 /// on the backdrop, or Escape.
 #[component]
@@ -1419,6 +1450,58 @@ fn ContactPanel(
     }
 }
 
+/// The chat header's "⋮" menu: what can be done about the session with
+/// the open contact. So far, repairing it, for when one side can no longer
+/// read the other's messages: both drop the session and set up a new one
+/// (see `api::repair_session`). Hidden while the contact is pending, as
+/// there's no session yet.
+#[component]
+fn ChatMenu(token: String, error: RwSignal<Option<String>>) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let repairing = RwSignal::new(false);
+    let token = StoredValue::new(token);
+    let repair = move |_| {
+        open.set(false);
+        error.set(None);
+        repairing.set(true);
+        let token = token.get_value();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = api::repair_session(&token).await {
+                error.try_set(Some(e));
+            }
+            repairing.try_set(false);
+        });
+    };
+
+    view! {
+        <div class="chat-menu">
+            <button
+                type="button"
+                class="icon-btn menu-btn"
+                title="More"
+                aria-haspopup="menu"
+                aria-expanded=move || open.get().to_string()
+                on:click=move |_| open.update(|o| *o = !*o)
+            >
+                <MenuIcon />
+            </button>
+            <Show when=move || open.get()>
+                <Menu on_close=Callback::new(move |()| open.set(false))>
+                    <button
+                        type="button"
+                        role="menuitem"
+                        title="Set up a new secure session with them, if messages aren't getting through"
+                        disabled=move || repairing.get()
+                        on:click=repair
+                    >
+                        "Repair session"
+                    </button>
+                </Menu>
+            </Show>
+        </div>
+    }
+}
+
 /// Message transcript + send box for whichever contact is selected. Shows
 /// a placeholder state until a contact is picked and until that contact's
 /// session has finished the PQXDH handshake ("established" status) —
@@ -1433,7 +1516,6 @@ fn ChatPanel(
 ) -> impl IntoView {
     let draft = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
-    let repairing = RwSignal::new(false);
 
     // Zero-arg closure so it can be called uniformly from both a click
     // handler (which Leptos passes a MouseEvent to) and a keydown handler
@@ -1501,7 +1583,7 @@ fn ChatPanel(
                 None => view! { <p class="hint">"Select a contact to start chatting."</p> }.into_any(),
                 Some(token) => {
                     let header_token = token.clone();
-                    let repair_token = token.clone();
+                    let menu_token = token.clone();
                     let len_token = token.clone();
                     let status_token = token.clone();
                     let status = move || {
@@ -1553,36 +1635,10 @@ fn ChatPanel(
                             >
                                 "← Contacts"
                             </button>
-                            <h3>"Chat with " {chat_label}</h3>
-                            // For when one side can no longer read the
-                            // other's messages: both drop the session and
-                            // set up a new one (see `api::repair_session`).
+                            <h3>{chat_label}</h3>
                             {move || contacts.with(|list| {
-                                list.iter().any(|c| c.token == repair_token && c.status != "pending")
-                            }).then(|| {
-                                let repair_token = repair_token.clone();
-                                view! {
-                                    <button
-                                        type="button"
-                                        class="secondary repair-btn"
-                                        title="Set up a new secure session with them, if messages aren't getting through"
-                                        disabled=move || repairing.get()
-                                        on:click=move |_| {
-                                            let token = repair_token.clone();
-                                            error.set(None);
-                                            repairing.set(true);
-                                            leptos::task::spawn_local(async move {
-                                                if let Err(e) = api::repair_session(&token).await {
-                                                    error.try_set(Some(e));
-                                                }
-                                                repairing.try_set(false);
-                                            });
-                                        }
-                                    >
-                                        "Repair session"
-                                    </button>
-                                }
-                            })}
+                                list.iter().any(|c| c.token == menu_token && c.status != "pending")
+                            }).then(|| view! { <ChatMenu token=menu_token.clone() error=error /> })}
                         </div>
                         {move || match status().as_deref() {
                             Some("pending") => Some(view! {
