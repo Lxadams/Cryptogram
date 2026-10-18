@@ -798,6 +798,11 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     // panel's scanner, and the panel can unmute.
     let requests = RwSignal::new(api::ConnectionRequestsDto::default());
     let scanning = RwSignal::new(false);
+    // Our QR code popup (see `QrCodeModal`), and, when it opened because we
+    // just scanned someone who hasn't scanned us yet, their token: it
+    // closes once they have.
+    let show_qr = RwSignal::new(false);
+    let qr_waiting_for = RwSignal::new(None::<String>);
     let selected = RwSignal::new(None::<String>);
     // token_hex -> transcript. Populated by both outgoing sends (added
     // immediately, optimistically), incoming polls (added on arrival), and
@@ -867,6 +872,21 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                 });
             }
         });
+    });
+
+    // They've scanned our code once they're past "pending": their side has
+    // reached ours (see `Client::contact_status`).
+    Effect::new(move |_| {
+        let Some(token) = qr_waiting_for.get() else {
+            return;
+        };
+        if contacts.with(|list| {
+            list.iter()
+                .any(|c| c.token == token && c.status != "pending")
+        }) {
+            show_qr.set(false);
+            qr_waiting_for.set(None);
+        }
     });
 
     // Poll the backend every second for contact-status changes and newly
@@ -960,7 +980,11 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         // `chat-open`: on narrow screens, show the chat instead of the
         // contact list (see `.main-screen.chat-open` in style.css).
         <section class="main-screen" class:chat-open=move || selected.get().is_some()>
-            <IdentityCard identity=identity />
+            <IdentityCard identity=identity.clone() show_qr=show_qr />
+            // Before the scanner and the connection request notice, so they
+            // open on top of it: accepting a request means scanning their
+            // code while ours is still up.
+            <QrCodeModal identity=identity show_qr=show_qr waiting_for=qr_waiting_for />
             <div class="columns">
                 <ContactPanel
                     contacts=contacts
@@ -968,6 +992,8 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                     requests=requests
                     scanning=scanning
                     unread=unread
+                    show_qr=show_qr
+                    qr_waiting_for=qr_waiting_for
                 />
                 <ChatPanel
                     contacts=contacts
@@ -995,12 +1021,7 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
 /// are any: whether notifications name senders, on devices that post them,
 /// and the simulated network loss (see `SimulatedLoss`).
 #[component]
-fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
-    let show_qr = RwSignal::new(false);
-    let qr_svg = StoredValue::new(
-        contact_code::encode(&identity.routing_token, &identity.ed25519_public)
-            .and_then(|code| qr::svg_for(&code)),
-    );
+fn IdentityCard(identity: api::IdentityDto, show_qr: RwSignal<bool>) -> impl IntoView {
     let notifications = RwSignal::new(None::<api::NotificationSettingsDto>);
     leptos::task::spawn_local(async move {
         if let Ok(settings) = api::notification_settings().await {
@@ -1063,19 +1084,45 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
                 </details>
             })}
             <SimulatedLoss />
-            <Show when=move || show_qr.get()>
-                <Modal title="Your QR code" on_close=Callback::new(move |()| show_qr.set(false))>
-                    {match qr_svg.get_value() {
-                        Ok(svg) => view! { <div class="qr-code" inner_html=svg></div> }.into_any(),
-                        Err(e) => view! { <p class="error">"Couldn't draw QR code: " {e}</p> }.into_any(),
-                    }}
-                    <p class="hint">
-                        "Have your contact tap \"Scan QR code\" and point their camera here, "
-                        "then scan theirs."
-                    </p>
-                </Modal>
-            </Show>
         </div>
+    }
+}
+
+/// Our QR code, for a contact to scan: opened with "Present QR code", or
+/// by scanning someone who hasn't scanned us yet (`waiting_for` is then
+/// their token), so they can scan ours straight back. Closes when we scan
+/// someone who had already scanned it, or once `waiting_for` has (see
+/// `MainScreen`), as well as the usual ways.
+#[component]
+fn QrCodeModal(
+    identity: api::IdentityDto,
+    show_qr: RwSignal<bool>,
+    waiting_for: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let qr_svg = StoredValue::new(
+        contact_code::encode(&identity.routing_token, &identity.ed25519_public)
+            .and_then(|code| qr::svg_for(&code)),
+    );
+    let close = Callback::new(move |()| {
+        show_qr.set(false);
+        waiting_for.set(None);
+    });
+    view! {
+        <Show when=move || show_qr.get()>
+            <Modal title="Your QR code" on_close=close>
+                {match qr_svg.get_value() {
+                    Ok(svg) => view! { <div class="qr-code" inner_html=svg></div> }.into_any(),
+                    Err(e) => view! { <p class="error">"Couldn't draw QR code: " {e}</p> }.into_any(),
+                }}
+                <p class="hint">
+                    {move || if waiting_for.get().is_some() {
+                        "Added. Now have them tap \"Scan QR code\" and scan this; it closes once they have."
+                    } else {
+                        "Have your contact tap \"Scan QR code\" and point their camera here, then scan theirs."
+                    }}
+                </p>
+            </Modal>
+        </Show>
     }
 }
 
@@ -1291,6 +1338,8 @@ fn ContactPanel(
     requests: RwSignal<api::ConnectionRequestsDto>,
     scanning: RwSignal<bool>,
     unread: RwSignal<HashMap<String, usize>>,
+    show_qr: RwSignal<bool>,
+    qr_waiting_for: RwSignal<Option<String>>,
 ) -> impl IntoView {
     let token_input = RwSignal::new(String::new());
     let key_input = RwSignal::new(String::new());
@@ -1316,15 +1365,28 @@ fn ContactPanel(
 
     // Runs for every QR code the scanner decodes. Anything that isn't a
     // contact code goes back to the scanner as an error so it keeps
-    // looking; a valid one closes the scanner and sends the request.
+    // looking; a valid one closes the scanner and sends the request. Then
+    // our own QR code: if they'd already scanned it (they're asking to
+    // connect), it has done its job and closes; if not, it opens for them
+    // to scan, and closes once they have (see `QrCodeModal`).
     let on_scan = Callback::new(move |raw: String| {
         let code = contact_code::parse(&raw)?;
-        clear_request(&code.token_hex);
+        let token = code.token_hex.trim().to_ascii_lowercase();
+        let scanned_us = requests.with_untracked(|r| r.tokens.contains(&token));
+        clear_request(&token);
         scanning.set(false);
         error.set(None);
         leptos::task::spawn_local(async move {
-            if let Err(e) = api::connect_to_peer(&code.token_hex, &code.ed25519_hex).await {
-                error.set(Some(e));
+            match api::connect_to_peer(&code.token_hex, &code.ed25519_hex).await {
+                Ok(()) if scanned_us => {
+                    show_qr.set(false);
+                    qr_waiting_for.set(None);
+                }
+                Ok(()) => {
+                    qr_waiting_for.set(Some(token));
+                    show_qr.set(true);
+                }
+                Err(e) => error.set(Some(e)),
             }
         });
         Ok(())
