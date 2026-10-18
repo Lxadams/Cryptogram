@@ -16,6 +16,7 @@
 use crate::RoutingToken;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub struct ChatHistory {
@@ -161,6 +162,24 @@ impl ChatHistory {
         Ok(())
     }
 
+    /// When the latest message (sent or received) with each contact we have
+    /// any history with was recorded, in Unix milliseconds: what a contact
+    /// list is ordered by, newest first.
+    pub fn latest_per_contact(&self) -> Result<HashMap<RoutingToken, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT contact_token, MAX(timestamp_ms) FROM messages GROUP BY contact_token",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut latest = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let mut token = [0u8; 16];
+            if hex::decode_to_slice(row.get::<_, String>(0)?, &mut token).is_ok() {
+                latest.insert(token, row.get(1)?);
+            }
+        }
+        Ok(latest)
+    }
+
     /// The most recent `limit` messages with `contact_token`, oldest first.
     pub fn recent(&self, contact_token: RoutingToken, limit: i64) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
@@ -235,6 +254,21 @@ mod tests {
         assert_eq!(msgs[1].text, "hello back");
         // Oldest-first ordering, and ids strictly increasing.
         assert!(msgs[0].id < msgs[1].id);
+    }
+
+    #[test]
+    fn test_latest_per_contact_is_each_contacts_newest_message() {
+        let db = ScratchDb::new("latest");
+        let history = ChatHistory::open(&db.0, &[6u8; 32]).unwrap();
+        let (alice, bob, carol) = ([1u8; 16], [2u8; 16], [3u8; 16]);
+        history.append_at(alice, true, "a1", 100).unwrap();
+        history.append_at(bob, false, "b1", 300).unwrap();
+        history.append_at(alice, false, "a2", 200).unwrap();
+
+        let latest = history.latest_per_contact().unwrap();
+        assert_eq!(latest.get(&alice), Some(&200));
+        assert_eq!(latest.get(&bob), Some(&300));
+        assert_eq!(latest.get(&carol), None, "no history, no entry");
     }
 
     #[test]

@@ -196,6 +196,25 @@ fn TrashIcon() -> impl IntoView {
     }
 }
 
+/// A small square with how many new messages there are (see `MainScreen`'s
+/// `unread`), or nothing when there are none.
+#[component]
+fn UnreadBadge(count: usize) -> impl IntoView {
+    (count > 0).then(|| {
+        let label = if count > 99 {
+            "99+".to_string()
+        } else {
+            count.to_string()
+        };
+        let title = if count == 1 {
+            "1 new message".to_string()
+        } else {
+            format!("{count} new messages")
+        };
+        view! { <span class="unread-badge" title=title>{label}</span> }
+    })
+}
+
 /// Three dots, for a button that opens a menu (see `Menu`).
 #[component]
 fn MenuIcon() -> impl IntoView {
@@ -789,6 +808,18 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     // state, deleted the conversation, or reconnected from scratch.
     let messages = RwSignal::new(HashMap::<String, Vec<ChatMessage>>::new());
     let history_loaded_for = RwSignal::new(HashSet::<String>::new());
+    // token_hex -> how many messages arrived from them while their chat
+    // wasn't open, shown next to their name (see `UnreadBadge`). Opening
+    // the chat clears it. Live only: a restart starts from none, and
+    // anything that arrived meanwhile counts once it's handed over.
+    let unread = RwSignal::new(HashMap::<String, usize>::new());
+    Effect::new(move |_| {
+        if let Some(token) = selected.get() {
+            unread.update(|counts| {
+                counts.remove(&token);
+            });
+        }
+    });
     // Send statuses that came before their message was added: `send_message`
     // returns only once the first packet is out, and a short message can be
     // confirmed by then. Keyed by message id; the send takes its status
@@ -860,6 +891,15 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
             if let Ok(incoming) = api::poll_inbox().await
                 && !incoming.is_empty()
             {
+                // New unless their chat is the one open.
+                let open = selected.try_get_untracked().flatten();
+                let _ = unread.try_update(|counts| {
+                    for msg in &incoming {
+                        if open.as_ref() != Some(&msg.from_token) {
+                            *counts.entry(msg.from_token.clone()).or_default() += 1;
+                        }
+                    }
+                });
                 messages.update(|map| {
                     for msg in incoming {
                         map.entry(msg.from_token).or_default().push(ChatMessage {
@@ -927,12 +967,14 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                     selected=selected
                     requests=requests
                     scanning=scanning
+                    unread=unread
                 />
                 <ChatPanel
                     contacts=contacts
                     selected=selected
                     messages=messages
                     early_updates=early_updates
+                    unread=unread
                 />
             </div>
             <ConnectionRequestNotice requests=requests scanning=scanning selected=selected />
@@ -1248,6 +1290,7 @@ fn ContactPanel(
     selected: RwSignal<Option<String>>,
     requests: RwSignal<api::ConnectionRequestsDto>,
     scanning: RwSignal<bool>,
+    unread: RwSignal<HashMap<String, usize>>,
 ) -> impl IntoView {
     let token_input = RwSignal::new(String::new());
     let key_input = RwSignal::new(String::new());
@@ -1354,6 +1397,12 @@ fn ContactPanel(
                                             <code>{contact.token.chars().take(8).collect::<String>()}"..."</code>
                                         }.into_any(),
                                     }}
+                                    {
+                                        let token = contact.token.clone();
+                                        move || view! {
+                                            <UnreadBadge count=unread.with(|counts| counts.get(&token).copied().unwrap_or(0)) />
+                                        }
+                                    }
                                 </span>
                                 <span class=format!("status status-{}", contact.status)>
                                     {contact.status.clone()}
@@ -1513,6 +1562,7 @@ fn ChatPanel(
     selected: RwSignal<Option<String>>,
     messages: RwSignal<HashMap<String, Vec<ChatMessage>>>,
     early_updates: StoredValue<HashMap<u64, SendStatus>>,
+    unread: RwSignal<HashMap<String, usize>>,
 ) -> impl IntoView {
     let draft = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
@@ -1634,6 +1684,12 @@ fn ChatPanel(
                                 on:click=move |_| selected.set(None)
                             >
                                 "← Contacts"
+                                // From the others: in the one-column layout,
+                                // the list (and their badges) is hidden while
+                                // a chat is open.
+                                {move || view! {
+                                    <UnreadBadge count=unread.with(|counts| counts.values().sum()) />
+                                }}
                             </button>
                             <h3>{chat_label}</h3>
                             {move || contacts.with(|list| {

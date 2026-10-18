@@ -501,6 +501,28 @@ button.danger {
   min-width: 0;
 }
 
+/* How many new messages a contact has sent (see `UnreadBadge`): a small
+   square after their name, and the total on the back button. */
+.unread-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding: 0 0.3rem;
+  border-radius: 4px;
+  background: var(--accent);
+  color: white;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.back-btn .unread-badge {
+  margin-left: 0.4rem;
+}
+
 /* "Waiting for them to scan your code", on its own row under a pending
    contact. */
 .contact-list li .contact-hint {
@@ -525,6 +547,7 @@ button.danger {
 .chat-header .back-btn {
   grid-column: 1;
   justify-self: start;
+  align-items: center;
 }
 
 .chat-header h3 {

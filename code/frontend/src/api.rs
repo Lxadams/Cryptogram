@@ -71,6 +71,10 @@ pub struct ContactDto {
     pub token: String,
     pub status: String,
     pub name: Option<String>,
+    /// When the latest message with them was recorded (Unix milliseconds):
+    /// the list comes newest first.
+    #[serde(default)]
+    pub last_message_ms: Option<i64>,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]

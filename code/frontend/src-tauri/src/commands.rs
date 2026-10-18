@@ -790,6 +790,9 @@ pub struct ContactDto {
     /// The display name this contact chose for themselves, learned from
     /// their KeyExchange (see `Client::contact_names`), if they set one.
     pub name: Option<String>,
+    /// When the latest message with them, sent or received, was recorded
+    /// (Unix milliseconds), or `None` if there's none yet.
+    pub last_message_ms: Option<i64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1113,12 +1116,18 @@ fn notification_sender(client: &Client, from: &RoutingToken) -> Option<String> {
 /// — everyone the UI should show in the contact list, with a status badge
 /// for which stage they're at (see `ContactDto::status`): "established"
 /// only once both sides have the session (see `Client::is_connected`).
+/// Newest conversation first (see `ContactDto::last_message_ms`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>, String> {
     let guard = state.runtime.lock().await;
     let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
 
     let client = &rt.client;
+    let latest = client
+        .history
+        .as_ref()
+        .and_then(|history| history.latest_per_contact().ok())
+        .unwrap_or_default();
     let tokens: HashSet<&RoutingToken> = client
         .pending_contacts
         .keys()
@@ -1135,11 +1144,17 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
             }
             .to_string(),
             name: client.contact_names.get(token).cloned(),
+            last_message_ms: latest.get(token).copied(),
         })
         .collect();
-    // A stable order (by name, then token) so the list doesn't reshuffle
-    // between polls — hash-map iteration order is arbitrary.
-    contacts.sort_by(|a, b| (&a.name, &a.token).cmp(&(&b.name, &b.token)));
+    // Whoever messaged (or was messaged) most recently first, then those
+    // with no messages yet, by name then token. Stable between polls, as
+    // hash-map iteration order is arbitrary.
+    contacts.sort_by(|a, b| {
+        b.last_message_ms
+            .cmp(&a.last_message_ms)
+            .then_with(|| (&a.name, &a.token).cmp(&(&b.name, &b.token)))
+    });
 
     Ok(contacts)
 }
