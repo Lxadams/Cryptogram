@@ -38,6 +38,8 @@ pub fn run() {
         ])
         .setup(|app| {
             background::init(app.handle());
+            #[cfg(all(target_os = "android", debug_assertions))]
+            forward_stdout_to_logcat();
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -54,6 +56,51 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| background::on_run_event(app, &event));
+}
+
+/// Sends what's printed to stdout and stderr to logcat, tagged `E2E`, a
+/// line at a time. The client crate reports what happens to each packet
+/// with `println!` (sessions set up, PQ refreshes, messages it can't
+/// decrypt yet), which Android otherwise throws away, so this is how to
+/// watch it on a phone: `adb logcat -s E2E`. Debug builds only: it prints
+/// messages as they arrive, which a release build mustn't put in the
+/// system log.
+#[cfg(all(target_os = "android", debug_assertions))]
+fn forward_stdout_to_logcat() {
+    use std::ffi::CString;
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::FromRawFd;
+    use std::os::raw::{c_char, c_int};
+
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+    const ANDROID_LOG_INFO: c_int = 4;
+
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: `fds` has room for the two descriptors `pipe` writes.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return;
+    }
+    // SAFETY: plain descriptor calls on ones we own; stdout and stderr
+    // become the pipe's write end.
+    unsafe {
+        libc::dup2(fds[1], libc::STDOUT_FILENO);
+        libc::dup2(fds[1], libc::STDERR_FILENO);
+        libc::close(fds[1]);
+    }
+    // SAFETY: the read end is ours alone, and the File takes it over.
+    let reader = BufReader::new(unsafe { std::fs::File::from_raw_fd(fds[0]) });
+    std::thread::spawn(move || {
+        let tag = c"E2E";
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(text) = CString::new(line) {
+                // SAFETY: both are valid NUL-terminated strings.
+                unsafe { __android_log_write(ANDROID_LOG_INFO, tag.as_ptr(), text.as_ptr()) };
+            }
+        }
+    });
 }
 
 /// Lets the frontend's QR scanner (src/qr.rs) use the camera on Linux.

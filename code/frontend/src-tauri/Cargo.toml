@@ -49,6 +49,9 @@ webkit2gtk = { version = "2.0", features = ["v2_8"] }
 # src/background.rs). Same version tao/wry already use there.
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+# To pass the client's printed diagnostics on to logcat in debug builds
+# (see `forward_stdout_to_logcat` in src/lib.rs). Already in the tree.
+libc = "0.2"
 
 # Argon2id (see `ARGON2_M_COST_KIB` in code/client/src/lib.rs) is built
 # optimised even in debug builds and tests, where it would otherwise take

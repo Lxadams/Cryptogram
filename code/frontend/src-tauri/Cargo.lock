@@ -973,6 +973,7 @@ dependencies = [
  "client",
  "hex",
  "jni",
+ "libc",
  "log",
  "serde",
  "tauri",
