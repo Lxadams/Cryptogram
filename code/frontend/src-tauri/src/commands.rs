@@ -1017,7 +1017,9 @@ fn spawn_keepalive_loop(
 }
 
 /// Background task, twice a second: ask the relay which of our messages it
-/// has (see `Client::receipt_requests`), and hand over any message held for
+/// has (see `Client::receipt_requests`), ask contacts for any PQ refresh we're
+/// holding their messages for (see `Client::pq_inject_requests`), and hand
+/// over any message held for
 /// one sent before it that has waited long enough (see
 /// `Client::release_held_messages`), with a notification, as the receive
 /// loop would have if a packet had come in.
@@ -1034,7 +1036,8 @@ fn spawn_tick_loop(app: AppHandle, socket: Arc<UdpSocket>) -> tauri::async_runti
             let inbox_before = rt.client.inbox.len();
             rt.client.release_held_messages();
             notify_new_messages(&rt.client, inbox_before);
-            let packets = rt.client.receipt_requests();
+            let mut packets = rt.client.receipt_requests();
+            packets.extend(rt.client.pq_inject_requests());
             let server_addr = rt.client.server_addr;
             drop(guard);
             for packet in packets {

@@ -14,8 +14,9 @@ use x25519_dalek::PublicKey as X25519PublicKey;
 // defines `signed_bytes()` (the part before the signature); `to_bytes()`,
 // `verify()` and signing in `generate()` are all derived from that one
 // function, which is what keeps the signed and serialized layouts from ever
-// drifting apart. (PQInjectPayload's signature also covers a session binding
-// that isn't sent — see its `signing_input`.)
+// drifting apart. (PQInjectPayload's and PQInjectRequestPayload's
+// signatures also cover a session binding that isn't sent — see their
+// `signing_input`.)
 
 const TOKEN_LEN: usize = 16;
 /// Sender token + target token + timestamp.
@@ -410,6 +411,99 @@ impl PQInjectPayload {
     }
 }
 
+// ============================================================
+// PQInjectRequestPayload (0x08) — 120 bytes
+// ============================================================
+
+const PQIR_LEN: usize = HEADER_LEN + 8 + 8 + SIG_LEN;
+
+/// Asks the peer to send again the PQ refreshes (see `PQInjectPayload`) it
+/// mixed in at positions `from..=through`: the sender is holding messages
+/// it can't decrypt without one it never got (see
+/// `Client::pq_inject_requests`).
+pub struct PQInjectRequestPayload {
+    pub routing_token: RoutingToken,
+    pub target_token: RoutingToken,
+    pub timestamp: u64,
+    /// The asker's receive position: it has every refresh before this one.
+    pub from: u64,
+    /// The furthest message it's holding.
+    pub through: u64,
+    pub signature: Signature,
+}
+
+impl PQInjectRequestPayload {
+    fn signed_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PQIR_LEN);
+        write_header(
+            &mut out,
+            &self.routing_token,
+            &self.target_token,
+            self.timestamp,
+        );
+        out.extend_from_slice(&self.from.to_be_bytes());
+        out.extend_from_slice(&self.through.to_be_bytes());
+        out
+    }
+
+    /// What the signature covers: a label, so it can't be mistaken for any
+    /// other signed payload, everything before it on the wire, and the
+    /// session binding, as for `PQInjectPayload::signing_input`: a request
+    /// only verifies on the session it was made for.
+    fn signing_input(&self, session_binding: &[u8; 32]) -> Vec<u8> {
+        let mut input = b"pq-inject-request".to_vec();
+        input.extend_from_slice(&self.signed_bytes());
+        input.extend_from_slice(session_binding);
+        input
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        with_signature(self.signed_bytes(), &self.signature)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let (routing_token, target_token, timestamp, body, signature) =
+            split_payload(bytes, PQIR_LEN, "PQ inject request")?;
+        Ok(Self {
+            routing_token,
+            target_token,
+            timestamp,
+            from: u64::from_be_bytes(body[..8].try_into().unwrap()),
+            through: u64::from_be_bytes(body[8..].try_into().unwrap()),
+            signature,
+        })
+    }
+
+    pub fn generate(
+        identity: &UserIdentity,
+        target_token: RoutingToken,
+        from: u64,
+        through: u64,
+        session_binding: &[u8; 32],
+    ) -> Self {
+        let mut payload = Self {
+            routing_token: identity.routing_token,
+            target_token,
+            timestamp: now_secs(),
+            from,
+            through,
+            signature: unsigned(),
+        };
+        payload.signature = identity
+            .ed25519_secret
+            .sign(&payload.signing_input(session_binding));
+        payload
+    }
+
+    pub fn verify(&self, ed25519_pub: &VerifyingKey, session_binding: &[u8; 32]) -> Result<()> {
+        check_signature(
+            &self.signing_input(session_binding),
+            &self.signature,
+            ed25519_pub,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +515,7 @@ mod tests {
         assert_eq!(KX_LEN, 1393);
         assert_eq!(EST_LEN, 1232);
         assert_eq!(PQI_LEN, 1200);
+        assert_eq!(PQIR_LEN, 120);
         // ML-KEM-768 (FIPS 203) has the sizes round-3 Kyber-768 had, and the
         // same key layout, so payloads kept their sizes and identities saved
         // with Kyber keys still load: they're valid ML-KEM keys.
@@ -464,6 +559,23 @@ mod tests {
         let mut bad_flag = expected;
         bad_flag[KX_LEN - SIG_LEN - 9] = 4;
         assert!(KeyExchangePayload::from_bytes(&bad_flag).is_err());
+    }
+
+    /// A request round-trips, and only verifies with the asker's key on the
+    /// session it was made for.
+    #[test]
+    fn pq_inject_request_roundtrips_and_is_bound_to_its_session() {
+        let identity = UserIdentity::generate();
+        let binding = [7u8; 32];
+        let request = PQInjectRequestPayload::generate(&identity, [9u8; 16], 5, 12, &binding);
+        let parsed = PQInjectRequestPayload::from_bytes(&request.to_bytes()).unwrap();
+        assert_eq!((parsed.from, parsed.through), (5, 12));
+        assert_eq!(parsed.routing_token, identity.routing_token);
+        assert!(parsed.verify(&identity.ed25519_public, &binding).is_ok());
+        assert!(parsed.verify(&identity.ed25519_public, &[8u8; 32]).is_err());
+        let other = UserIdentity::generate();
+        assert!(parsed.verify(&other.ed25519_public, &binding).is_err());
+        assert!(PQInjectRequestPayload::from_bytes(&request.to_bytes()[1..]).is_err());
     }
 
     /// No session is `None`, not a session for add ID 0 (which a contact

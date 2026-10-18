@@ -79,6 +79,27 @@ const MAX_TIMESTAMP_DRIFT: u64 = 300;
 // their position. Refreshes come at least PQ_INJECT_INTERVAL steps apart and
 // messages more than 100 steps ahead are rejected anyway, so this is ample.
 const MAX_PENDING_PQ_INJECTS: usize = 32;
+
+// Our latest PQ refreshes kept per session, to send again if the peer never
+// got one (see `SymmetricSessionState::sent_pq_injects`). The receive chain
+// looks at most 100 messages ahead, which spans this many refreshes; one
+// missing from further back can't be recovered anyway.
+const KEPT_PQ_INJECTS: usize = 100 / PQ_INJECT_INTERVAL as usize;
+
+// While holding messages for a PQ refresh that hasn't arrived, we ask the
+// sender for it again (see `Client::pq_inject_requests`): first after this
+// long, as a refresh is often just a moment behind the message after it,
+// then twice as long each time, up to `MAX_PQ_INJECT_ASK_DELAY`.
+const FIRST_PQ_INJECT_ASK: Duration = Duration::from_secs(3);
+const MAX_PQ_INJECT_ASK_DELAY: Duration = Duration::from_secs(30);
+// Copies of each request, and of each refresh sent again, as each is a
+// single packet with nothing else to make up for losing it. At 70% loss on
+// both uplinks, three copies each way get a refresh through four times in
+// ten; the asking repeats until one does.
+const PQ_RECOVERY_COPIES: usize = 3;
+// Requests from a peer closer together than this get one answer: the
+// copies of one request arrive together.
+const MIN_PQ_RESEND_GAP: Duration = Duration::from_secs(1);
 /// Most send statuses kept for a front end to collect (see
 /// `Client::drain_send_updates`).
 const MAX_SEND_UPDATES: usize = 256;
@@ -395,6 +416,13 @@ pub struct SymmetricSessionState {
     /// The peer's chat payloads that can't be decrypted until a PQ inject
     /// still on its way arrives (see `ParkedPayloads`).
     pub parked: transport::ParkedPayloads,
+    /// Our latest PQ refreshes on this session, as the signed 0x05 payloads
+    /// we sent, by the position they apply at: if one never reaches the
+    /// peer, it asks for it (see `Client::pq_inject_requests`) and gets it
+    /// again, as only its Kyber ciphertext can bring their receive chain
+    /// back in step with our send chain. Nothing secret: the ciphertext is
+    /// for their key. The latest `KEPT_PQ_INJECTS`.
+    pub sent_pq_injects: BTreeMap<u64, Vec<u8>>,
 }
 
 /// PQ refreshes received from the peer, tracked by the position the sender
@@ -457,6 +485,7 @@ impl SymmetricSessionState {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: BTreeMap::new(),
         }
     }
 
@@ -583,6 +612,15 @@ impl SymmetricSessionState {
     /// Mix fresh PQ shared secret into the send chain key via HKDF (called by sender)
     pub fn inject_pq_secret_send(&mut self, pq_secret_bytes: &[u8]) {
         mix_pq_secret(&mut self.send_chain_key, pq_secret_bytes);
+    }
+
+    /// Keep the refresh we mixed in at `applies_at` (its signed 0x05
+    /// payload), to send again if asked (see `sent_pq_injects`).
+    fn keep_sent_pq_inject(&mut self, applies_at: u64, payload: Vec<u8>) {
+        self.sent_pq_injects.insert(applies_at, payload);
+        while self.sent_pq_injects.len() > KEPT_PQ_INJECTS {
+            self.sent_pq_injects.pop_first();
+        }
     }
 }
 
@@ -791,6 +829,23 @@ pub struct Client {
     listed_requests: VecDeque<Instant>,
     /// Whose requests were dismissed ("Not now"), and when. Live state.
     dismissed_requests: HashMap<RoutingToken, Instant>,
+    /// When to next ask each contact we're holding messages from for the
+    /// PQ refresh they need (see `pq_inject_requests`). Live state.
+    pq_inject_asks: HashMap<RoutingToken, PqInjectAsk>,
+    /// When we last sent each contact refreshes they asked for again (see
+    /// `MIN_PQ_RESEND_GAP`). Live state.
+    pq_resent_at: HashMap<RoutingToken, Instant>,
+    /// Packets handling an incoming packet produced beyond its one reply
+    /// (refreshes a contact asked for again), for `handle_relay_packet` to
+    /// send after it. Live state.
+    extra_replies: Vec<Vec<u8>>,
+}
+
+/// When `Client::pq_inject_requests` next asks a contact for a PQ refresh,
+/// and how long it waits after that.
+struct PqInjectAsk {
+    at: Instant,
+    delay: Duration,
 }
 
 /// Where a new identity's add-ID counter starts (see `AddIds`): somewhere
@@ -845,6 +900,9 @@ impl Client {
             connection_requests: Vec::new(),
             listed_requests: VecDeque::new(),
             dismissed_requests: HashMap::new(),
+            pq_inject_asks: HashMap::new(),
+            pq_resent_at: HashMap::new(),
+            extra_replies: Vec::new(),
         }
     }
 
@@ -1617,6 +1675,58 @@ impl Client {
         }
     }
 
+    /// Ask each contact we're holding messages from (see `ParkedPayloads`)
+    /// for the PQ refreshes those messages need, when that's due: first
+    /// `FIRST_PQ_INJECT_ASK` after we start holding them, then less and less
+    /// often, until they decrypt. A refresh travels once, in the burst of
+    /// the message that triggered it, so if that burst is lost, this is the
+    /// only way it comes again; without it, nothing from them would decrypt
+    /// again on this session. Returns the packets to send. Call it a few
+    /// times a second.
+    pub fn pq_inject_requests(&mut self) -> Vec<Vec<u8>> {
+        self.pq_inject_requests_at(Instant::now())
+    }
+
+    fn pq_inject_requests_at(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        // Who we're holding messages from: from our receive position to the
+        // furthest message held.
+        let waiting: Vec<(RoutingToken, u64, u64)> = self
+            .e2e_sessions
+            .iter()
+            .filter_map(|(token, session)| {
+                let through = *session.parked.0.keys().next_back()?;
+                Some((*token, session.recv_count, through))
+            })
+            .collect();
+        self.pq_inject_asks
+            .retain(|token, _| waiting.iter().any(|(waiting, ..)| waiting == token));
+        let mut packets = Vec::new();
+        for (token, from, through) in waiting {
+            let ask = self.pq_inject_asks.entry(token).or_insert(PqInjectAsk {
+                at: now + FIRST_PQ_INJECT_ASK,
+                delay: FIRST_PQ_INJECT_ASK,
+            });
+            if now < ask.at {
+                continue;
+            }
+            ask.delay = (ask.delay * 2).min(MAX_PQ_INJECT_ASK_DELAY);
+            ask.at = now + ask.delay;
+            let binding = self.e2e_sessions[&token].pq_inject_binding();
+            let request =
+                PQInjectRequestPayload::generate(&self.identity, token, from, through, &binding);
+            let mut inner = vec![0x08];
+            inner.extend_from_slice(&request.to_bytes());
+            println!(
+                ">> [PQ] Holding messages from {} for a post-quantum refresh that hasn't arrived: asking for it again.",
+                short(&token)
+            );
+            for _ in 0..PQ_RECOVERY_COPIES {
+                packets.push(self.wrap_link_encryption(token, &inner));
+            }
+        }
+        packets
+    }
+
     /// Ask the relay which of the messages we sent it has, when that's due,
     /// and give up on any it hasn't confirmed within `CONFIRM_TIMEOUT`.
     /// Returns the packets to send. Call it a few times a second.
@@ -1745,8 +1855,6 @@ impl Client {
             (e2e_payloads, pq_ct)
         };
         // mutable borrow on self.e2e_sessions released
-        self.save();
-        self.record_message(target_token, true, plaintext);
 
         // Phase 2: build the signed PQ inject payload (immutable borrow on self)
         let pq_payload = pq_ct.map(|(applies_at, kyber_ct, binding)| {
@@ -1759,10 +1867,19 @@ impl Client {
             );
             let mut inner = vec![0x05];
             inner.extend_from_slice(&pqi_payload.to_bytes());
-            inner
+            (applies_at, inner)
         });
+        // Kept, and saved along with the ratchet it moved, in case the peer
+        // never gets it and asks again.
+        if let Some((applies_at, inner)) = &pq_payload
+            && let Some(session) = self.e2e_sessions.get_mut(&target_token)
+        {
+            session.keep_sent_pq_inject(*applies_at, inner.clone());
+        }
+        self.save();
+        self.record_message(target_token, true, plaintext);
 
-        Ok((e2e_payloads, pq_payload))
+        Ok((e2e_payloads, pq_payload.map(|(_, inner)| inner)))
     }
 
     /// Whether a signed control payload's timestamp is within
@@ -1875,6 +1992,7 @@ impl Client {
         {
             out.push(reply);
         }
+        out.append(&mut self.extra_replies);
         if self.admission_changed {
             out.push(self.generate_sync_packet());
         }
@@ -2016,6 +2134,78 @@ impl Client {
                         }
                     } else {
                         println!(">> PQInject received but sender unknown (not in contacts).");
+                    }
+                }
+                Ok(None)
+            }
+            0x08 => {
+                // PQ inject request: a contact is holding our messages for a
+                // refresh that never reached them (see `pq_inject_requests`).
+                // Signed on this session, so only they can ask.
+                let Ok(request) = PQInjectRequestPayload::from_bytes(pkt_data) else {
+                    return Ok(None);
+                };
+                if !self.is_addressed_to_us("PQ inject request", &request.target_token) {
+                    return Ok(None);
+                }
+                let peer = request.routing_token;
+                let (Some(&peer_ed25519), Some(session)) = (
+                    self.pending_contacts.get(&peer),
+                    self.e2e_sessions.get_mut(&peer),
+                ) else {
+                    return Ok(None);
+                };
+                // Most often one they sent before the session was repaired,
+                // which the relay was still holding: routine, not an alert.
+                if request
+                    .verify(&peer_ed25519, &session.pq_inject_binding())
+                    .is_err()
+                {
+                    println!(
+                        ">> Ignored a PQ inject request from {} that isn't for your current session (sent before a repair?).",
+                        short(&peer)
+                    );
+                    return Ok(None);
+                }
+                // They've mixed in every refresh before `from`: no need to
+                // keep those.
+                let kept_before = session.sent_pq_injects.len();
+                session
+                    .sent_pq_injects
+                    .retain(|&applies_at, _| applies_at >= request.from);
+                let wanted: Vec<Vec<u8>> = session
+                    .sent_pq_injects
+                    .iter()
+                    .filter(|&(&applies_at, _)| applies_at <= request.through)
+                    .map(|(_, payload)| payload.clone())
+                    .collect();
+                if session.sent_pq_injects.len() != kept_before {
+                    self.save();
+                }
+                if self
+                    .pq_resent_at
+                    .get(&peer)
+                    .is_some_and(|at| at.elapsed() < MIN_PQ_RESEND_GAP)
+                {
+                    return Ok(None);
+                }
+                self.pq_resent_at.insert(peer, Instant::now());
+                if wanted.is_empty() {
+                    println!(
+                        ">> [PQ] {} is missing a post-quantum refresh we no longer have. Repair the session.",
+                        short(&peer)
+                    );
+                    return Ok(None);
+                }
+                println!(
+                    ">> [PQ] {} is missing post-quantum refreshes: sending {} again.",
+                    short(&peer),
+                    wanted.len()
+                );
+                for payload in wanted {
+                    for _ in 0..PQ_RECOVERY_COPIES {
+                        let packet = self.wrap_link_encryption(peer, &payload);
+                        self.extra_replies.push(packet);
                     }
                 }
                 Ok(None)
@@ -2900,6 +3090,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -2912,6 +3103,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         for i in 0..10 {
             let alice_mk = alice_state.symmetric_ratchet();
@@ -2934,6 +3126,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         let mut seen_keys = std::collections::HashSet::new();
         for _ in 0..100 {
@@ -2961,6 +3154,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
             },
         );
         bob.e2e_sessions.insert(
@@ -2976,6 +3170,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
             },
         );
         let (packet, _pq) = alice
@@ -3018,6 +3213,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -3076,6 +3272,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
                 peer_kyber_pub: None, // No Kyber key!
             },
         );
@@ -3114,6 +3311,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -3129,6 +3327,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
                 peer_kyber_pub: Some(alice_kyber_copy),
             },
         );
@@ -3191,6 +3390,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -3238,6 +3438,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         for _ in 0..5 {
             no_pq_state.symmetric_ratchet();
@@ -4280,6 +4481,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
             },
         );
         let chain_before = bob.e2e_sessions[&alice_id.routing_token].recv_chain_key;
@@ -4329,6 +4531,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4341,6 +4544,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
 
         let mk1 = alice_state.symmetric_ratchet();
@@ -4387,6 +4591,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4399,6 +4604,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
 
         // Receive packet with seq_no 150 (exceeds MAX_SKIP_DICT_ENTRIES of 100)
@@ -4468,6 +4674,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4480,6 +4687,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
 
         let mk0 = alice_state.symmetric_ratchet();
@@ -4654,6 +4862,7 @@ mod tests {
                         parked_at_ms: 5678,
                     },
                 )])),
+                sent_pq_injects: BTreeMap::from([(5, vec![0x05, 9, 8])]),
             },
         );
         original
@@ -4715,6 +4924,7 @@ mod tests {
         assert_eq!(orig_sess.recv_count, load_sess.recv_count);
         assert_eq!(orig_sess.skip_dict.len(), load_sess.skip_dict.len());
         assert_eq!(orig_sess.skip_dict[&1], load_sess.skip_dict[&1]);
+        assert_eq!(orig_sess.sent_pq_injects, load_sess.sent_pq_injects);
         assert_eq!(
             orig_sess.recv_pq_injects.pending,
             load_sess.recv_pq_injects.pending
@@ -4770,6 +4980,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
             },
         );
 
@@ -4786,6 +4997,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
             },
         );
 
@@ -4800,6 +5012,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
 
         let mut charlie_sender = SymmetricSessionState {
@@ -4813,6 +5026,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
 
         let mut bob_pkts = vec![];

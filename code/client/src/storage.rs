@@ -117,6 +117,11 @@ pub struct SymmetricSessionStateDto {
     // Older state files predate them.
     #[serde(default)]
     pub parked_payloads: Vec<ParkedDto>,
+    // Our latest PQ refreshes, hex, by the position they apply at, to send
+    // again if asked (see `SymmetricSessionState::sent_pq_injects`). Older
+    // state files predate them.
+    #[serde(default)]
+    pub sent_pq_injects: HashMap<u64, String>,
 }
 
 /// A `Parked` payload, by its seq number.
@@ -209,6 +214,11 @@ impl ClientStateDto {
                             payload: hex::encode(&parked.payload),
                             parked_at_ms: parked.parked_at_ms,
                         })
+                        .collect(),
+                    sent_pq_injects: state
+                        .sent_pq_injects
+                        .iter()
+                        .map(|(&applies_at, payload)| (applies_at, hex::encode(payload)))
                         .collect(),
                 },
             );
@@ -404,6 +414,11 @@ impl ClientStateDto {
                 );
             }
 
+            let mut sent_pq_injects = BTreeMap::new();
+            for (applies_at, payload) in dto_state.sent_pq_injects {
+                sent_pq_injects.insert(applies_at, hex::decode(&payload)?);
+            }
+
             e2e_sessions.insert(
                 tok,
                 SymmetricSessionState {
@@ -420,6 +435,7 @@ impl ClientStateDto {
                     },
                     delivery,
                     parked,
+                    sent_pq_injects,
                 },
             );
         }
@@ -537,6 +553,9 @@ impl ClientStateDto {
             connection_requests: Vec::new(), // live state, not persisted
             listed_requests: Default::default(), // live state, not persisted
             dismissed_requests: HashMap::new(), // live state, not persisted
+            pq_inject_asks: HashMap::new(),
+            pq_resent_at: HashMap::new(),
+            extra_replies: Vec::new(),
         })
     }
 }

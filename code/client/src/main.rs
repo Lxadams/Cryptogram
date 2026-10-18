@@ -125,8 +125,9 @@ async fn main() -> Result<()> {
     // Background task, twice a second: print any message held for one sent
     // before it that has waited long enough (see
     // `Client::release_held_messages`), whether or not another packet comes
-    // in meanwhile, and ask the relay which of our messages it has (see
-    // `Client::receipt_requests`).
+    // in meanwhile, ask the relay which of our messages it has (see
+    // `Client::receipt_requests`), and ask contacts for any PQ refresh we're
+    // holding their messages for (see `Client::pq_inject_requests`).
     let tick_socket = Arc::clone(&socket);
     let tick_client = Arc::clone(&client);
     tokio::spawn(async move {
@@ -135,7 +136,9 @@ async fn main() -> Result<()> {
             ticker.tick().await;
             let mut c = tick_client.lock().await;
             c.release_held_messages();
-            for packet in c.receipt_requests() {
+            let mut packets = c.receipt_requests();
+            packets.extend(c.pq_inject_requests());
+            for packet in packets {
                 let _ = tick_socket.send_to(&packet, c.server_addr).await;
             }
         }
