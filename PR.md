@@ -7,7 +7,7 @@ Closes issue: #
 - **"Repair session"** sets up a fresh session with a contact without removing them, for anything recovery can't fix.
 - **Contact setup and repair hold up at heavy loss.** Setup packets go out 3 times, and are resent after 10 s instead of 30 s. At 70% loss each way, a repair took 30–71 s. Before, it took 251 s once and didn't finish within 5 minutes three times out of four.
 - **Loss can be simulated on the device itself,** with a percentage each way, so testing no longer needs a lossy relay.
-- **Network stats and an unstable-network warning:**
+- **Network stats and an unstable-network warning,** behind a **Network stats** setting that's off by default, as measuring sends extra packets:
   - **Network fold:** the relay's status, packet counts, loss each way over the last 10 s, and retransmissions.
   - **Warning:** a thin amber bar while 90% or more is being lost either way.
 - **Chat UI:**
@@ -69,6 +69,9 @@ Closes issue: #
 
 **Network stats** (`netsim.rs`, `Client::retransmissions`, `network_stats` command, `NetworkStats`)
 - **Where:** a "Network" fold in the settings section after the contacts, updated every second.
+- **The setting:** a **Network stats** checkbox under Settings, off by default and saved per device (`localStorage`).
+  - **Off:** the main screen doesn't ask for the stats, so the client sends no probes and there's no warning. The Network fold says the stats are off, and still has the simulated loss.
+  - **On:** stats and the warning, with the probes below.
 - **What it shows:**
   - **The relay:** its address and status. It's connected if heard from in the last 40 s, quiet if not, or reconnecting.
   - **Packets:** sent and received since the app started, with any dropped by the simulated loss (`netsim::packet_counts`).
@@ -81,7 +84,9 @@ Closes issue: #
   - **Receiving loss:** the copies that arrived, out of 3 per answer sent.
   - **Sending loss:** the answers sent, out of the requests sent.
 - **Replays count too:** the copies are the same packet, so the link turns copies 2 and 3 away as replays. It does that only after authenticating them, so they're still counted.
-- **Probes:** while the stats are polled, the client sends 8 receipt requests a second, so 10 s holds enough to measure. That's about 4 KB/s, and nothing while the app is in the background.
+- **Probes:** while the stats are polled, the client sends 8 receipt requests a second, so 10 s holds enough to measure. That's about 4 KB/s.
+  - **Background:** none while the app is in the background or the screen is off (`document.hidden`).
+  - **Why that check is needed:** the web view keeps the page's timers running in the background. Before the check, a phone with the app in the background went on probing at the same rate: about 7 requests a second up, and 21 answers down.
 - **The warning** (`NetworkWarning`):
   - **What:** a thin amber bar across the top of the main screen, above the chat on a phone too.
   - **When:** shown once either way reaches 90%, and kept until it's below 88%, so it doesn't flicker.
@@ -201,6 +206,18 @@ Closes issue: #
   - **The history bug:** caught in the act. A chat was open with its entry at index 1 of 2, and back still went to the home screen.
   - **Layers:** with the back-button listener build, back closed a chat, then a QR code opened over a chat, one at a time, and only then left the app. Each was opened without a tap, which is what had marked entries to skip before. They were also tried by hand.
   - **A recreated activity** (the final build): changing the font scale makes Android recreate the activity in the same process, as closing and reopening the app does while it runs in the background. On the new activity, back from Login returned to the start page and the app stayed open. Back from the start page left the app, as it should.
+- **The Network stats setting, on the phone:** counted over adb. Each count is a `network_stats` call, which starts up to 5 s of probing itself (about 40 packets up), so a 60 s window with nothing else going on reads about 45.
+
+  | State | Sent | Received |
+  |---|---|---|
+  | Off (the default), app open | 48 in 60 s | 144 |
+  | On, app open | 7.1/s | 21.3/s |
+  | On, app in the background | 45 in 60 s | 135 |
+  | On, back in the foreground | 7.1/s | 21.4/s |
+  | Off again | 46 in 60 s | 138 |
+
+  - **Off:** the fold said the stats are off, with no stats or warning. Turning it on brought them back, and the choice was saved.
+  - **Background:** the page reported itself hidden.
 - **Through the lossy proxy, on this PC:** the repair and contact-setup times, and the loss estimate's readings, in the tables above.
 - **In a browser:** these were rendered in headless Firefox with a mocked backend:
   - **Screens:** the start page and the chat screen, in both themes.
@@ -221,7 +238,7 @@ Closes issue: #
 - **Connection request pop-up:** Android back doesn't close it.
 - **Loss pattern:** simulated loss drops packets independently at random, with no bursts.
 - **Loss estimate:**
-  - **Only while watched:** it's measured only while the main screen polls the stats, so there's no estimate for when the app was in the background.
+  - **Only while watched:** it's measured only while **Network stats** is on and the app is on screen, so there's no estimate for when the app was in the background.
   - **Near the threshold:** 10 s of samples is noisy, so between about 85% and 90% loss the warning can come and go.
 - **Retrying a message:** if the first try reached the contact after all, they get it twice.
 - **The old name:** the identifier, Android package, crate names and saved-theme key still say e2e-messenger. Changing the identifier would make it a separate app, without the old one's data.

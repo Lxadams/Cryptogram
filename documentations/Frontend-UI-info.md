@@ -199,7 +199,7 @@ MainScreen
 
 ### `NetworkWarning`
 
-A thin amber bar across the top of the main screen, above the chat on a phone too, while `network_stats().unstable` is true. That's when either direction's loss over the last 10 s reaches 90%; it stays until the loss is below 88% again, so it doesn't flicker. It says how much is lost and which way, or that nothing has come back from the relay at all.
+A thin amber bar across the top of the main screen, above the chat on a phone too, while `network_stats().unstable` is true, so only while **Network stats** is on in Settings. That's when either direction's loss over the last 10 s reaches 90%; it stays until the loss is below 88% again, so it doesn't flicker. It says how much is lost and which way, or that nothing has come back from the relay at all.
 
 ### `IdentityCard`
 
@@ -211,13 +211,14 @@ A section of its own after the contact list, holding two folds:
 
 - **Settings:**
   - **Show token and key,** a fold inside it: name, routing token and Ed25519 key as hex, each with a `CopyButton` (copies, shows a tick for 1.2 s). This is what someone needs to add you by hand.
+  - **Network stats:** a checkbox, off by default and saved per device in `localStorage` (`e2e-messenger-network-stats`). While it's on, `MainScreen` polls `network_stats` every second for the Network fold and `NetworkWarning`, and the poll has the client probe the relay to measure loss (about 4 KB/s, see below). While it's off, or while the page is hidden (`document.hidden`: the app in the background or the screen off), the poll skips `network_stats`, so the probes stop 5 s later. The web view keeps the page's timers running in the background, so without that check it went on probing there.
   - **Notifications:** where `notification_settings().posted` is true (Android), one checkbox, *"Say who each message is from in notifications"*, off by default.
-- **Network** (`NetworkStats`), updated every second from `MainScreen`'s `network_stats` poll:
+- **Network** (`NetworkStats`), updated every second from `MainScreen`'s `network_stats` poll while **Network stats** is on (with it off, the fold says so and shows only the simulated loss):
   - **The relay:** its address, and its status. It's connected if heard from in the last 40 s, quiet if not, or reconnecting.
   - **Packets:** sent and received, with any dropped by the simulated loss. These count since the app started.
   - **Loss, last 10 s:** each way (`client/src/link_quality.rs`). The relay answers every sync and receipt request with 3 copies of one numbered packet, and numbers everything it sends in order. So the answers it sent are those that arrived plus the gaps in the numbering. The receiving side is the copies that arrived out of 3 per answer sent, and the sending side is the answers sent out of the requests sent. While the stats are polled, the client probes with 8 receipt requests a second, so a 10 s window has enough samples. That costs about 4 KB/s, and nothing while the app is in the background. On a real link through the lossy proxy, it read 52/51% at 50% loss each way, 67/64% at 70%, and 86/85% at 85%.
   - **Retransmissions:** contact-setup resends, reconnects, PQ refreshes asked for and resent, messages retried, and deliveries received twice. These count since login.
-  - **Simulated loss** (`SimulatedLoss`): a sending and a receiving percentage of packets to drop on this device (`set_simulated_loss`), reset when the app closes. It sits outside the part that redraws every second, so a half-typed value isn't wiped.
+  - **Simulated loss** (`SimulatedLoss`), there whether stats are on or off: a sending and a receiving percentage of packets to drop on this device (`set_simulated_loss`), reset when the app closes. It sits outside the part that redraws every second, so a half-typed value isn't wiped.
 
 ### `ContactPanel`
 
