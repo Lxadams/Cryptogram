@@ -1,19 +1,32 @@
-Logan - PQ Inject Fixes: recover lost PQ injects, repair sessions, on-device loss testing, chat UI
+Logan - PQ Inject Fixes: recover lost PQ injects, repair sessions, loss testing and network stats, chat UI, Cryptogram branding
 
 Closes issue: #
 
 ### Summary
 - **A lost PQ inject no longer breaks a session for good.** The receiver asks for it again and the sender resends it, so the held messages decrypt. Before, one lost burst left one direction of the chat dead until both people re-added each other.
 - **"Repair session"** sets up a fresh session with a contact without removing them, for anything recovery can't fix.
+- **Contact setup and repair hold up at heavy loss.** Setup packets go out 3 times, and are resent after 10 s instead of 30 s. At 70% loss each way, a repair took 30–71 s. Before, it took 251 s once and didn't finish within 5 minutes three times out of four.
 - **Loss can be simulated on the device itself,** with a percentage each way, so testing no longer needs a lossy relay.
+- **Network stats and an unstable-network warning:**
+  - **Network fold:** the relay's status, packet counts, loss each way over the last 10 s, and retransmissions.
+  - **Warning:** a thin amber bar while 80% or more is being lost either way.
 - **Chat UI:**
   - **New messages:** counts next to each contact, newest conversation first.
   - **Header:** a ⋮ menu, with the contact's name centred.
+  - **Sending:** a spinner while a message sends, and a retry button next to a **!**.
   - **QR codes:** they open and close around a scan.
   - **Android back:** closes what's on top instead of leaving the app.
   - **Keyboard:** the newest message stays in view when it opens.
+- **Branding:**
+  - **Name:** the app is now called Cryptogram.
+  - **Look:** the new palette, and the logo as the app icon.
+  - **Start page:** a "Sign in" page before login.
+  - **Connect:** waits at least 2 s.
 - **Screen capture is allowed again** (no `FLAG_SECURE`), so a phone can be mirrored to a laptop for demos.
-- **Tooling:** `build-apk.sh` and `runpeer.sh` take `-ip`, `-p` and `-pk` to point at any relay, and debug Android builds send the client's log output to logcat.
+- **Tooling:**
+  - **`-ip`, `-p` and `-pk`:** `build-apk.sh` and `runpeer.sh` take them to point at any relay.
+  - **logcat:** debug Android builds send the client's log output there.
+  - **CLI:** a `repair` command.
 
 ### What changed
 
@@ -33,12 +46,54 @@ Closes issue: #
 **Repair session** (`Client::repair_session`, `repair_session` command)
 - **What it does:** drops the session and sends a KeyExchange with a new add ID, the way removing and re-adding someone would. The other side drops its copy when that arrives, and the two set up a fresh session, PQ keys and all.
 - **What stays:** the contact, their name and the chat history.
-- **Where:** either side can repair, from the chat's ⋮ menu. It's hidden while a contact is pending.
+- **Where:** either side can repair, from the chat's ⋮ menu. It's hidden while a contact is pending. The CLI has `repair <token>` too.
+
+**Contact setup at heavy loss** (`code/client/src/lib.rs`)
+- **Why copies, not FEC:** messages already go out as FEC bursts. A KeyExchange or SessionEstablish is a single packet, though, so it can't be spread over symbols, and copies are its redundancy.
+- **Copies:** setup packets to a contact who has added us go out 3 times (`SETUP_COPIES`), each sealed on its own. At 70% loss on the uplink, one copy reaches the relay 30% of the time, and three 66%. The relay then resends what it has until the contact acks it.
+- **First requests:** to someone who hasn't added us yet (no admission tag), a setup packet goes just once. Those share a small queue at the relay with everyone else's first requests.
+- **Sooner resends:** an unanswered KeyExchange is first resent after 10 s instead of 30 s, then twice as long each time, as before. A repair at heavy loss takes several steps, so each one waiting 30 s added up.
+- **Sending the copies:** `Client::take_extra_packets` hands over the extra copies, and front ends send them after what `add_contact` and `repair_session` return. `keepalive` and the relay handshake return them with their own packets.
+- **Measured** through the lossy proxy, at 70% loss each way:
+
+  | | Repair | First contact setup |
+  |---|---|---|
+  | Before | 251 s, then 3 runs not done in 5 minutes | not done in 5 minutes |
+  | After | 42, 30, 63 and 71 s | 41–233 s |
 
 **Simulated loss** (new `code/client/src/netsim.rs`)
 - **Two percentages:** outgoing and incoming, set under "Simulated network loss" on the identity card (`simulated_loss`, `set_simulated_loss` commands).
 - **Coverage:** every send to and receive from the relay goes through it: message bursts, keepalives, receipts, acks, contact requests and the relay handshake.
 - **Defaults:** off (0%) by default, and reset when the app closes.
+
+**Network stats** (`netsim.rs`, `Client::retransmissions`, `network_stats` command, `NetworkStats`)
+- **Where:** a "Network" fold on the identity card, updated every second.
+- **What it shows:**
+  - **The relay:** its address and status. It's connected if heard from in the last 40 s, quiet if not, or reconnecting.
+  - **Packets:** sent and received since the app started, with any dropped by the simulated loss (`netsim::packet_counts`).
+  - **Loss:** each way, over the last 10 s (see below).
+  - **Retransmissions since login:** contact-setup resends, reconnects, PQ refreshes asked for and resent, messages retried, and deliveries received twice.
+
+**Loss estimate and unstable-network warning** (new `code/client/src/link_quality.rs`)
+- **What it measures from:** the relay answers every sync and receipt request with 3 copies of one packet, and numbers everything it sends in order. So the answers it sent are the ones that arrived plus the gaps in the numbering.
+- **The estimate,** over the last 10 s, giving each answer 250 ms to arrive:
+  - **Receiving loss:** the copies that arrived, out of 3 per answer sent.
+  - **Sending loss:** the answers sent, out of the requests sent.
+- **Replays count too:** the copies are the same packet, so the link turns copies 2 and 3 away as replays. It does that only after authenticating them, so they're still counted.
+- **Probes:** while the stats are polled, the client sends 8 receipt requests a second, so 10 s holds enough to measure. That's about 4 KB/s, and nothing while the app is in the background.
+- **The warning** (`NetworkWarning`):
+  - **What:** a thin amber bar across the top of the main screen, above the chat on a phone too.
+  - **When:** shown once either way reaches 80%, and kept until it's below 78%, so it doesn't flicker.
+  - **What it says:** how much is lost and which way, or that nothing came back from the relay at all.
+- **Measured on real UDP** through the lossy proxy:
+
+  | Loss each way | Read as (sending / receiving, mean) | Warning on |
+  |---|---|---|
+  | 50% | 52% / 51% | never |
+  | 70% | 67% / 64% | never |
+  | 85% | 86% / 85% | 96% of the time |
+
+  After a step up to 85%, the warning came on about 9 s later. After a step back down, it cleared about 1 s later.
 
 **Chat UI** (`code/frontend/src/app.rs`, `style.css`)
 - **New-message counts:**
@@ -50,6 +105,9 @@ Closes issue: #
   - **Title:** the contact's name, centred, instead of "Chat with *name*".
   - **Menu:** a ⋮ button holds "Repair session" (a reusable `Menu`, built like `Modal`).
   - **Back button:** just ←.
+- **Sending:**
+  - **Spinner:** a small spinner shows while a message sends. ✓ and **!** are unchanged.
+  - **Retry:** a retry button sits next to a **!**. `retry_message` sends the text again as a new message at the bottom, and deletes the failed one from the history (`ChatHistory::message`, `ChatHistory::delete`). If the first try reached the contact after all, they get it twice.
 - **QR codes** (new `QrCodeModal`, owned by `MainScreen`):
   - **They scanned you first:** scanning their code closes yours.
   - **You scanned first:** scanning someone who hasn't scanned you yet opens your code, which closes once they have (their status leaves "pending").
@@ -57,6 +115,22 @@ Closes issue: #
   - **Order:** back closes the scanner, then the QR code, then the chat, and only then leaves the app.
   - **Other ways of closing:** closing a layer some other way (X, ←, a scan) takes its entry back off.
 - **Keyboard:** opening it shrinks the web view, and the transcript's scroll position counts from the top, so the newest messages slipped out of sight. The transcript now stays at the newest message through a resize if it was there.
+
+**Branding** (`code/frontend/branding/`, `style.css`, `app.rs`)
+- **Name:** "Cryptogram" in the window title, the header and the Android launcher (`productName`, `strings.xml`).
+  - **Unchanged:** the app identifier, the Android package and the crate names, so the new build installs over the old one and keeps its data.
+- **Palette:** the colour tokens come from `#164858`, `#EFFBF2`, `#1F8A70` and `#02141A`, plus shades mixed from them, with a new `--info`. Dark mode uses `#02141A` behind panels shaded from `#164858`. Light mode uses `#EFFBF2` behind white panels.
+- **App icon:** made from `logo-app-icon.svg`, with an adaptive icon on Android (a foreground and a background).
+  - **Sources:** they're in `code/frontend/branding/`.
+  - **Regenerating:** run `cargo tauri icon ../branding/icon.json` from `src-tauri`.
+- **Start page** (`WelcomeScreen`):
+  - **What's on it:** the large logo, in the version for the theme, the name and **Sign in**, which goes to the Login page.
+  - **Who sees it:** someone already signed in goes straight to their contacts.
+  - **Getting back to it:** log out, or Android back from Login or Create Identity.
+- **Connect:** the main screen appears no sooner than 2 s after **Connect** is clicked (`CONNECT_MIN_WAIT`), however fast the relay answers. Errors show straight away.
+- **Small fixes:**
+  - The notification setting's checkbox is no longer full width.
+  - Logging out with a chat open takes its back-button history entries off.
 
 **Tooling**
 - **`build-apk.sh -ip <ip> -p <port> -pk <hex>`** builds for any relay, such as the deployed one. `-pk` is required with `-ip`. With no flags it builds for the local relay, as before.
@@ -66,10 +140,15 @@ Closes issue: #
   - **Output:** it prints the relay it uses.
 - **Screen capture:** `FLAG_SECURE` is gone from `MainActivity`, so the app shows in screenshots, recordings and mirroring tools such as scrcpy, and in the recent-apps thumbnail. It was there to keep chats and QR codes off other screens.
 - **logcat:** debug Android builds send stdout and stderr to logcat under the tag `E2E` (`adb logcat -s E2E`), so the client's reports can be watched on a phone. Release builds don't, as the client also prints messages as they arrive.
-- **Docs:** `Frontend-UI-info.md` describes the new chat header and back behaviour.
+- **CLI `repair <token>`:** does what the app's "Repair session" does. It was used to time repairs through the lossy proxy.
+- **Docs:**
+  - **`Frontend-UI-info.md`:** the start page, chat header, back behaviour, network stats and the warning, how loss is estimated, the palette and the icon sources.
+  - **`code/README.md`:** the CLI `repair` command.
+  - **`code/frontend/README.md` and `ANDROID.md`:** the 10 s resend and setup copies.
 
 ### Compatibility
 - **No relay changes:** the relay doesn't need redeploying.
+- **Installing over the old app:** the new name and icon install over the old build, as the app identifier is unchanged.
 - **Mixed builds:** an old client ignores the new 0x08 request, so recovering a lost inject needs both sides on this build. Repair works with any build.
 - **Saved state:** sessions gain `sent_pq_injects`. Older saved state loads without it.
 - **Sessions already broken:** a session broken before this build can't recover by itself, because the old build didn't keep its injects. Repair it once.
@@ -83,7 +162,7 @@ Closes issue: #
   | relay-link | 13 |
   | fec | 25 |
   | Relay | 49 |
-  | Client | 177 (9 new) |
+  | Client | 189 (21 new) |
   | Tauri backend | 15 |
   | Frontend | 10 |
 
@@ -96,16 +175,22 @@ Closes issue: #
   - **Repair:** from either side, and refused for a non-contact.
   - **Contact order:** the latest-message query.
   - **Simulated loss:** 0% never drops a packet, and 100% always does.
+  - **Setup copies:** only to contacts who have added us, each sealed on its own.
+  - **The loss estimate** (8 tests): loss each way, from copies, gaps and requests; nothing back; too little to tell; only the last 10 s counting; probing only while watched; the 80%/78% warning thresholds.
+  - **Measuring the link:** the relay's sync acks, replayed copies included, feed the estimate.
+  - **Retry:** looking up and deleting one message in the history.
 
-  The save/load round trip now includes the kept injects.
+  The save/load round trip now includes the kept injects. Counters for retransmissions are checked in the existing PQ recovery and relay packet tests.
 - **On devices, a phone and the emulator through the deployed relay:**
   - **The bug:** reproduced. 5 messages failed at 100% sending loss, including the one carrying the inject, and every later message was held.
   - **Recovery:** with this build, a lost inject was recovered twice without a repair. The receiver asked about 3 s after the next message arrived, the sender resent it, and the message appeared.
   - **Repair session:** pressed twice on the phone, both times on a session broken before the fix. Messages got through again after each.
   - **Old requests:** requests from before a repair were refused, as they should be.
-- **Commits:** each of the 11 builds and lints on its own.
+- **Through the lossy proxy, on this PC:** the repair and contact-setup times, and the loss estimate's readings, in the tables above.
+- **In a browser:** the start page, both themes, the chat screen and the warning bar were rendered in headless Firefox with a mocked backend.
+- **Commits:** each of the 17 code commits builds and lints on its own.
 - **Not yet tested:**
-  - on a device: the ⋮ menu and centred title, new-message counts and ordering, the QR code popups, Android back, and the keyboard fix (all in the latest APK, which built)
+  - on a device: the ⋮ menu and centred title, new-message counts and ordering, the QR code popups, Android back, the keyboard fix, network stats and the warning, the spinner and retry, and the new name, icon and start page (all in the latest APK, which built)
   - the desktop app by hand
   - `runpeer.sh -ip …` beyond its argument handling, which was checked with a stub `cargo`
   - mirroring the phone with scrcpy now that `FLAG_SECURE` is gone
@@ -116,6 +201,11 @@ Closes issue: #
 - **Unread counts:** not saved, so they reset when the app restarts.
 - **Connection request pop-up:** Android back doesn't close it.
 - **Loss pattern:** simulated loss drops packets independently at random, with no bursts.
+- **Loss estimate:**
+  - **Only while watched:** it's measured only while the main screen polls the stats, so there's no estimate for when the app was in the background.
+  - **Near the threshold:** 10 s of samples is noisy, so between about 75% and 85% loss the warning can come and go.
+- **Retrying a message:** if the first try reached the contact after all, they get it twice.
+- **The old name:** the identifier, Android package, crate names and saved-theme key still say e2e-messenger. Changing the identifier would make it a separate app, without the old one's data.
 - **A stale comment:** `chunks.rs` says the relay keeps at most 50 packets per recipient. It's actually 2 MiB (`MAX_QUEUED_BYTES_PER_TOKEN`).
 - **Screen capture:** consider turning `FLAG_SECURE` back on for release builds, or making it a setting.
 - **Group chats:** designed (relay fan-out to a conversation token, with Sender Keys) but not started.
