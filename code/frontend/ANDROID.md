@@ -200,8 +200,9 @@ cargo tauri android build --debug --apk --target aarch64
    you about them.
 2. **Create identity**, then log in, the same way as on desktop.
 3. Press **Connect**. The relay's public key is already built in (step 6).
-4. Add contacts with **Scan QR code** (Android asks for camera permission
-   the first time) or by pasting a routing token and Ed25519 key. You each
+4. Add contacts from the **+** by "Contacts": **Scan QR code** (Android
+   asks for camera permission the first time) or **Manual add**, pasting
+   a routing token and Ed25519 key. You each
    add the other; a contact stays "pending" until both have, then shows
    "connecting" while the session is set up. The app sends its
    KeyExchange again by itself if a packet goes missing, and adding them

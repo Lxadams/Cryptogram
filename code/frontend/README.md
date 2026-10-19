@@ -126,11 +126,13 @@ Android, set up the toolchain first; see [ANDROID.md](ANDROID.md).
 
 ### Testing messaging between peers
 
-1. In alice's window, copy her identity (routing token + Ed25519 key) —
-   just those two fields, same as before names existed.
-2. In bob's window, paste those into "Add contact" and submit. Alice
-   shows up as "pending": a connection request only counts once the other
-   side has added you too, so alice's client ignores bob's until then.
+1. In alice's window, copy her identity (routing token + Ed25519 key,
+   under Settings → "Show token and key") — just those two fields, same
+   as before names existed.
+2. In bob's window, tap **+** by "Contacts", then **Manual add**, paste
+   those in and submit. Alice shows up as "pending": a connection request
+   only counts once the other side has added you too, so alice's client
+   ignores bob's until then.
 3. Repeat in the other direction: copy bob's identity and add it as a
    contact in alice's window.
 4. Now that both sides have added each other, the KeyExchange goes

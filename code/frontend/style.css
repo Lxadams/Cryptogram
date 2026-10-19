@@ -248,6 +248,7 @@ button.link-btn {
 .connect-screen,
 .identity-card,
 .contact-panel,
+.settings-panel,
 .chat-panel {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -446,23 +447,31 @@ button.danger {
   white-space: nowrap;
 }
 
-.identity-card-header button {
-  margin-left: auto;
-}
-
-/* Token and key are long and only needed to add someone by hand (the QR
-   code covers the usual case), so they're folded away by default. */
-.identity-details {
+/* The folds after the contact list (see `SettingsPanel`): Settings, with
+   your token and key folded inside it as they're long and only needed to
+   add someone by hand (the QR code covers the usual case), and Network. */
+.fold {
   margin-top: 0.5rem;
 }
 
-.identity-details summary {
+.settings-panel > .fold:first-child {
+  margin-top: 0;
+}
+
+/* A fold inside a fold, set in under its summary. */
+.fold .fold {
+  margin-left: 0.25rem;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border);
+}
+
+.fold summary {
   cursor: pointer;
   color: var(--muted);
   font-size: 0.9rem;
 }
 
-.identity-details p {
+.fold p {
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -470,7 +479,20 @@ button.danger {
   margin: 0.5rem 0 0;
 }
 
-.identity-details .setting {
+/* Your name, token or key: label | value | copy, the value wrapping
+   within its column, so its copy button stays beside it however narrow
+   the side column. */
+.fold p.copy-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.copy-row code {
+  justify-self: start;
+  overflow-wrap: anywhere;
+}
+
+.fold .setting {
   display: flex;
   align-items: flex-start;
   gap: 0.5rem;
@@ -478,13 +500,13 @@ button.danger {
 }
 
 /* Inputs are full width by default; a checkbox is just its box. */
-.identity-details .setting input[type="checkbox"] {
+.fold .setting input[type="checkbox"] {
   flex: none;
   width: auto;
   margin: 0.2rem 0 0;
 }
 
-.identity-details .setting input[type="number"] {
+.fold .setting input[type="number"] {
   width: 5rem;
   margin-left: auto;
 }
@@ -503,9 +525,49 @@ button.danger {
   min-height: 0;
 }
 
-.contact-panel {
-  overflow-y: auto;
+/* The contacts and the settings after them, scrolling together. */
+.side-column {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
   min-height: 0;
+  overflow-y: auto;
+}
+
+.contact-panel,
+.settings-panel {
+  flex: none;
+}
+
+.settings-panel {
+  padding: 0.75rem 1rem;
+}
+
+/* "Contacts" with its "+" menu at the far right (see `ContactPanel`). */
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.panel-header h2 {
+  margin: 0;
+}
+
+.add-menu {
+  position: relative;
+}
+
+.icon-btn.add-btn {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.icon-btn.add-btn:hover {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
 }
 
 .contact-list {
@@ -571,7 +633,7 @@ button.danger {
   text-align: center;
 }
 
-/* The "Network" fold on the identity card (see `NetworkStats`). */
+/* The "Network" fold after the contact list (see `NetworkStats`). */
 .network-stats dl {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -872,12 +934,6 @@ button.danger {
   flex: none;
 }
 
-/* "Scan QR code" in the Add contact section: full width, the primary way
-   to add someone, with the hex fields below it as the fallback. */
-.scan-btn {
-  width: 100%;
-}
-
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -966,22 +1022,23 @@ button.danger {
 }
 
 /* One column: phones and narrow windows. The contact list (with your
-   identity above it) fills the screen until a chat is opened, then the
-   chat fills it instead, with a back button to return. */
+   identity above it and the settings below) fills the screen until a chat
+   is opened, then the chat fills it instead, with a back button to
+   return. */
 @media (max-width: 719px) {
   .columns {
     display: flex;
     flex-direction: column;
   }
 
-  .contact-panel,
+  .side-column,
   .chat-panel {
     flex: 1;
   }
 
   .main-screen:not(.chat-open) .chat-panel,
   .main-screen.chat-open .identity-card,
-  .main-screen.chat-open .contact-panel {
+  .main-screen.chat-open .side-column {
     display: none;
   }
 

@@ -244,6 +244,16 @@ fn MenuIcon() -> impl IntoView {
     }
 }
 
+/// A plus, for a button that adds something.
+#[component]
+fn PlusIcon() -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <path d="M8 3v10M3 8h10" />
+        </svg>
+    }
+}
+
 /// Clears a polling interval when the component that started it unmounts.
 /// A `set_interval` otherwise outlives its screen: after logging in, the
 /// Login screen's poll kept firing against disposed signals (panicking), and
@@ -896,6 +906,9 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     // panel's scanner, and the panel can unmute.
     let requests = RwSignal::new(api::ConnectionRequestsDto::default());
     let scanning = RwSignal::new(false);
+    // Whether the "Manual add" popup is open (see `ContactPanel`): here so
+    // Android's back button can close it, like the scanner.
+    let adding_manually = RwSignal::new(false);
     // Our QR code popup (see `QrCodeModal`), and, when it opened because we
     // just scanned someone who hasn't scanned us yet, their token: it
     // closes once they have.
@@ -975,15 +988,17 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     // Android's back button goes back in the web view's history, and only
     // leaves the app when there's none (see Tauri's `AppPlugin`). So each
     // layer open over the contact list (an open chat, our QR code, the
-    // scanner) gets a history entry, and going back closes the topmost
-    // one: back steps out of the scanner, then the QR code, then the chat,
-    // as on a phone it should, and only then out of the app. A layer that
+    // scanner, the "Manual add" popup) gets a history entry, and going back
+    // closes the topmost one: back steps out of the scanner or the popup,
+    // then the QR code, then the chat, as on a phone it should, and only
+    // then out of the app. A layer that
     // closes any other way (its X, the ← button, a scan) takes its entry
     // back off, so the two stay in step.
     let layers_open = move || {
         usize::from(selected.get().is_some())
             + usize::from(show_qr.get())
             + usize::from(scanning.get())
+            + usize::from(adding_manually.get())
     };
     // Entries pushed for open layers, and how many of our own trips back
     // through them (when layers closed some other way) are still to land.
@@ -1026,6 +1041,8 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         pushed.update_value(|n| *n = n.saturating_sub(1));
         if scanning.get_untracked() {
             scanning.set(false);
+        } else if adding_manually.get_untracked() {
+            adding_manually.set(false);
         } else if show_qr.get_untracked() {
             show_qr.set(false);
             qr_waiting_for.set(None);
@@ -1159,21 +1176,27 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         // contact list (see `.main-screen.chat-open` in style.css).
         <section class="main-screen" class:chat-open=move || selected.get().is_some()>
             <NetworkWarning stats=net_stats />
-            <IdentityCard identity=identity.clone() show_qr=show_qr net_stats=net_stats />
+            <IdentityCard identity=identity.clone() />
             // Before the scanner and the connection request notice, so they
             // open on top of it: accepting a request means scanning their
             // code while ours is still up.
-            <QrCodeModal identity=identity show_qr=show_qr waiting_for=qr_waiting_for />
+            <QrCodeModal identity=identity.clone() show_qr=show_qr waiting_for=qr_waiting_for />
             <div class="columns">
-                <ContactPanel
-                    contacts=contacts
-                    selected=selected
-                    requests=requests
-                    scanning=scanning
-                    unread=unread
-                    show_qr=show_qr
-                    qr_waiting_for=qr_waiting_for
-                />
+                // The contacts, with the settings and network folds after
+                // them, scrolling together.
+                <div class="side-column">
+                    <ContactPanel
+                        contacts=contacts
+                        selected=selected
+                        requests=requests
+                        scanning=scanning
+                        adding_manually=adding_manually
+                        unread=unread
+                        show_qr=show_qr
+                        qr_waiting_for=qr_waiting_for
+                    />
+                    <SettingsPanel identity=identity net_stats=net_stats />
+                </div>
                 <ChatPanel
                     contacts=contacts
                     selected=selected
@@ -1187,22 +1210,38 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     }
 }
 
-/// Our own identity — what a peer needs (routing token + Ed25519 key) to
-/// add us as a contact, shown both as hex (to copy-paste, folded away by
-/// default since it's long and the QR code is the usual way) and, via
-/// "Present QR code", as a QR code of the same two values for a peer's
-/// "Scan QR code" (see contact_code.rs for the payload). `name` (chosen on
-/// the login screen) is shown here for your own reference only — it's sent
-/// automatically as part of the KeyExchange once you connect to someone,
-/// so peers see "alice" in their contact list without typing anything
-/// themselves (see `Client::local_name` / `contact_names` in
-/// code/client/src/lib.rs). Settings fold away under it too, where there
-/// are any: whether notifications name senders, on devices that post them,
-/// and the simulated network loss (see `SimulatedLoss`).
+/// Your identity, at the top of the main screen: your name. Your QR code
+/// is under the contact list's "+" (see `ContactPanel`), and your routing
+/// token and Ed25519 key in hex, for adding by hand, under Settings (see
+/// `SettingsPanel`). `name` (chosen on the login screen) is shown here for
+/// your own reference only — it's sent automatically as part of the
+/// KeyExchange once you connect to someone, so peers see "alice" in their
+/// contact list without typing anything themselves (see
+/// `Client::local_name` / `contact_names` in code/client/src/lib.rs).
 #[component]
-fn IdentityCard(
+fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
+    view! {
+        <div class="identity-card">
+            <div class="identity-card-header">
+                <h2>"Your Identity"</h2>
+                {identity.name.map(|name| view! {
+                    <span class="identity-name">{name}</span>
+                })}
+            </div>
+        </div>
+    }
+}
+
+/// The folds after the contact list, in a section of their own:
+/// - **Settings:** your name, routing token and Ed25519 key in hex, folded
+///   away again as they're long and only needed to add someone by hand (the
+///   QR code covers the usual case); and, on devices that post
+///   notifications, whether they name senders.
+/// - **Network:** the network stats and the simulated loss (see
+///   `NetworkStats`).
+#[component]
+fn SettingsPanel(
     identity: api::IdentityDto,
-    show_qr: RwSignal<bool>,
     net_stats: RwSignal<Option<api::NetworkStatsDto>>,
 ) -> impl IntoView {
     let notifications = RwSignal::new(None::<api::NotificationSettingsDto>);
@@ -1213,41 +1252,32 @@ fn IdentityCard(
     });
 
     view! {
-        <div class="identity-card">
-            <div class="identity-card-header">
-                <h2>"Your Identity"</h2>
-                {identity.name.clone().map(|name| view! {
-                    <span class="identity-name">{name}</span>
-                })}
-                <button type="button" on:click=move |_| show_qr.set(true)>
-                    "Present QR code"
-                </button>
-            </div>
-            <details class="identity-details">
-                <summary>"Show token and key"</summary>
-                {identity.name.clone().map(|name| view! {
-                    <p>
-                        <strong>"Name: "</strong>
-                        <code>{name.clone()}</code>
-                        <CopyButton value=name />
+        <div class="settings-panel">
+            <details class="fold">
+                <summary>"Settings"</summary>
+                <details class="fold">
+                    <summary>"Show token and key"</summary>
+                    {identity.name.clone().map(|name| view! {
+                        <p class="copy-row">
+                            <strong>"Name: "</strong>
+                            <code>{name.clone()}</code>
+                            <CopyButton value=name />
+                        </p>
+                    })}
+                    <p class="copy-row">
+                        <strong>"Token: "</strong>
+                        <code>{identity.routing_token.clone()}</code>
+                        <CopyButton value=identity.routing_token />
                     </p>
-                })}
-                <p>
-                    <strong>"Token: "</strong>
-                    <code>{identity.routing_token.clone()}</code>
-                    <CopyButton value=identity.routing_token />
-                </p>
-                <p>
-                    <strong>"Ed25519: "</strong>
-                    <code>{identity.ed25519_public.clone()}</code>
-                    <CopyButton value=identity.ed25519_public />
-                </p>
-            </details>
-            // Read once it's loaded, then left to the checkbox: setting the
-            // signal again would redraw the panel and fold it shut.
-            {move || notifications.get().filter(|n| n.posted).map(|n| view! {
-                <details class="identity-details">
-                    <summary>"Settings"</summary>
+                    <p class="copy-row">
+                        <strong>"Ed25519: "</strong>
+                        <code>{identity.ed25519_public.clone()}</code>
+                        <CopyButton value=identity.ed25519_public />
+                    </p>
+                </details>
+                // Read once it's loaded, then left to the checkbox: setting
+                // the signal again would redraw it and lose the change.
+                {move || notifications.get().filter(|n| n.posted).map(|n| view! {
                     <label class="setting">
                         <input
                             type="checkbox"
@@ -1264,9 +1294,8 @@ fn IdentityCard(
                     <p class="hint">
                         "Off by default: notifications can show on the lock screen, where anyone holding your phone can read them."
                     </p>
-                </details>
-            })}
-            <SimulatedLoss />
+                })}
+            </details>
             <NetworkStats stats=net_stats />
         </div>
     }
@@ -1304,11 +1333,11 @@ fn NetworkWarning(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoVie
     }
 }
 
-/// The link to the relay, the packets to and from it, what had to be sent
-/// again, and how much is being lost (see `api::network_stats`), folded
-/// away under the identity card and updated every second from
-/// `MainScreen`'s poll. Packet counts are since the app started; the rest
-/// since this login.
+/// The "Network" fold (see `SettingsPanel`): the link to the relay, the
+/// packets to and from it, what had to be sent again, and how much is
+/// being lost (see `api::network_stats`), updated every second from
+/// `MainScreen`'s poll, then the simulated loss (see `SimulatedLoss`).
+/// Packet counts are since the app started; the rest since this login.
 #[component]
 fn NetworkStats(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoView {
     // "1,234", with any simulated drops after it.
@@ -1321,7 +1350,7 @@ fn NetworkStats(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoView 
     };
 
     view! {
-        <details class="identity-details network-stats">
+        <details class="fold network-stats">
             <summary>"Network"</summary>
             {move || stats.get().map(|s| {
                 let heard = s.last_heard_ms_ago / 1000;
@@ -1366,11 +1395,14 @@ fn NetworkStats(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoView 
                     </dl>
                 }
             })}
+            // Outside the stats, which redraw every second, so a half-typed
+            // percentage isn't wiped.
+            <SimulatedLoss />
         </details>
     }
 }
 
-/// Our QR code, for a contact to scan: opened with "Present QR code", or
+/// Our QR code, for a contact to scan: opened with "Show QR code", or
 /// by scanning someone who hasn't scanned us yet (`waiting_for` is then
 /// their token), so they can scan ours straight back. Closes when we scan
 /// someone who had already scanned it, or once `waiting_for` has (see
@@ -1398,9 +1430,9 @@ fn QrCodeModal(
                 }}
                 <p class="hint">
                     {move || if waiting_for.get().is_some() {
-                        "Added. Now have them tap \"Scan QR code\" and scan this; it closes once they have."
+                        "Added. Now have them tap + then \"Scan QR code\" and scan this; it closes once they have."
                     } else {
-                        "Have your contact tap \"Scan QR code\" and point their camera here, then scan theirs."
+                        "Have your contact tap + then \"Scan QR code\" and point their camera here, then scan theirs."
                     }}
                 </p>
             </Modal>
@@ -1412,7 +1444,7 @@ fn QrCodeModal(
 /// sending and one for receiving, to try the app on a bad connection
 /// without making the relay lossy for everyone (see `client::netsim`).
 /// Each takes effect as soon as it's changed, and lasts until the app
-/// closes.
+/// closes. Part of the "Network" fold (see `NetworkStats`).
 #[component]
 fn SimulatedLoss() -> impl IntoView {
     let loss = RwSignal::new(api::SimulatedLossDto::default());
@@ -1450,29 +1482,27 @@ fn SimulatedLoss() -> impl IntoView {
     };
 
     view! {
-        <details class="identity-details">
-            <summary>"Simulated network loss"</summary>
-            <label class="setting">
-                "Sending loss (%)"
-                <input
-                    type="number" min="0" max="100" step="1"
-                    prop:value=move || loss.get().send.to_string()
-                    on:change=move |ev| apply(ev, true)
-                />
-            </label>
-            <label class="setting">
-                "Receiving loss (%)"
-                <input
-                    type="number" min="0" max="100" step="1"
-                    prop:value=move || loss.get().receive.to_string()
-                    on:change=move |ev| apply(ev, false)
-                />
-            </label>
-            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
-            <p class="hint">
-                "Drops that share of this device's packets at random, as a bad connection would. Resets to 0 when the app closes."
-            </p>
-        </details>
+        <h4>"Simulated loss"</h4>
+        <label class="setting">
+            "Sending loss (%)"
+            <input
+                type="number" min="0" max="100" step="1"
+                prop:value=move || loss.get().send.to_string()
+                on:change=move |ev| apply(ev, true)
+            />
+        </label>
+        <label class="setting">
+            "Receiving loss (%)"
+            <input
+                type="number" min="0" max="100" step="1"
+                prop:value=move || loss.get().receive.to_string()
+                on:change=move |ev| apply(ev, false)
+            />
+        </label>
+        {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        <p class="hint">
+            "Drops that share of this device's packets at random, as a bad connection would. Resets to 0 when the app closes."
+        </p>
     }
 }
 
@@ -1608,24 +1638,30 @@ fn Modal(title: &'static str, on_close: Callback<()>, children: Children) -> imp
     }
 }
 
-/// Contact list plus the two ways to add a contact: "Scan QR code" (reads
-/// a peer's presented QR with the camera) or pasting their routing token +
-/// Ed25519 key by hand as a fallback. Both end in the same
-/// `connect_to_peer` call with the same two values, so both establish the
-/// same trust anchor (see KeyExchangePayload::verify in packets.rs).
+/// Contact list, with a "+" menu of the ways to add a contact: "Show QR
+/// code" (ours, for them to scan), "Scan QR code" (reads a peer's presented
+/// QR with the camera) or "Manual add" (a popup for pasting their routing
+/// token + Ed25519 key by hand, as a fallback). Scanning and adding by hand
+/// end in the same `connect_to_peer` call with the same two values, so
+/// both establish the same trust anchor (see KeyExchangePayload::verify in
+/// packets.rs).
 #[component]
 fn ContactPanel(
     contacts: RwSignal<Vec<api::ContactDto>>,
     selected: RwSignal<Option<String>>,
     requests: RwSignal<api::ConnectionRequestsDto>,
     scanning: RwSignal<bool>,
+    adding_manually: RwSignal<bool>,
     unread: RwSignal<HashMap<String, usize>>,
     show_qr: RwSignal<bool>,
     qr_waiting_for: RwSignal<Option<String>>,
 ) -> impl IntoView {
+    let add_menu_open = RwSignal::new(false);
     let token_input = RwSignal::new(String::new());
     let key_input = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
+    // The "Manual add" popup's own error, shown in it.
+    let manual_error = RwSignal::new(None::<String>);
 
     // Which contact (by token) is showing its "Remove?" confirm row instead
     // of the usual remove icon — same inline-confirm pattern as the Login
@@ -1678,19 +1714,32 @@ fn ContactPanel(
         let token = token_input.get();
         let key = key_input.get();
         if token.trim().is_empty() || key.trim().is_empty() {
-            error.set(Some("Both fields are required.".into()));
+            manual_error.set(Some("Both fields are required.".into()));
             return;
         }
-        error.set(None);
+        manual_error.set(None);
         leptos::task::spawn_local(async move {
             if let Err(e) = api::connect_to_peer(&token, &key).await {
-                error.set(Some(e));
+                manual_error.set(Some(e));
             } else {
                 clear_request(&token);
                 token_input.set(String::new());
                 key_input.set(String::new());
+                adding_manually.set(false);
             }
         });
+    };
+    let close_manual = Callback::new(move |()| {
+        adding_manually.set(false);
+        manual_error.set(None);
+    });
+    // Each menu item closes the menu, then opens its own thing.
+    let choose = move |open: RwSignal<bool>| {
+        move |_| {
+            add_menu_open.set(false);
+            error.set(None);
+            open.set(true);
+        }
     };
 
     // Removing a contact also deletes its local chat history unconditionally
@@ -1717,7 +1766,40 @@ fn ContactPanel(
 
     view! {
         <div class="contact-panel">
-            <h2>"Contacts"</h2>
+            <div class="panel-header">
+                <h2>"Contacts"</h2>
+                <div class="add-menu">
+                    <button
+                        type="button"
+                        class="icon-btn menu-btn add-btn"
+                        title="Add a contact"
+                        aria-label="Add a contact"
+                        aria-haspopup="menu"
+                        aria-expanded=move || add_menu_open.get().to_string()
+                        on:click=move |_| add_menu_open.update(|o| *o = !*o)
+                    >
+                        <PlusIcon />
+                    </button>
+                    <Show when=move || add_menu_open.get()>
+                        <Menu on_close=Callback::new(move |()| add_menu_open.set(false))>
+                            <button type="button" role="menuitem" on:click=choose(show_qr)>
+                                "Show QR code"
+                            </button>
+                            <button type="button" role="menuitem" on:click=choose(scanning)>
+                                "Scan QR code"
+                            </button>
+                            <button type="button" role="menuitem" on:click=choose(adding_manually)>
+                                "Manual add"
+                            </button>
+                        </Menu>
+                    </Show>
+                </div>
+            </div>
+            {move || contacts.with(Vec::is_empty).then(|| view! {
+                <p class="hint">
+                    "No contacts yet. Tap + to add someone: you each add the other, and a contact stays pending until they've added you too."
+                </p>
+            })}
             <ul class="contact-list">
                 <For
                     each=move || contacts.get()
@@ -1812,28 +1894,30 @@ fn ContactPanel(
                     <button type="button" class="link-btn" on:click=unmute>"Unmute"</button>
                 </p>
             })}
-            <h3>"Add contact"</h3>
-            <p class="hint">
-                "You each add the other. A contact stays pending until they've added you too."
-            </p>
-            <button type="button" class="scan-btn" on:click=move |_| scanning.set(true)>
-                "Scan QR code"
-            </button>
-            <p class="hint">"Or enter their details manually:"</p>
-            <input
-                type="text"
-                placeholder="their routing token (hex)"
-                prop:value=move || token_input.get()
-                on:input=move |ev| token_input.set(event_target_value(&ev))
-            />
-            <input
-                type="text"
-                placeholder="their ed25519 pubkey (hex)"
-                prop:value=move || key_input.get()
-                on:input=move |ev| key_input.set(event_target_value(&ev))
-            />
-            <button on:click=on_add>"Send Connection Request"</button>
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+            <Show when=move || adding_manually.get()>
+                <Modal title="Manual add" on_close=close_manual>
+                    <p class="hint">
+                        "Their routing token and Ed25519 key, from \"Show token and key\" under their Settings. You each add the other: they stay pending until they've added you too."
+                    </p>
+                    <input
+                        type="text"
+                        placeholder="their routing token (hex)"
+                        prop:value=move || token_input.get()
+                        on:input=move |ev| token_input.set(event_target_value(&ev))
+                    />
+                    <input
+                        type="text"
+                        placeholder="their ed25519 pubkey (hex)"
+                        prop:value=move || key_input.get()
+                        on:input=move |ev| key_input.set(event_target_value(&ev))
+                    />
+                    {move || manual_error.get().map(|e| view! { <p class="error">{e}</p> })}
+                    <div class="modal-actions">
+                        <button type="button" on:click=on_add>"Send connection request"</button>
+                    </div>
+                </Modal>
+            </Show>
             <Show when=move || scanning.get()>
                 <Modal title="Scan QR code" on_close=Callback::new(move |()| scanning.set(false))>
                     <QrScanner on_scan=on_scan />
