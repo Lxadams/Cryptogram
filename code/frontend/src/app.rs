@@ -190,6 +190,26 @@ fn apply_theme(theme: Theme) {
     }
 }
 
+/// Whether this device measures the network for the stats and the unstable
+/// network warning (see `MainScreen`): "on", or off when unset.
+const NETWORK_STATS_STORAGE_KEY: &str = "e2e-messenger-network-stats";
+
+fn saved_network_stats_on() -> bool {
+    window()
+        .local_storage()
+        .ok()
+        .flatten()
+        .and_then(|storage| storage.get_item(NETWORK_STATS_STORAGE_KEY).ok().flatten())
+        .as_deref()
+        == Some("on")
+}
+
+fn save_network_stats_on(on: bool) {
+    if let Ok(Some(storage)) = window().local_storage() {
+        let _ = storage.set_item(NETWORK_STATS_STORAGE_KEY, if on { "on" } else { "off" });
+    }
+}
+
 /// Bin icon for destructive icon buttons (delete identity, remove contact).
 #[component]
 fn TrashIcon() -> impl IntoView {
@@ -1040,15 +1060,34 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     });
 
     // The network stats (see `api::network_stats`), for the Network section
-    // and the unstable network warning (see `NetworkWarning`).
+    // and the unstable network warning (see `NetworkWarning`), while they're
+    // turned on in Settings. Asking for them has the client probe the relay
+    // to measure loss (about 4 KB/s; see client/src/link_quality.rs), so
+    // they're off by default, saved per device, and not asked for while the
+    // app is out of sight: the web view keeps this page's timers running in
+    // the background.
+    let stats_on = RwSignal::new(saved_network_stats_on());
     let net_stats = RwSignal::new(None::<api::NetworkStatsDto>);
+    Effect::new(move |_| {
+        let on = stats_on.get();
+        save_network_stats_on(on);
+        if !on {
+            net_stats.set(None);
+        }
+    });
 
     // Poll the backend every second for contact-status changes and newly
     // decrypted messages. This is deliberately simple polling rather than
     // a push/event channel — see poll_inbox's doc comment in commands.rs.
     let refresh = move || {
         leptos::task::spawn_local(async move {
-            if let Ok(latest) = api::network_stats().await {
+            let want_stats = move || stats_on.try_get_untracked() == Some(true);
+            if want_stats()
+                && !document().hidden()
+                && let Ok(latest) = api::network_stats().await
+                // Turned off while that was on its way.
+                && want_stats()
+            {
                 net_stats.try_set(Some(latest));
             }
             // Only notify when something actually changed: this runs every
@@ -1157,7 +1196,7 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
                         show_qr=show_qr
                         qr_waiting_for=qr_waiting_for
                     />
-                    <SettingsPanel identity=identity net_stats=net_stats />
+                    <SettingsPanel identity=identity stats_on=stats_on net_stats=net_stats />
                 </div>
                 <ChatPanel
                     contacts=contacts
@@ -1197,13 +1236,15 @@ fn IdentityCard(identity: api::IdentityDto) -> impl IntoView {
 /// The folds after the contact list, in a section of their own:
 /// - **Settings:** your name, routing token and Ed25519 key in hex, folded
 ///   away again as they're long and only needed to add someone by hand (the
-///   QR code covers the usual case); and, on devices that post
-///   notifications, whether they name senders.
+///   QR code covers the usual case); whether to measure the network (see
+///   `MainScreen`'s `stats_on`); and, on devices that post notifications,
+///   whether they name senders.
 /// - **Network:** the network stats and the simulated loss (see
 ///   `NetworkStats`).
 #[component]
 fn SettingsPanel(
     identity: api::IdentityDto,
+    stats_on: RwSignal<bool>,
     net_stats: RwSignal<Option<api::NetworkStatsDto>>,
 ) -> impl IntoView {
     let notifications = RwSignal::new(None::<api::NotificationSettingsDto>);
@@ -1237,6 +1278,17 @@ fn SettingsPanel(
                         <CopyButton value=identity.ed25519_public />
                     </p>
                 </details>
+                <label class="setting">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || stats_on.get()
+                        on:change=move |ev| stats_on.set(event_target_checked(&ev))
+                    />
+                    "Network stats"
+                </label>
+                <p class="hint">
+                    "Measures the connection to the relay, for the Network section and a warning when it's unstable. Sends extra packets, about 4 KB/s while the app is open."
+                </p>
                 // Read once it's loaded, then left to the checkbox: setting
                 // the signal again would redraw it and lose the change.
                 {move || notifications.get().filter(|n| n.posted).map(|n| view! {
@@ -1258,7 +1310,7 @@ fn SettingsPanel(
                     </p>
                 })}
             </details>
-            <NetworkStats stats=net_stats />
+            <NetworkStats on=stats_on stats=net_stats />
         </div>
     }
 }
@@ -1298,10 +1350,14 @@ fn NetworkWarning(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoVie
 /// The "Network" fold (see `SettingsPanel`): the link to the relay, the
 /// packets to and from it, what had to be sent again, and how much is
 /// being lost (see `api::network_stats`), updated every second from
-/// `MainScreen`'s poll, then the simulated loss (see `SimulatedLoss`).
-/// Packet counts are since the app started; the rest since this login.
+/// `MainScreen`'s poll while `on` (the "Network stats" setting), then the
+/// simulated loss (see `SimulatedLoss`), which doesn't need it. Packet
+/// counts are since the app started; the rest since this login.
 #[component]
-fn NetworkStats(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoView {
+fn NetworkStats(
+    on: RwSignal<bool>,
+    stats: RwSignal<Option<api::NetworkStatsDto>>,
+) -> impl IntoView {
     // "1,234", with any simulated drops after it.
     let packets = |count: u64, dropped: u64| {
         if dropped == 0 {
@@ -1314,6 +1370,9 @@ fn NetworkStats(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoView 
     view! {
         <details class="fold network-stats">
             <summary>"Network"</summary>
+            {move || (!on.get()).then(|| view! {
+                <p class="hint">"Network stats are off. Turn them on under Settings."</p>
+            })}
             {move || stats.get().map(|s| {
                 let heard = s.last_heard_ms_ago / 1000;
                 let (status_class, status) = match s.status.as_str() {
