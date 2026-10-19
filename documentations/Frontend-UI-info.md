@@ -150,7 +150,7 @@ The header is always there: the title (kept invisible on the start page, which s
 
 ### Start page (`WelcomeScreen`)
 
-The large logo, "Cryptogram" and a **Sign in** button, which goes to Login. It has two logos, `logo-dark.svg` and `logo-light.svg`, and shows the one for the theme (`.logo-for-dark` / `.logo-for-light`). Android's back button from Login or Create Identity comes back here: leaving the start page adds a history entry, like the layers over the contact list (see §7).
+The large logo, "Cryptogram" and a **Sign in** button, which goes to Login. It has two logos, `logo-dark.svg` and `logo-light.svg`, and shows the one for the theme (`.logo-for-dark` / `.logo-for-light`). Android's back button from Login or Create Identity comes back here (see `back_button` in §7).
 
 ### Login (`LoginScreen`)
 
@@ -355,7 +355,7 @@ One hand-written stylesheet, `style.css` (no framework, no component-scoped CSS)
 - **Page layout:** `body` doesn't scroll. `.app` is a full-height flex column (max width 1100 px); the panels inside scroll on their own, so the composer stays put while the transcript scrolls.
 - **Login / Create / Connect** are a centred column, max 440 px.
 - **Main screen, wide:** a two-column grid, the side column (220–300 px: contacts, then the settings section, scrolling as one) beside the chat.
-- **Main screen, narrow** (`max-width: 719px`): one column. `MainScreen` adds the class `chat-open` when a contact is selected, and CSS shows *either* the identity card and the side column (contacts and settings) *or* the chat. The **←** button sets `selected` back to `None`. No JavaScript-side layout logic is involved. Each layer open over the contact list (a chat, your QR code, the scanner, the manual add dialog) also gets a browser-history entry, so Android's back button (which goes back in the web view's history before leaving the app) closes the topmost one (the scanner or manual add, then the QR code, then the chat) and only leaves the app when none is open. A layer closed any other way (its X, **←**, a scan) pops its entry again.
+- **Main screen, narrow** (`max-width: 719px`): one column. `MainScreen` adds the class `chat-open` when a contact is selected, and CSS shows *either* the identity card and the side column (contacts and settings) *or* the chat. The **←** button sets `selected` back to `None`. No JavaScript-side layout logic is involved. Android's back button closes the topmost layer over the contact list (the scanner or manual add, then the QR code, then the chat) and only leaves the app when none is open. `MainActivity` handles every back press by calling `window.__cryptogramBack()`, which `back_button.rs` installs. It runs the newest handler a component registered with `back_button::while_active` that has something open, and returns whether there was one. If there wasn't, back goes on to Android's default, which puts the app in the background. Two simpler ways didn't hold up on a phone. One was a history entry per layer: Chromium marks an entry for the back button to skip when the page adds the next one without a tap, and the web view then says it can't go back. The other was Tauri's back-button listener: Tauri attaches its back handling to the first activity only, so after the app was closed and reopened while still running in the background, back left the app from anywhere.
 - **Touch** (`pointer: coarse`): 16 px text in fields (stops mobile webviews zooming on focus) and bigger tap targets.
 
 ---
@@ -366,7 +366,7 @@ The UI code is identical; what differs is around it (`src-tauri/src/background.r
 
 | Piece | What it does |
 |---|---|
-| `MainActivity.kt` | Allows screen capture (no `FLAG_SECURE`), so the phone can be mirrored for demos. Pads the webview by the status bar, navigation bar and **keyboard** insets, so the composer stays visible while typing (done natively because older WebViews report CSS safe-area insets as zero). Asks for notification permission on Android 13+. Starts `NativeBridge`. |
+| `MainActivity.kt` | Allows screen capture (no `FLAG_SECURE`), so the phone can be mirrored for demos. Handles the back button on every activity by asking the page (`window.__cryptogramBack`, see §7). Pads the webview by the status bar, navigation bar and **keyboard** insets, so the composer stays visible while typing (done natively because older WebViews report CSS safe-area insets as zero). Asks for notification permission on Android 13+. Starts `NativeBridge`. |
 | `NativeBridge.kt` | A thread blocks in the JNI call `nextEvent()` and reacts to strings the Rust side emits: `session_started`, `session_ended`, `message`, `message\t<from>`. |
 | `MessageService.kt` | A foreground service that runs while someone is logged in. It does no work; it exists so Android doesn't freeze the process and its UDP socket. Also posts the "N new messages" notification, only when the app isn't on screen, and never with message text. |
 | `background.rs` | The Rust half: `session_started` (from `bootstrap`), `session_ended` (from logout), `message_received` (from the receive and tick loops). No-ops on desktop. |

@@ -114,9 +114,10 @@ Closes issue: #
 - **QR codes** (new `QrCodeModal`, owned by `MainScreen`):
   - **They scanned you first:** scanning their code closes yours.
   - **You scanned first:** scanning someone who hasn't scanned you yet opens your code, which closes once they have (their status leaves "pending").
-- **Android back:** each layer over the contact list (a chat, your QR code, the scanner, the Manual add dialog) gets a browser-history entry, and Tauri goes back in the web view's history before leaving the app.
+- **Android back** (`MainActivity.kt`, new `code/frontend/src/back_button.rs`): `MainActivity` asks the page about every back press (`window.__cryptogramBack()`). The page closes the top layer over the contact list (a chat, your QR code, the scanner, the Manual add dialog) and says so. With none open, back goes on to Android's default, which puts the app in the background.
+  - **Why not history:** each layer first got a web view history entry, which Tauri goes back through. But Chromium marks an entry for the back button to skip when the page adds the next one without a tap, as when your QR code opened by itself after a scan. The web view then said it couldn't go back, so back left the app from an open chat. Seen on a phone: back exited with the chat's entry at index 1 of 2.
+  - **Why not Tauri's back-button listener:** Tauri attaches its back handling to the first activity only. Closing the app while it keeps running in the background (for notifications) destroys that activity, and reopening makes a new one. Back then left the app from anywhere until a force stop. `MainActivity` attaches its handler to every activity.
   - **Order:** back closes the scanner or Manual add, then the QR code, then the chat, and only then leaves the app.
-  - **Other ways of closing:** closing a layer some other way (X, ←, a scan) takes its entry back off.
 - **Keyboard:** opening it shrinks the web view, and the transcript's scroll position counts from the top, so the newest messages slipped out of sight. The transcript now stays at the newest message through a resize if it was there.
 
 **Branding** (`code/frontend/branding/`, `style.css`, `app.rs`)
@@ -141,7 +142,6 @@ Closes issue: #
   - **Theme toggle:** a sun in dark mode and a moon in light mode, for the mode it switches to, in place of the "Light mode" / "Dark mode" text.
 - **Small fixes:**
   - The notification setting's checkbox is no longer full width.
-  - Logging out with a chat open takes its back-button history entries off.
 
 **Tooling**
 - **`build-apk.sh -ip <ip> -p <port> -pk <hex>`** builds for any relay, such as the deployed one. `-pk` is required with `-ip`. With no flags it builds for the local relay, as before.
@@ -197,14 +197,19 @@ Closes issue: #
   - **Recovery:** with this build, a lost inject was recovered twice without a repair. The receiver asked about 3 s after the next message arrived, the sender resent it, and the message appeared.
   - **Repair session:** pressed twice on the phone, both times on a session broken before the fix. Messages got through again after each.
   - **Old requests:** requests from before a repair were refused, as they should be.
+- **Android back, on the phone** (driven over adb, with Chrome DevTools to read the web view):
+  - **The history bug:** caught in the act. A chat was open with its entry at index 1 of 2, and back still went to the home screen.
+  - **Layers:** with the back-button listener build, back closed a chat, then a QR code opened over a chat, one at a time, and only then left the app. Each was opened without a tap, which is what had marked entries to skip before. They were also tried by hand.
+  - **A recreated activity** (the final build): changing the font scale makes Android recreate the activity in the same process, as closing and reopening the app does while it runs in the background. On the new activity, back from Login returned to the start page and the app stayed open. Back from the start page left the app, as it should.
 - **Through the lossy proxy, on this PC:** the repair and contact-setup times, and the loss estimate's readings, in the tables above.
 - **In a browser:** these were rendered in headless Firefox with a mocked backend:
   - **Screens:** the start page and the chat screen, in both themes.
   - **The warning bar.**
   - **The new main screen layout:** the + menu, the Manual add dialog, an empty contact list, and the settings section with every fold open, at desktop and phone widths.
-- **Commits:** each of the 20 code commits builds and lints on its own.
+- **Commits:** each of the 21 code commits builds and lints on its own.
 - **Not yet tested:**
-  - on a device: the ⋮ menu and centred title, new-message counts and ordering, the QR code popups, Android back, the keyboard fix, network stats and the warning, the spinner and retry, the new name, icon and start page, and the main screen's new layout
+  - on a device: the ⋮ menu and centred title, new-message counts and ordering, the QR code popups, the keyboard fix, network stats and the warning, the spinner and retry, the new name, icon and start page, and the main screen's new layout
+  - Android back on the final build after closing and reopening the app, from a chat or a QR code: only Login was tried on a recreated activity
   - the desktop app by hand
   - `runpeer.sh -ip …` beyond its argument handling, which was checked with a stub `cargo`
   - mirroring the phone with scrcpy now that `FLAG_SECURE` is gone
