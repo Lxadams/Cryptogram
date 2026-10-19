@@ -1176,6 +1176,12 @@ mod tests {
             ["m5", "m6"]
         );
         assert_eq!(
+            bob.retransmissions().pq_requests,
+            2,
+            "the lost request and the answered one"
+        );
+        assert_eq!(alice.retransmissions().pq_resends, 1);
+        assert_eq!(
             session(&alice, &bob).send_chain_key,
             session(&bob, &alice).recv_chain_key
         );

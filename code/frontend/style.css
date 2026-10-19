@@ -501,6 +501,42 @@ button.danger {
   min-width: 0;
 }
 
+/* The "Network" fold on the identity card (see `NetworkStats`). */
+.network-stats dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+}
+
+.network-stats dt {
+  color: var(--muted);
+}
+
+.network-stats dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.network-stats h4 {
+  margin: 0.75rem 0 0;
+  font-size: 0.85rem;
+}
+
+.network-stats .net-connected {
+  color: var(--ok);
+}
+
+.network-stats .net-quiet {
+  color: #ffc107;
+}
+
+.network-stats .net-reconnecting {
+  color: var(--error);
+}
+
 /* How many new messages a contact has sent (see `UnreadBadge`): a small
    square after their name, and the total on the back button. */
 .unread-badge {

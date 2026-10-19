@@ -1269,6 +1269,69 @@ pub async fn set_notify_with_names(state: State<'_, AppState>, on: bool) -> Resu
     Ok(())
 }
 
+/// What `network_stats` reports: the link to the relay, packets to and from
+/// it, and what had to be sent again (see `client::Retransmissions`).
+#[derive(Serialize, Clone)]
+pub struct NetworkStatsDto {
+    /// The relay's address.
+    pub relay: String,
+    /// "connected", "quiet" (nothing heard from the relay for a while, so
+    /// the link may be gone) or "reconnecting".
+    pub status: String,
+    /// How long since we last heard from the relay, in milliseconds.
+    pub last_heard_ms_ago: u64,
+    /// Packets since the app started (see `client::netsim::PacketCounts`).
+    pub packets_sent: u64,
+    pub packets_send_dropped: u64,
+    pub packets_received: u64,
+    pub packets_receive_dropped: u64,
+    pub contact_setup_resends: u64,
+    pub reconnects: u64,
+    pub pq_requests: u64,
+    pub pq_resends: u64,
+    pub message_retries: u64,
+    pub duplicates_received: u64,
+}
+
+/// Silence from the relay longer than this shows as "quiet": the client
+/// syncs every 15s and the relay acks each one, so this is two missed.
+const QUIET_AFTER_MS: u64 = 40_000;
+
+/// The network stats the app shows (see `NetworkStatsDto`).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn network_stats(state: State<'_, AppState>) -> Result<NetworkStatsDto, String> {
+    let guard = state.runtime.lock().await;
+    let client = &guard.as_ref().ok_or("Not connected to relay yet")?.client;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let last_heard_ms_ago = now_ms.saturating_sub(client.last_heard_from_relay_ms());
+    let status = if client.reconnecting() {
+        "reconnecting"
+    } else if last_heard_ms_ago > QUIET_AFTER_MS {
+        "quiet"
+    } else {
+        "connected"
+    };
+    let packets = netsim::packet_counts();
+    let resent = client.retransmissions();
+    Ok(NetworkStatsDto {
+        relay: client.server_addr.to_string(),
+        status: status.to_string(),
+        last_heard_ms_ago,
+        packets_sent: packets.sent,
+        packets_send_dropped: packets.send_dropped,
+        packets_received: packets.received,
+        packets_receive_dropped: packets.receive_dropped,
+        contact_setup_resends: resent.contact_setup,
+        reconnects: resent.reconnects,
+        pq_requests: resent.pq_requests,
+        pq_resends: resent.pq_resends,
+        message_retries: resent.message_retries,
+        duplicates_received: resent.duplicates_received,
+    })
+}
+
 /// What `simulated_loss` reports: the percentage of packets this device
 /// drops on purpose in each direction (see `client::netsim`).
 #[derive(Serialize, Clone)]

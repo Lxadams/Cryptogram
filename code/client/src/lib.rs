@@ -851,6 +851,33 @@ pub struct Client {
     /// their own; a front end sending what `add_contact` or
     /// `repair_session` returned sends `take_extra_packets` too. Live state.
     extra_replies: Vec<Vec<u8>>,
+    /// What we've sent again, and received twice (see `Retransmissions`).
+    /// Live state.
+    retransmissions: Retransmissions,
+}
+
+/// What this client has had to send again, and what reached it twice,
+/// since it started: for a front end's network stats (see
+/// `Client::retransmissions`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Retransmissions {
+    /// KeyExchanges sent again to contacts still setting up a session (see
+    /// `setup_resends`).
+    pub contact_setup: u64,
+    /// Times the link to the relay was set up again after it went quiet
+    /// (see `keepalive`).
+    pub reconnects: u64,
+    /// Requests for PQ refreshes that never arrived (see
+    /// `pq_inject_requests`), each counted once however many copies.
+    pub pq_requests: u64,
+    /// PQ refreshes sent again because a contact asked for them.
+    pub pq_resends: u64,
+    /// Messages sent again by hand after the relay didn't confirm them
+    /// (see `note_message_retry`).
+    pub message_retries: u64,
+    /// Packets the relay delivered again because our ack didn't reach it,
+    /// recognised and skipped.
+    pub duplicates_received: u64,
 }
 
 /// When `Client::pq_inject_requests` next asks a contact for a PQ refresh,
@@ -915,6 +942,7 @@ impl Client {
             pq_inject_asks: HashMap::new(),
             pq_resent_at: HashMap::new(),
             extra_replies: Vec::new(),
+            retransmissions: Retransmissions::default(),
         }
     }
 
@@ -1155,6 +1183,7 @@ impl Client {
             if link_gone {
                 if self.pending_handshake.is_none() {
                     println!(">> The relay stopped answering; reconnecting...");
+                    self.retransmissions.reconnects += 1;
                 }
                 let (secret, packet) = self.generate_handshake_packet();
                 self.pending_handshake = Some((secret, now));
@@ -1361,9 +1390,33 @@ impl Client {
             retry.delay = (retry.delay * 2).min(MAX_SETUP_RETRY_DELAY);
             due.push(token);
         }
+        self.retransmissions.contact_setup += due.len() as u64;
         due.into_iter()
             .map(|token| self.create_kx_request(token))
             .collect()
+    }
+
+    /// What we've had to send again, and what reached us twice, so far (see
+    /// `Retransmissions`).
+    pub fn retransmissions(&self) -> Retransmissions {
+        self.retransmissions
+    }
+
+    /// A front end has sent a message again by hand, as the relay didn't
+    /// confirm the first try: count it (see `Retransmissions`).
+    pub fn note_message_retry(&mut self) {
+        self.retransmissions.message_retries += 1;
+    }
+
+    /// Whether we're setting up a new link to the relay, after it went
+    /// quiet (see `keepalive`).
+    pub fn reconnecting(&self) -> bool {
+        self.pending_handshake.is_some()
+    }
+
+    /// When we last heard from the relay, in Unix milliseconds.
+    pub fn last_heard_from_relay_ms(&self) -> u64 {
+        self.last_heard_ms
     }
 
     /// The packets `extra_replies` holds, for a front end to send after
@@ -1757,6 +1810,7 @@ impl Client {
             for _ in 0..PQ_RECOVERY_COPIES {
                 packets.push(self.wrap_link_encryption(token, &inner));
             }
+            self.retransmissions.pq_requests += 1;
         }
         packets
     }
@@ -2021,9 +2075,10 @@ impl Client {
         let payload = inner.to_vec();
         let needs_ack = delivery_id != [0u8; 16];
         let mut out = Vec::new();
-        if (!needs_ack || self.recent_deliveries.first_time(delivery_id))
-            && let Ok(Some(reply)) = self.handle_incoming_packet(&payload)
-        {
+        let first_time = !needs_ack || self.recent_deliveries.first_time(delivery_id);
+        if !first_time {
+            self.retransmissions.duplicates_received += 1;
+        } else if let Ok(Some(reply)) = self.handle_incoming_packet(&payload) {
             out.push(reply);
         }
         out.append(&mut self.extra_replies);
@@ -2236,6 +2291,7 @@ impl Client {
                     short(&peer),
                     wanted.len()
                 );
+                self.retransmissions.pq_resends += wanted.len() as u64;
                 for payload in wanted {
                     for _ in 0..PQ_RECOVERY_COPIES {
                         let packet = self.wrap_link_encryption(peer, &payload);
@@ -5670,6 +5726,7 @@ mod tests {
         // The relay seals each resend afresh.
         let resend = bob.handle_relay_packet(&relay_forward(&bob, delivery_id, &kx_inner));
         assert_eq!(resend.len(), 1, "a resend is only acked again");
+        assert_eq!(bob.retransmissions().duplicates_received, 1);
 
         let ack = &resend[0];
         let header = relay_link::header(ack).unwrap();
@@ -5868,6 +5925,7 @@ mod tests {
         let _lost = b.add_contact(ta, a.identity.ed25519_public).unwrap();
         let mut resent = a.setup_resends(Instant::now() + FIRST_SETUP_RETRY);
         assert_eq!(resent.len(), 1);
+        assert_eq!(a.retransmissions().contact_setup, 1);
         exchange(&mut a, &mut b, resent.remove(0));
         assert!(a.is_connected(&tb) && b.is_connected(&ta));
         let later = Instant::now() + MAX_SETUP_RETRY_DELAY;

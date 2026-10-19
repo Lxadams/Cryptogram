@@ -952,11 +952,17 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         }
     });
 
+    // The network stats (see `api::network_stats`), for the Network section.
+    let net_stats = RwSignal::new(None::<api::NetworkStatsDto>);
+
     // Poll the backend every second for contact-status changes and newly
     // decrypted messages. This is deliberately simple polling rather than
     // a push/event channel — see poll_inbox's doc comment in commands.rs.
     let refresh = move || {
         leptos::task::spawn_local(async move {
+            if let Ok(latest) = api::network_stats().await {
+                net_stats.try_set(Some(latest));
+            }
             // Only notify when something actually changed: this runs every
             // second, and every `set` re-runs everything that reads
             // `contacts`. `try_`: the response can land after this screen
@@ -1043,7 +1049,7 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         // `chat-open`: on narrow screens, show the chat instead of the
         // contact list (see `.main-screen.chat-open` in style.css).
         <section class="main-screen" class:chat-open=move || selected.get().is_some()>
-            <IdentityCard identity=identity.clone() show_qr=show_qr />
+            <IdentityCard identity=identity.clone() show_qr=show_qr net_stats=net_stats />
             // Before the scanner and the connection request notice, so they
             // open on top of it: accepting a request means scanning their
             // code while ours is still up.
@@ -1084,7 +1090,11 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
 /// are any: whether notifications name senders, on devices that post them,
 /// and the simulated network loss (see `SimulatedLoss`).
 #[component]
-fn IdentityCard(identity: api::IdentityDto, show_qr: RwSignal<bool>) -> impl IntoView {
+fn IdentityCard(
+    identity: api::IdentityDto,
+    show_qr: RwSignal<bool>,
+    net_stats: RwSignal<Option<api::NetworkStatsDto>>,
+) -> impl IntoView {
     let notifications = RwSignal::new(None::<api::NotificationSettingsDto>);
     leptos::task::spawn_local(async move {
         if let Ok(settings) = api::notification_settings().await {
@@ -1147,7 +1157,68 @@ fn IdentityCard(identity: api::IdentityDto, show_qr: RwSignal<bool>) -> impl Int
                 </details>
             })}
             <SimulatedLoss />
+            <NetworkStats stats=net_stats />
         </div>
+    }
+}
+
+/// The link to the relay, the packets to and from it, and what had to be
+/// sent again (see `api::network_stats`), folded away under the identity
+/// card and updated every second from
+/// `MainScreen`'s poll. Packet counts are since the app started; the rest
+/// since this login.
+#[component]
+fn NetworkStats(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoView {
+    // "1,234", with any simulated drops after it.
+    let packets = |count: u64, dropped: u64| {
+        if dropped == 0 {
+            count.to_string()
+        } else {
+            format!("{count} (+{dropped} dropped by simulated loss)")
+        }
+    };
+
+    view! {
+        <details class="identity-details network-stats">
+            <summary>"Network"</summary>
+            {move || stats.get().map(|s| {
+                let heard = s.last_heard_ms_ago / 1000;
+                let (status_class, status) = match s.status.as_str() {
+                    "reconnecting" => ("net-reconnecting", "Reconnecting…".to_string()),
+                    "quiet" => ("net-quiet", format!("No reply for {heard} s")),
+                    _ => ("net-connected", format!("Connected · heard {heard} s ago")),
+                };
+                view! {
+                    <dl>
+                        <dt>"Relay"</dt>
+                        <dd><code>{s.relay}</code></dd>
+                        <dt>"Status"</dt>
+                        <dd class=status_class>{status}</dd>
+                        <dt>"Packets sent"</dt>
+                        <dd>{packets(s.packets_sent, s.packets_send_dropped)}</dd>
+                        <dt>"Packets received"</dt>
+                        <dd>{packets(s.packets_received, s.packets_receive_dropped)}</dd>
+                    </dl>
+                    <h4>"Retransmissions"</h4>
+                    <dl>
+                        <dt>"Contact setup resent"</dt>
+                        <dd>{s.contact_setup_resends}</dd>
+                        <dt>"Reconnects to relay"</dt>
+                        <dd>{s.reconnects}</dd>
+                        <dt>"PQ refreshes asked for"</dt>
+                        <dd>{s.pq_requests}</dd>
+                        <dt>"PQ refreshes resent"</dt>
+                        <dd>{s.pq_resends}</dd>
+                        <dt>"Messages retried"</dt>
+                        <dd>{s.message_retries}</dd>
+                        <dt>"Received twice"</dt>
+                        <dd title="The relay sent it again, as our acknowledgement didn't reach it">
+                            {s.duplicates_received}
+                        </dd>
+                    </dl>
+                }
+            })}
+        </details>
     }
 }
 

@@ -326,6 +326,31 @@ pub async fn send_message(token_hex: &str, text: &str) -> Result<SentMessageDto,
     call("send_message", &SendMessageArgs { token_hex, text }).await
 }
 
+/// Mirrors `NetworkStatsDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct NetworkStatsDto {
+    pub relay: String,
+    /// "connected", "quiet" or "reconnecting".
+    pub status: String,
+    pub last_heard_ms_ago: u64,
+    pub packets_sent: u64,
+    pub packets_send_dropped: u64,
+    pub packets_received: u64,
+    pub packets_receive_dropped: u64,
+    pub contact_setup_resends: u64,
+    pub reconnects: u64,
+    pub pq_requests: u64,
+    pub pq_resends: u64,
+    pub message_retries: u64,
+    pub duplicates_received: u64,
+}
+
+/// The link to the relay, packets to and from it, and what had to be sent
+/// again.
+pub async fn network_stats() -> Result<NetworkStatsDto, String> {
+    call("network_stats", &()).await
+}
+
 pub async fn poll_inbox() -> Result<Vec<IncomingMessageDto>, String> {
     call("poll_inbox", &()).await
 }

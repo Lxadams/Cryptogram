@@ -32,6 +32,7 @@ pub fn run() {
             commands::simulated_loss,
             commands::set_simulated_loss,
             commands::send_message,
+            commands::network_stats,
             commands::sent_message_updates,
             commands::poll_inbox,
             commands::chat_history,

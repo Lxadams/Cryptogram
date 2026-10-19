@@ -5,16 +5,44 @@
 //! the socket, incoming ones are read and thrown away before the client
 //! sees them. Off (0%) until a front end turns it on with `set_loss`, and
 //! process-wide, like a real network: it applies to every packet this
-//! process sends to or receives from the relay.
+//! process sends to or receives from the relay. It also counts those
+//! packets, for a front end's network stats (see `packet_counts`).
 
 use rand_core::{OsRng, RngCore};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use tokio::net::UdpSocket;
 
 static SEND_LOSS: AtomicU8 = AtomicU8::new(0);
 static RECEIVE_LOSS: AtomicU8 = AtomicU8::new(0);
+static SENT: AtomicU64 = AtomicU64::new(0);
+static SEND_DROPPED: AtomicU64 = AtomicU64::new(0);
+static RECEIVED: AtomicU64 = AtomicU64::new(0);
+static RECEIVE_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Packets to and from the relay since the process started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PacketCounts {
+    /// Handed to the socket.
+    pub sent: u64,
+    /// Dropped on the way out by the simulated loss.
+    pub send_dropped: u64,
+    /// Read from the socket and passed on.
+    pub received: u64,
+    /// Read from the socket and dropped by the simulated loss.
+    pub receive_dropped: u64,
+}
+
+/// Packets to and from the relay so far (see `PacketCounts`).
+pub fn packet_counts() -> PacketCounts {
+    PacketCounts {
+        sent: SENT.load(Ordering::Relaxed),
+        send_dropped: SEND_DROPPED.load(Ordering::Relaxed),
+        received: RECEIVED.load(Ordering::Relaxed),
+        receive_dropped: RECEIVE_DROPPED.load(Ordering::Relaxed),
+    }
+}
 
 /// The simulated loss, as `(sending, receiving)` percentages.
 pub fn loss() -> (u8, u8) {
@@ -41,9 +69,12 @@ fn lose(percent: &AtomicU8) -> bool {
 /// network would.
 pub async fn send_to(socket: &UdpSocket, packet: &[u8], addr: SocketAddr) -> io::Result<usize> {
     if lose(&SEND_LOSS) {
+        SEND_DROPPED.fetch_add(1, Ordering::Relaxed);
         return Ok(packet.len());
     }
-    socket.send_to(packet, addr).await
+    let sent = socket.send_to(packet, addr).await?;
+    SENT.fetch_add(1, Ordering::Relaxed);
+    Ok(sent)
 }
 
 /// `socket.recv_from`, but packets lost on the way in are skipped: it waits
@@ -52,8 +83,10 @@ pub async fn recv_from(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize,
     loop {
         let received = socket.recv_from(buf).await?;
         if !lose(&RECEIVE_LOSS) {
+            RECEIVED.fetch_add(1, Ordering::Relaxed);
             return Ok(received);
         }
+        RECEIVE_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
