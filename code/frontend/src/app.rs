@@ -15,7 +15,7 @@
 //! prototype with three screens.
 
 use crate::qr::QrScanner;
-use crate::{api, contact_code, qr};
+use crate::{api, back_button, contact_code, qr};
 use leptos::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -433,37 +433,19 @@ pub fn App() -> impl IntoView {
     let theme = RwSignal::new(initial_theme());
     Effect::new(move |_| apply_theme(theme.get()));
 
-    // Android's back button (see `MainScreen`): from Login or Create
-    // Identity it goes back to the start page, not out of the app. So
-    // leaving the start page adds a history entry, and logging in, which
-    // leaves those screens the other way, takes it back off.
-    let past_welcome = move || login.get().is_none() && auth_screen.get() != AuthScreen::Welcome;
-    let closed_by_back = StoredValue::new(false);
-    let our_pop = StoredValue::new(false);
-    Effect::new(move |was_past: Option<bool>| {
-        let past = past_welcome();
-        if let Ok(history) = window().history() {
-            if past && was_past == Some(false) {
-                let _ = history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", None);
-            } else if !past && was_past == Some(true) && !closed_by_back.get_value() {
-                our_pop.set_value(true);
-                let _ = history.back();
-            }
-        }
-        closed_by_back.set_value(false);
-        past
-    });
-    let popstate = window_event_listener(leptos::ev::popstate, move |_| {
-        if our_pop.get_value() {
-            our_pop.set_value(false);
-        } else if login.get_untracked().is_none()
-            && auth_screen.get_untracked() != AuthScreen::Welcome
-        {
-            closed_by_back.set_value(true);
-            auth_screen.set(AuthScreen::Welcome);
-        }
-    });
-    on_cleanup(move || popstate.remove());
+    // Android's back button, from Login or Create Identity: back to the
+    // start page, not out of the app (see `back_button`).
+    back_button::while_active(
+        move || {
+            login.try_with(Option::is_none) == Some(true)
+                && auth_screen
+                    .try_get()
+                    .is_some_and(|s| s != AuthScreen::Welcome)
+        },
+        move || {
+            auth_screen.try_set(AuthScreen::Welcome);
+        },
+    );
 
     view! {
         <main class="app">
@@ -1016,82 +998,31 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         });
     });
 
-    // Android's back button goes back in the web view's history, and only
-    // leaves the app when there's none (see Tauri's `AppPlugin`). So each
-    // layer open over the contact list (an open chat, our QR code, the
-    // scanner, the "Manual add" popup) gets a history entry, and going back
-    // closes the topmost one: back steps out of the scanner or the popup,
-    // then the QR code, then the chat, as on a phone it should, and only
-    // then out of the app. A layer that
-    // closes any other way (its X, the ← button, a scan) takes its entry
-    // back off, so the two stay in step.
-    let layers_open = move || {
-        usize::from(selected.get().is_some())
-            + usize::from(show_qr.get())
-            + usize::from(scanning.get())
-            + usize::from(adding_manually.get())
-    };
-    // Entries pushed for open layers, and how many of our own trips back
-    // through them (when layers closed some other way) are still to land.
-    let pushed = StoredValue::new(0usize);
-    let pending_pops = StoredValue::new(0usize);
-    // Push or pop entries until there's one per open layer. Waits while one
-    // of our pops is still on its way: history moves asynchronously, and
-    // pushing meanwhile would muddle which entry it lands on.
-    let sync_history = move || {
-        if pending_pops.get_value() > 0 {
-            return;
-        }
-        let Ok(history) = window().history() else {
-            return;
-        };
-        let open = untrack(layers_open);
-        let have = pushed.get_value();
-        if open > have {
-            for _ in have..open {
-                let _ = history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", None);
+    // Android's back button closes the topmost layer over the contact list
+    // (see `back_button`): the scanner or the "Manual add" popup, then our
+    // QR code, then the open chat, as on a phone it should, and only with
+    // none of them open leaves the app.
+    let open = |layer: RwSignal<bool>| layer.try_get_untracked() == Some(true);
+    back_button::while_active(
+        move || {
+            selected.try_with_untracked(Option::is_some) == Some(true)
+                || open(show_qr)
+                || open(scanning)
+                || open(adding_manually)
+        },
+        move || {
+            if open(scanning) {
+                scanning.set(false);
+            } else if open(adding_manually) {
+                adding_manually.set(false);
+            } else if open(show_qr) {
+                show_qr.set(false);
+                qr_waiting_for.set(None);
+            } else {
+                selected.try_set(None);
             }
-        } else if open < have {
-            pending_pops.set_value(1);
-            let _ = history.go_with_delta(-((have - open) as i32));
-        }
-        pushed.set_value(open);
-    };
-    Effect::new(move |_| {
-        layers_open();
-        sync_history();
-    });
-    let popstate = window_event_listener(leptos::ev::popstate, move |_| {
-        if pending_pops.get_value() > 0 {
-            // One of ours: catch up on anything that changed meanwhile.
-            pending_pops.set_value(0);
-            sync_history();
-            return;
-        }
-        // The back button: that entry is gone, so close its layer.
-        pushed.update_value(|n| *n = n.saturating_sub(1));
-        if scanning.get_untracked() {
-            scanning.set(false);
-        } else if adding_manually.get_untracked() {
-            adding_manually.set(false);
-        } else if show_qr.get_untracked() {
-            show_qr.set(false);
-            qr_waiting_for.set(None);
-        } else if selected.get_untracked().is_some() {
-            selected.set(None);
-        }
-    });
-    on_cleanup(move || {
-        popstate.remove();
-        // Logging out with a chat (say) still open: take its entries off.
-        let have = pushed.try_get_value().unwrap_or(0);
-        if have > 0
-            && pending_pops.try_get_value() == Some(0)
-            && let Ok(history) = window().history()
-        {
-            let _ = history.go_with_delta(-(have as i32));
-        }
-    });
+        },
+    );
 
     // They've scanned our code once they're past "pending": their side has
     // reached ours (see `Client::contact_status`).

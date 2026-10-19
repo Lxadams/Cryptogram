@@ -109,7 +109,9 @@ from git afterwards. They're all under
 - `java/.../MainActivity.kt`, `NativeBridge.kt` and `MessageService.kt`:
   background receiving and notifications (see
   [Receiving in the background](#receiving-in-the-background)), plus
-  keeping the UI clear of the status bar, navigation bar and keyboard.
+  keeping the UI clear of the status bar, navigation bar and keyboard,
+  and the back button, which `MainActivity` hands to the page on every
+  activity (Tauri's own back handling only covers the first).
 - `res/values/strings.xml`, `res/drawable/ic_stat_message.xml` and
   `res/xml/data_extraction_rules.xml`.
 
