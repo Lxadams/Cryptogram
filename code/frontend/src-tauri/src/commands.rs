@@ -1298,7 +1298,7 @@ pub struct NetworkStatsDto {
     pub loss_receiving_pct: Option<u8>,
     /// Nothing came back from the relay at all in those 10 s.
     pub nothing_back: bool,
-    /// Whether to warn of an unstable network: 80% or more lost either way
+    /// Whether to warn of an unstable network: 90% or more lost either way
     /// (see `Client::unstable_network`).
     pub unstable: bool,
 }

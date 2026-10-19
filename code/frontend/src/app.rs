@@ -1273,8 +1273,8 @@ fn IdentityCard(
 }
 
 /// A thin bar across the top of the main screen while the network is
-/// unstable: 80% or more of packets lost either way (see
-/// `Client::unstable_network`), shown until it's below 78% again. Above
+/// unstable: 90% or more of packets lost either way (see
+/// `Client::unstable_network`), shown until it's below 88% again. Above
 /// the chat too, on a phone.
 #[component]
 fn NetworkWarning(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoView {
@@ -1283,7 +1283,8 @@ fn NetworkWarning(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoVie
             let s = s.as_ref().filter(|s| s.unstable)?;
             let sending = s.loss_sending_pct.unwrap_or(0);
             let receiving = s.loss_receiving_pct.unwrap_or(0);
-            let which = match (sending >= 80, receiving >= 80) {
+            // Which way is past where it stays on (88%).
+            let which = match (sending >= 88, receiving >= 88) {
                 (true, true) => "both ways",
                 (true, false) => "sending",
                 _ => "receiving",

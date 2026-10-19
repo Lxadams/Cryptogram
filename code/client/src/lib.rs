@@ -1434,8 +1434,8 @@ impl Client {
         self.link_quality.estimate(Instant::now())
     }
 
-    /// Whether the network is unstable enough to warn about: 80% or more
-    /// lost either way over the last 10 s, until it's below 78% again (see
+    /// Whether the network is unstable enough to warn about: 90% or more
+    /// lost either way over the last 10 s, until it's below 88% again (see
     /// `link_quality`). Asking also has `receipt_requests` probe the link
     /// for a few seconds, so there's something to measure.
     pub fn unstable_network(&mut self) -> bool {

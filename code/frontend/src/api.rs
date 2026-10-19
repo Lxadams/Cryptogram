@@ -364,7 +364,7 @@ pub struct NetworkStatsDto {
     /// Nothing came back from the relay at all in those 10 s.
     #[serde(default)]
     pub nothing_back: bool,
-    /// Whether to warn of an unstable network (80% or more lost either way).
+    /// Whether to warn of an unstable network (90% or more lost either way).
     #[serde(default)]
     pub unstable: bool,
 }

@@ -17,8 +17,9 @@
 //! is watching (see `LinkQuality::unstable`) the client probes with a
 //! receipt request every `PROBE_INTERVAL` that nothing else has asked the
 //! relay anything (see `LinkQuality::probes_due`): enough samples that the
-//! estimate is steady enough to warn by. At 70% each way, a probe a second
-//! left the warning on a third of the time; eight a second, simulated, 7%.
+//! estimate is steady enough to warn by. At 70% each way, with the warning
+//! at 80% then, a probe a second left it on a third of the time; eight a
+//! second, simulated, 7%.
 //! Unwatched, it adds nothing.
 //!
 //! Packets dropped by the simulated loss (see `netsim`) count like any
@@ -47,9 +48,9 @@ const WATCHED_FOR: Duration = Duration::from_secs(5);
 /// Loss in either direction at which the network counts as unstable, and
 /// below which it counts as stable again: a little apart, so an estimate
 /// wobbling around one threshold doesn't flip the warning on and off, but
-/// not far, or noise at 70% (which isn't unstable) would keep it on.
-const UNSTABLE_LOSS: f64 = 0.8;
-const STABLE_AGAIN_LOSS: f64 = 0.78;
+/// not far, or noise just under the threshold would keep it on.
+const UNSTABLE_LOSS: f64 = 0.9;
+const STABLE_AGAIN_LOSS: f64 = 0.88;
 
 /// The estimated share of packets lost each way, from 0 to 1.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -384,13 +385,17 @@ mod tests {
     }
 
     #[test]
-    fn unstable_comes_on_at_80_percent_and_goes_off_below_78() {
+    fn unstable_comes_on_at_90_percent_and_goes_off_below_88() {
         let (mut fine, now) = exchange(|_| true, |_| ALL);
         assert!(!fine.unstable(now));
-        // 9 requests in 10 lost on the way up.
-        let (mut lossy, now) = exchange(|i| i % 10 == 0, |_| ALL);
+        // 4 requests in 5 lost on the way up: bad, but not that bad.
+        let (mut lossy, now) = exchange(|i| i % 5 == 0, |_| ALL);
+        assert!(!lossy.unstable(now));
+        // Every request answered, but one copy of one answer back in 10 s:
+        // 97% lost on the way down.
+        lossy.incoming = exchange(|_| true, |i| u32::from(i % 10 == 1)).0.incoming;
         assert!(lossy.unstable(now));
-        // 1 in 2 lost: below 78%, so off.
+        // 1 in 2 lost: below 88%, so off.
         lossy.incoming = exchange(|i| i % 2 == 0, |_| ALL).0.incoming;
         assert!(!lossy.unstable(now));
     }
