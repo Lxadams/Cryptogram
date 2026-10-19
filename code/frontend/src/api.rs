@@ -343,6 +343,18 @@ pub struct NetworkStatsDto {
     pub pq_resends: u64,
     pub message_retries: u64,
     pub duplicates_received: u64,
+    /// Estimated share of packets lost each way over the last 10 s, in
+    /// percent, when there's enough to tell.
+    #[serde(default)]
+    pub loss_sending_pct: Option<u8>,
+    #[serde(default)]
+    pub loss_receiving_pct: Option<u8>,
+    /// Nothing came back from the relay at all in those 10 s.
+    #[serde(default)]
+    pub nothing_back: bool,
+    /// Whether to warn of an unstable network (80% or more lost either way).
+    #[serde(default)]
+    pub unstable: bool,
 }
 
 /// The link to the relay, packets to and from it, and what had to be sent

@@ -29,6 +29,7 @@ mod chunks;
 mod confirmations;
 mod deliveries;
 mod history;
+mod link_quality;
 pub mod netsim;
 mod ordering;
 mod padding;
@@ -38,6 +39,7 @@ mod transport;
 pub use chunks::MAX_MESSAGE_LEN;
 pub use confirmations::CONFIRM_TIMEOUT;
 pub use history::{ChatHistory, SendStatus, StoredMessage};
+pub use link_quality::Loss;
 pub use ordering::{DeliveryOrder, REORDER_WAIT};
 /// Routing tokens, link session IDs and delivery IDs are the relay link's
 /// (see the `relay-link` crate), as is how a routing token is derived.
@@ -854,6 +856,9 @@ pub struct Client {
     /// What we've sent again, and received twice (see `Retransmissions`).
     /// Live state.
     retransmissions: Retransmissions,
+    /// How much of our traffic with the relay is being lost (see
+    /// `link_quality`). Live state.
+    link_quality: link_quality::LinkQuality,
 }
 
 /// What this client has had to send again, and what reached it twice,
@@ -943,6 +948,7 @@ impl Client {
             pq_resent_at: HashMap::new(),
             extra_replies: Vec::new(),
             retransmissions: Retransmissions::default(),
+            link_quality: Default::default(),
         }
     }
 
@@ -1126,6 +1132,8 @@ impl Client {
             self.link.keys(),
             self.admission_tags_in(),
         );
+        // The relay answers it, which measures the link (see `link_quality`).
+        self.link_quality.request_sent(Instant::now());
         self.link.seal(Lane::Direct, TYPE_SYNC, &sync.to_bytes())
     }
 
@@ -1417,6 +1425,21 @@ impl Client {
     /// When we last heard from the relay, in Unix milliseconds.
     pub fn last_heard_from_relay_ms(&self) -> u64 {
         self.last_heard_ms
+    }
+
+    /// The estimated share of packets lost each way between us and the
+    /// relay over the last 10 s, or `None` when too little went either way
+    /// to tell (see `link_quality`).
+    pub fn link_loss(&self) -> Option<Loss> {
+        self.link_quality.estimate(Instant::now())
+    }
+
+    /// Whether the network is unstable enough to warn about: 80% or more
+    /// lost either way over the last 10 s, until it's below 78% again (see
+    /// `link_quality`). Asking also has `receipt_requests` probe the link
+    /// for a few seconds, so there's something to measure.
+    pub fn unstable_network(&mut self) -> bool {
+        self.link_quality.unstable(Instant::now())
     }
 
     /// The packets `extra_replies` holds, for a front end to send after
@@ -1823,11 +1846,18 @@ impl Client {
         for message in self.confirmations.expire(now) {
             self.settle(message, SendStatus::Failed);
         }
-        if !self.confirmations.request_due(now) {
-            return Vec::new();
-        }
-        (0..REQUEST_COPIES)
-            .map(|_| self.link.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]))
+        let copies = if self.confirmations.request_due(now) {
+            REQUEST_COPIES
+        } else {
+            // Nothing to ask about, but someone may be watching how much is
+            // being lost: requests to measure by (see `link_quality`).
+            self.link_quality.probes_due(now) as usize
+        };
+        (0..copies)
+            .map(|_| {
+                self.link_quality.request_sent(now);
+                self.link.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[])
+            })
             .collect()
     }
 
@@ -2041,7 +2071,26 @@ impl Client {
         if packet.first() == Some(&TYPE_HANDSHAKE_RESP) {
             return self.finish_handshake(packet);
         }
-        let Ok((header, plaintext)) = self.link.open(packet) else {
+        let opened = self.link.open(packet);
+        // Every packet from the relay, and every copy of its answers to our
+        // requests, measures how much is being lost (see `link_quality`).
+        // It sends each answer several times as the same packet, so the
+        // link turns the later copies away as replays, but only after
+        // authenticating them: they count too.
+        let authentic = match &opened {
+            Ok((header, _)) => Some(*header),
+            Err(relay_link::LinkError::Replayed) => relay_link::header(packet),
+            Err(_) => None,
+        };
+        if let Some(header) = authentic {
+            self.link_quality.received(
+                Instant::now(),
+                header.session_id,
+                header.packet_number,
+                matches!(header.packet_type, TYPE_SYNC_ACK | TYPE_RECEIPT),
+            );
+        }
+        let Ok((header, plaintext)) = opened else {
             return Vec::new();
         };
         // Authentic, and not a replay: the link is alive.
@@ -5956,6 +6005,56 @@ mod tests {
             assert_eq!(relay(copy, &a), relay(&again, &a), "the same KeyExchange");
         }
         cleanup(&[&a, &b]);
+    }
+
+    /// The relay's answers to our syncs, every copy of them, feed the loss
+    /// estimate (see `link_quality`).
+    #[test]
+    fn test_sync_acks_measure_the_link() {
+        let mut client = new_client();
+        link_with(&mut client, 9, [5, 6, 7, 8]);
+        for number in 0..12 {
+            let sync = client.generate_sync_packet();
+            let acked = relay_link::header(&sync).unwrap().packet_number;
+            // Numbered in order, as the relay numbers what it sends us
+            // (`from_relay`'s numbers are shared by every test, so they'd
+            // look like gaps), and sent `REPLY_COPIES` times as the same
+            // packet: the copies after the first are replays, and count too.
+            let ack = relay_link::seal(
+                &client.link.keys().to_client,
+                TYPE_SYNC_ACK,
+                &client.link.session_id(),
+                number,
+                &relay_link::sync_ack_plaintext(acked),
+            );
+            for _ in 0..relay_link::REPLY_COPIES {
+                client.handle_relay_packet(&ack);
+            }
+        }
+        let loss = client
+            .link_quality
+            .estimate(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert!(loss.sending < 0.01 && loss.receiving < 0.01, "{loss:?}");
+        cleanup(&[&client]);
+    }
+
+    /// While a front end watches the network, an otherwise idle client
+    /// probes the relay with receipt requests, and only then.
+    #[test]
+    fn test_watching_the_network_probes_the_link() {
+        let mut client = new_client();
+        link_with(&mut client, 9, [5, 6, 7, 8]);
+        assert!(client.receipt_requests().is_empty(), "nobody's watching");
+        client.unstable_network();
+        let probes = client.receipt_requests();
+        assert!(!probes.is_empty());
+        for probe in &probes {
+            let header = relay_link::header(probe).unwrap();
+            assert_eq!(header.packet_type, TYPE_RECEIPT_REQUEST);
+        }
+        assert!(client.receipt_requests().is_empty(), "not again so soon");
+        cleanup(&[&client]);
     }
 
     #[test]

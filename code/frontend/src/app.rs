@@ -952,7 +952,8 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         }
     });
 
-    // The network stats (see `api::network_stats`), for the Network section.
+    // The network stats (see `api::network_stats`), for the Network section
+    // and the unstable network warning (see `NetworkWarning`).
     let net_stats = RwSignal::new(None::<api::NetworkStatsDto>);
 
     // Poll the backend every second for contact-status changes and newly
@@ -1049,6 +1050,7 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
         // `chat-open`: on narrow screens, show the chat instead of the
         // contact list (see `.main-screen.chat-open` in style.css).
         <section class="main-screen" class:chat-open=move || selected.get().is_some()>
+            <NetworkWarning stats=net_stats />
             <IdentityCard identity=identity.clone() show_qr=show_qr net_stats=net_stats />
             // Before the scanner and the connection request notice, so they
             // open on top of it: accepting a request means scanning their
@@ -1162,9 +1164,40 @@ fn IdentityCard(
     }
 }
 
-/// The link to the relay, the packets to and from it, and what had to be
-/// sent again (see `api::network_stats`), folded away under the identity
-/// card and updated every second from
+/// A thin bar across the top of the main screen while the network is
+/// unstable: 80% or more of packets lost either way (see
+/// `Client::unstable_network`), shown until it's below 78% again. Above
+/// the chat too, on a phone.
+#[component]
+fn NetworkWarning(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoView {
+    move || {
+        stats.with(|s| {
+            let s = s.as_ref().filter(|s| s.unstable)?;
+            let sending = s.loss_sending_pct.unwrap_or(0);
+            let receiving = s.loss_receiving_pct.unwrap_or(0);
+            let which = match (sending >= 80, receiving >= 80) {
+                (true, true) => "both ways",
+                (true, false) => "sending",
+                _ => "receiving",
+            };
+            let worst = sending.max(receiving);
+            let what = if s.nothing_back {
+                "nothing back from the relay in the last 10 s".to_string()
+            } else {
+                format!("about {worst}% of packets lost {which}")
+            };
+            Some(view! {
+                <div class="network-warning" role="status">
+                    {format!("Unstable network: {what}. Messages may be slow to arrive.")}
+                </div>
+            })
+        })
+    }
+}
+
+/// The link to the relay, the packets to and from it, what had to be sent
+/// again, and how much is being lost (see `api::network_stats`), folded
+/// away under the identity card and updated every second from
 /// `MainScreen`'s poll. Packet counts are since the app started; the rest
 /// since this login.
 #[component]
@@ -1198,6 +1231,12 @@ fn NetworkStats(stats: RwSignal<Option<api::NetworkStatsDto>>) -> impl IntoView 
                         <dd>{packets(s.packets_sent, s.packets_send_dropped)}</dd>
                         <dt>"Packets received"</dt>
                         <dd>{packets(s.packets_received, s.packets_receive_dropped)}</dd>
+                        <dt>"Loss, last 10 s"</dt>
+                        <dd>{match (s.loss_sending_pct, s.loss_receiving_pct) {
+                            _ if s.nothing_back => "Nothing back from the relay".to_string(),
+                            (Some(up), Some(down)) => format!("{up}% sending, {down}% receiving"),
+                            _ => "Measuring…".to_string(),
+                        }}</dd>
                     </dl>
                     <h4>"Retransmissions"</h4>
                     <dl>

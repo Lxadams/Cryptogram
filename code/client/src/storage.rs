@@ -557,6 +557,7 @@ impl ClientStateDto {
             pq_resent_at: HashMap::new(),
             extra_replies: Vec::new(),
             retransmissions: Default::default(),
+            link_quality: Default::default(),
         })
     }
 }

@@ -501,6 +501,20 @@ button.danger {
   min-width: 0;
 }
 
+/* Across the top of the main screen while the network is unstable (see
+   `NetworkWarning`): thin, in the logo's amber. */
+.network-warning {
+  flex: none;
+  padding: 0.3rem 0.75rem;
+  border-radius: 6px;
+  background: color-mix(in srgb, #f0a832 18%, transparent);
+  border: 1px solid #f0a832;
+  color: var(--text);
+  font-size: 0.8rem;
+  line-height: 1.3;
+  text-align: center;
+}
+
 /* The "Network" fold on the identity card (see `NetworkStats`). */
 .network-stats dl {
   display: grid;

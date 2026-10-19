@@ -1291,6 +1291,16 @@ pub struct NetworkStatsDto {
     pub pq_resends: u64,
     pub message_retries: u64,
     pub duplicates_received: u64,
+    /// Estimated share of packets lost each way over the last 10 s, in
+    /// percent, or `None` when too little went either way to tell (see
+    /// `Client::link_loss`).
+    pub loss_sending_pct: Option<u8>,
+    pub loss_receiving_pct: Option<u8>,
+    /// Nothing came back from the relay at all in those 10 s.
+    pub nothing_back: bool,
+    /// Whether to warn of an unstable network: 80% or more lost either way
+    /// (see `Client::unstable_network`).
+    pub unstable: bool,
 }
 
 /// Silence from the relay longer than this shows as "quiet": the client
@@ -1300,8 +1310,11 @@ const QUIET_AFTER_MS: u64 = 40_000;
 /// The network stats the app shows (see `NetworkStatsDto`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn network_stats(state: State<'_, AppState>) -> Result<NetworkStatsDto, String> {
-    let guard = state.runtime.lock().await;
-    let client = &guard.as_ref().ok_or("Not connected to relay yet")?.client;
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    let unstable = rt.client.unstable_network();
+    let loss = rt.client.link_loss();
+    let client = &rt.client;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -1329,6 +1342,10 @@ pub async fn network_stats(state: State<'_, AppState>) -> Result<NetworkStatsDto
         pq_resends: resent.pq_resends,
         message_retries: resent.message_retries,
         duplicates_received: resent.duplicates_received,
+        loss_sending_pct: loss.map(|l| (l.sending * 100.0).round() as u8),
+        loss_receiving_pct: loss.map(|l| (l.receiving * 100.0).round() as u8),
+        nothing_back: loss.is_some_and(|l| l.nothing_back),
+        unstable,
     })
 }
 
