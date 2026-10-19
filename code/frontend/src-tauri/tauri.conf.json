@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "e2e-messenger",
+  "productName": "Cryptogram",
   "version": "0.1.0",
   "identifier": "nz.ac.waikato.compx374.e2e-messenger",
   "build": {
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "E2E-Messenger",
+        "title": "Cryptogram",
         "width": 800,
         "height": 600,
         "resizable": true,

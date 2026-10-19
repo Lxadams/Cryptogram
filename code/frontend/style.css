@@ -17,15 +17,16 @@
 
 :root {
   color-scheme: dark;
-  --bg: #14161a;
-  --panel: #1d2026;
-  --sunken: #0f1115;
-  --hover: #262a32;
-  --border: #2c3038;
-  --text: #e6e8eb;
-  --muted: #8b92a0;
-  --accent: #5b8cff;
-  --ok: #3ecf8e;
+  --bg: #02141a;
+  --panel: #0b2b36;
+  --sunken: #010d11;
+  --hover: #103845;
+  --border: #164858;
+  --text: #effbf2;
+  --muted: #9db7b7;
+  --accent: #1f8a70;
+  --ok: #5dac97;
+  --info: #7fb3c4;
   --error: #ff6b6b;
   /* Outer margin around everything; tighter on small screens. */
   --gutter: clamp(0.75rem, 2.5vw, 1.5rem);
@@ -33,29 +34,31 @@
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #14161a;
-  --panel: #1d2026;
-  --sunken: #0f1115;
-  --hover: #262a32;
-  --border: #2c3038;
-  --text: #e6e8eb;
-  --muted: #8b92a0;
-  --accent: #5b8cff;
-  --ok: #3ecf8e;
+  --bg: #02141a;
+  --panel: #0b2b36;
+  --sunken: #010d11;
+  --hover: #103845;
+  --border: #164858;
+  --text: #effbf2;
+  --muted: #9db7b7;
+  --accent: #1f8a70;
+  --ok: #5dac97;
+  --info: #7fb3c4;
   --error: #ff6b6b;
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #f4f5f7;
+  --bg: #effbf2;
   --panel: #ffffff;
-  --sunken: #eceef2;
-  --hover: #e6e9ef;
-  --border: #dbdfe6;
-  --text: #1c1f26;
-  --muted: #636b7a;
-  --accent: #3b63e0;
-  --ok: #1c8f5e;
+  --sunken: #deede6;
+  --hover: #d6eee2;
+  --border: #c4d7d3;
+  --text: #02141a;
+  --muted: #577e86;
+  --accent: #1f8a70;
+  --ok: #1f8a70;
+  --info: #164858;
   --error: #d1453b;
 }
 
@@ -428,6 +431,13 @@ button.danger {
   margin-top: 0.5rem;
 }
 
+/* Inputs are full width by default; a checkbox is just its box. */
+.identity-details .setting input[type="checkbox"] {
+  flex: none;
+  width: auto;
+  margin: 0.2rem 0 0;
+}
+
 .identity-details .setting input[type="number"] {
   width: 5rem;
   margin-left: auto;
@@ -673,7 +683,7 @@ button.danger {
 }
 
 .status-established {
-  background: rgba(62, 207, 142, 0.15);
+  background: color-mix(in srgb, var(--ok) 15%, transparent);
   color: var(--ok);
 }
 
@@ -683,8 +693,8 @@ button.danger {
 }
 
 .status-connecting {
-  background: rgba(91, 140, 255, 0.15);
-  color: var(--accent);
+  background: color-mix(in srgb, var(--info) 15%, transparent);
+  color: var(--info);
 }
 
 .chat-panel {

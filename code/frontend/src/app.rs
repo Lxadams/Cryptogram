@@ -402,7 +402,7 @@ pub fn App() -> impl IntoView {
     view! {
         <main class="app">
             <div class="app-header">
-                <h1>"E2E-Messenger"</h1>
+                <h1>"Cryptogram"</h1>
                 <div class="header-actions">
                     {move || login.get().is_some().then(|| view! {
                         <button class="theme-toggle" on:click=move |_| log_out()>
@@ -765,6 +765,10 @@ fn CreateIdentityScreen(
     }
 }
 
+/// How long after "Connect" is clicked the main screen appears at the
+/// earliest (see `ConnectScreen`).
+const CONNECT_MIN_WAIT: Duration = Duration::from_secs(2);
+
 /// Screen 1: perform the link handshake with the relay. The relay's Ed25519
 /// pubkey is built into the app (see `relay_pubkey_hex` in
 /// src-tauri/src/commands.rs), so there's nothing to paste.
@@ -773,15 +777,29 @@ fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView 
     let error = RwSignal::new(None::<String>);
     let connecting = RwSignal::new(false);
 
+    // The main screen comes no sooner than `CONNECT_MIN_WAIT` after the
+    // click, however fast the relay answers; an error shows straight away.
     let on_connect = move |_| {
         error.set(None);
         connecting.set(true);
+        let clicked_at = js_sys::Date::now();
         leptos::task::spawn_local(async move {
             match api::bootstrap().await {
-                Ok(id) => identity.set(Some(id)),
-                Err(e) => error.set(Some(e)),
+                Ok(id) => {
+                    let waited = Duration::from_millis((js_sys::Date::now() - clicked_at) as u64);
+                    set_timeout(
+                        move || {
+                            identity.try_set(Some(id));
+                            connecting.try_set(false);
+                        },
+                        CONNECT_MIN_WAIT.saturating_sub(waited),
+                    );
+                }
+                Err(e) => {
+                    error.set(Some(e));
+                    connecting.set(false);
+                }
             }
-            connecting.set(false);
         });
     };
 
