@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 592 592" width="592" height="592">
+  <!-- In-app logo for LIGHT mode: transparent background, deeper teal and amber
+       with a heavier dash so the outlines stay visible on white/light surfaces. -->
+  <defs>
+    <rect id="filled" width="80" height="80" rx="8" fill="#1F7A66"/>
+    <rect id="empty" x="2" y="2" width="76" height="76" rx="6.5"
+          fill="none" stroke="#B87308" stroke-width="4"
+          stroke-dasharray="11 7" stroke-linecap="round"/>
+  </defs>
+
+  <use href="#filled" x="0"     y="0"/>
+  <use href="#empty"  x="102.4" y="0"/>
+  <use href="#empty"  x="204.8" y="0"/>
+  <use href="#filled" x="307.2" y="0"/>
+  <use href="#empty"  x="409.6" y="0"/>
+  <use href="#empty"  x="512"   y="0"/>
+
+  <use href="#empty"  x="0"     y="102.4"/>
+  <use href="#filled" x="102.4" y="102.4"/>
+  <use href="#empty"  x="204.8" y="102.4"/>
+  <use href="#filled" x="307.2" y="102.4"/>
+  <use href="#empty"  x="409.6" y="102.4"/>
+  <use href="#empty"  x="512"   y="102.4"/>
+
+  <use href="#empty"  x="0"     y="204.8"/>
+  <use href="#filled" x="102.4" y="204.8"/>
+  <use href="#empty"  x="204.8" y="204.8"/>
+  <use href="#empty"  x="307.2" y="204.8"/>
+  <use href="#empty"  x="409.6" y="204.8"/>
+  <use href="#empty"  x="512"   y="204.8"/>
+
+  <use href="#empty"  x="0"     y="307.2"/>
+  <use href="#empty"  x="102.4" y="307.2"/>
+  <use href="#empty"  x="204.8" y="307.2"/>
+  <use href="#empty"  x="307.2" y="307.2"/>
+  <use href="#filled" x="409.6" y="307.2"/>
+  <use href="#empty"  x="512"   y="307.2"/>
+
+  <use href="#empty"  x="0"     y="409.6"/>
+  <use href="#filled" x="102.4" y="409.6"/>
+  <use href="#filled" x="204.8" y="409.6"/>
+  <use href="#empty"  x="307.2" y="409.6"/>
+  <use href="#empty"  x="409.6" y="409.6"/>
+  <use href="#filled" x="512"   y="409.6"/>
+
+  <use href="#filled" x="0"     y="512"/>
+  <use href="#empty"  x="102.4" y="512"/>
+  <use href="#filled" x="204.8" y="512"/>
+  <use href="#empty"  x="307.2" y="512"/>
+  <use href="#empty"  x="409.6" y="512"/>
+  <use href="#empty"  x="512"   y="512"/>
+</svg>

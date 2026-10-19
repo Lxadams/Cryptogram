@@ -343,19 +343,21 @@ fn PasswordInput(value: RwSignal<String>, placeholder: &'static str) -> impl Int
     }
 }
 
-/// Which of the two pre-login screens is showing. Kept separate from
+/// Which of the pre-login screens is showing. Kept separate from
 /// `login`/`identity` (which gate Connect/Main) since navigating between
-/// Login and Create Identity never involves either of those — it's purely
-/// a UI choice, no backend call happens until one of the two forms submits.
+/// them never involves either of those — it's purely a UI choice, no
+/// backend call happens until the Login or Create Identity form submits.
 #[derive(Clone, Copy, PartialEq)]
 enum AuthScreen {
+    /// The start page: name, logo and "Sign in" (see `WelcomeScreen`).
+    Welcome,
     Login,
     CreateIdentity,
 }
 
 #[component]
 pub fn App() -> impl IntoView {
-    let auth_screen = RwSignal::new(AuthScreen::Login);
+    let auth_screen = RwSignal::new(AuthScreen::Welcome);
     // Username to prefill on the Login screen right after a successful
     // Create Identity, so the user isn't retyping what they just chose.
     let just_created = RwSignal::new(None::<String>);
@@ -385,12 +387,13 @@ pub fn App() -> impl IntoView {
 
     // Tears down the backend session (stops background tasks, releases the
     // identity's session lock — see `logout`'s doc comment in commands.rs)
-    // and sends the UI back to the Login screen. Shown whenever `login` is
+    // and sends the UI back to the start page. Shown whenever `login` is
     // `Some`, i.e. any screen past Login itself, so abandoning a stuck
     // Connect screen works the same way as logging out from Main.
     let log_out = move || {
         leptos::task::spawn_local(async move {
             let _ = api::logout().await;
+            auth_screen.set(AuthScreen::Welcome);
             identity.set(None);
             login.set(None);
         });
@@ -399,10 +402,45 @@ pub fn App() -> impl IntoView {
     let theme = RwSignal::new(initial_theme());
     Effect::new(move |_| apply_theme(theme.get()));
 
+    // Android's back button (see `MainScreen`): from Login or Create
+    // Identity it goes back to the start page, not out of the app. So
+    // leaving the start page adds a history entry, and logging in, which
+    // leaves those screens the other way, takes it back off.
+    let past_welcome = move || login.get().is_none() && auth_screen.get() != AuthScreen::Welcome;
+    let closed_by_back = StoredValue::new(false);
+    let our_pop = StoredValue::new(false);
+    Effect::new(move |was_past: Option<bool>| {
+        let past = past_welcome();
+        if let Ok(history) = window().history() {
+            if past && was_past == Some(false) {
+                let _ = history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", None);
+            } else if !past && was_past == Some(true) && !closed_by_back.get_value() {
+                our_pop.set_value(true);
+                let _ = history.back();
+            }
+        }
+        closed_by_back.set_value(false);
+        past
+    });
+    let popstate = window_event_listener(leptos::ev::popstate, move |_| {
+        if our_pop.get_value() {
+            our_pop.set_value(false);
+        } else if login.get_untracked().is_none()
+            && auth_screen.get_untracked() != AuthScreen::Welcome
+        {
+            closed_by_back.set_value(true);
+            auth_screen.set(AuthScreen::Welcome);
+        }
+    });
+    on_cleanup(move || popstate.remove());
+
     view! {
         <main class="app">
             <div class="app-header">
-                <h1>"Cryptogram"</h1>
+                // The start page has the name, large, already.
+                <h1 class:hidden-title=move || {
+                    login.get().is_none() && auth_screen.get() == AuthScreen::Welcome
+                }>"Cryptogram"</h1>
                 <div class="header-actions">
                     {move || login.get().is_some().then(|| view! {
                         <button class="theme-toggle" on:click=move |_| log_out()>
@@ -422,6 +460,9 @@ pub fn App() -> impl IntoView {
             </div>
             {move || if restoring.get() { ().into_any() } else { match (login.get(), identity.get()) {
                 (None, _) => match auth_screen.get() {
+                    AuthScreen::Welcome => view! {
+                        <WelcomeScreen auth_screen=auth_screen />
+                    }.into_any(),
                     AuthScreen::Login => view! {
                         <LoginScreen
                             login=login
@@ -442,6 +483,28 @@ pub fn App() -> impl IntoView {
                 (Some(_), Some(id)) => view! { <MainScreen identity=id /> }.into_any(),
             }}}
         </main>
+    }
+}
+
+/// The start page, before signing in: the app's name, its logo (the dark
+/// or light version, to suit the theme: see `.logo-for-dark` in style.css)
+/// and "Sign in", which goes to the Login screen. Someone already signed in
+/// (see `current_session`) never sees it.
+#[component]
+fn WelcomeScreen(auth_screen: RwSignal<AuthScreen>) -> impl IntoView {
+    view! {
+        <section class="welcome-screen">
+            <img class="welcome-logo logo-for-dark" src="logo-dark.svg" alt="" />
+            <img class="welcome-logo logo-for-light" src="logo-light.svg" alt="" />
+            <h2 class="welcome-name">"Cryptogram"</h2>
+            <button
+                type="button"
+                class="welcome-sign-in"
+                on:click=move |_| auth_screen.set(AuthScreen::Login)
+            >
+                "Sign in"
+            </button>
+        </section>
     }
 }
 
@@ -970,7 +1033,17 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
             selected.set(None);
         }
     });
-    on_cleanup(move || popstate.remove());
+    on_cleanup(move || {
+        popstate.remove();
+        // Logging out with a chat (say) still open: take its entries off.
+        let have = pushed.try_get_value().unwrap_or(0);
+        if have > 0
+            && pending_pops.try_get_value() == Some(0)
+            && let Ok(history) = window().history()
+        {
+            let _ = history.go_with_delta(-(have as i32));
+        }
+    });
 
     // They've scanned our code once they're past "pending": their side has
     // reached ours (see `Client::contact_status`).

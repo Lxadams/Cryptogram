@@ -255,6 +255,52 @@ button.link-btn {
   padding: 1rem;
 }
 
+/* The start page (see `WelcomeScreen`): the logo, name and "Sign in",
+   centred in the window. */
+.welcome-screen {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1.25rem;
+  padding: 1rem 0 3rem;
+  text-align: center;
+}
+
+.welcome-logo {
+  width: min(60vw, 260px);
+  height: auto;
+}
+
+/* One logo per theme: the dark one's outlines are too faint on light. */
+.logo-for-light,
+:root[data-theme="light"] .logo-for-dark {
+  display: none;
+}
+
+:root[data-theme="light"] .logo-for-light {
+  display: block;
+}
+
+.welcome-name {
+  margin: 0;
+  font-size: 2.5rem;
+  letter-spacing: 0.02em;
+}
+
+.welcome-sign-in {
+  padding: 0.75rem 2.75rem;
+  font-size: 1.1rem;
+}
+
+/* The header's name, kept for its space, on the start page (which shows
+   it large). */
+.app-header h1.hidden-title {
+  visibility: hidden;
+}
+
 /* Login, Create identity and Connect: a form-width column, centred, that
    scrolls on its own if the window is too short for it. */
 .login-screen,

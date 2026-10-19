@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Home screen app icon: full-bleed square. iOS/Android apply their own corner mask,
+       so no rounding here. Grid sits inside the Android adaptive-icon safe zone. -->
+  <defs>
+    <rect id="filled" width="80" height="80" rx="8" fill="#31907A"/>
+    <rect id="empty" x="1.5" y="1.5" width="77" height="77" rx="7"
+          fill="none" stroke="#F0A832" stroke-width="3"
+          stroke-dasharray="11 7" stroke-linecap="round"/>
+  </defs>
+
+  <rect width="1024" height="1024" fill="#233D47"/>
+
+  <g transform="translate(192 192) scale(1.0811)">
+    <use href="#filled" x="0"     y="0"/>
+    <use href="#empty"  x="102.4" y="0"/>
+    <use href="#empty"  x="204.8" y="0"/>
+    <use href="#filled" x="307.2" y="0"/>
+    <use href="#empty"  x="409.6" y="0"/>
+    <use href="#empty"  x="512"   y="0"/>
+
+    <use href="#empty"  x="0"     y="102.4"/>
+    <use href="#filled" x="102.4" y="102.4"/>
+    <use href="#empty"  x="204.8" y="102.4"/>
+    <use href="#filled" x="307.2" y="102.4"/>
+    <use href="#empty"  x="409.6" y="102.4"/>
+    <use href="#empty"  x="512"   y="102.4"/>
+
+    <use href="#empty"  x="0"     y="204.8"/>
+    <use href="#filled" x="102.4" y="204.8"/>
+    <use href="#empty"  x="204.8" y="204.8"/>
+    <use href="#empty"  x="307.2" y="204.8"/>
+    <use href="#empty"  x="409.6" y="204.8"/>
+    <use href="#empty"  x="512"   y="204.8"/>
+
+    <use href="#empty"  x="0"     y="307.2"/>
+    <use href="#empty"  x="102.4" y="307.2"/>
+    <use href="#empty"  x="204.8" y="307.2"/>
+    <use href="#empty"  x="307.2" y="307.2"/>
+    <use href="#filled" x="409.6" y="307.2"/>
+    <use href="#empty"  x="512"   y="307.2"/>
+
+    <use href="#empty"  x="0"     y="409.6"/>
+    <use href="#filled" x="102.4" y="409.6"/>
+    <use href="#filled" x="204.8" y="409.6"/>
+    <use href="#empty"  x="307.2" y="409.6"/>
+    <use href="#empty"  x="409.6" y="409.6"/>
+    <use href="#filled" x="512"   y="409.6"/>
+
+    <use href="#filled" x="0"     y="512"/>
+    <use href="#empty"  x="102.4" y="512"/>
+    <use href="#filled" x="204.8" y="512"/>
+    <use href="#empty"  x="307.2" y="512"/>
+    <use href="#empty"  x="409.6" y="512"/>
+    <use href="#empty"  x="512"   y="512"/>
+  </g>
+</svg>
