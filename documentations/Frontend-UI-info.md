@@ -101,7 +101,7 @@ All commands lock `AppState.runtime` (a `tokio::sync::Mutex<Option<ClientRuntime
 | `remove_contact` | `token_hex` | `()` (also deletes that chat's history) | bin icon → "Remove? Yes" |
 | `dismiss_connection_request` | `token_hex` | `()` | "Not now" |
 | `set_connection_requests_muted` | `muted` | `()` | "Mute connection requests" / "Unmute" |
-| `notification_settings` | none | `NotificationSettingsDto` (`posted`, `with_names`) | once, when the identity card mounts |
+| `notification_settings` | none | `NotificationSettingsDto` (`posted`, `with_names`) | once, when the settings section mounts |
 | `set_notify_with_names` | `on` | `()` | Settings checkbox |
 
 Contact `status` is one of three strings: `pending` (we added them, waiting for them to add us), `connecting` (they've added us, session being set up), `established` (can chat).
@@ -146,7 +146,7 @@ There is no router. `App` (`src/app.rs`) holds a few signals and picks a screen 
           └──────────────── "Log out" (header, any screen past Login) ◀──────────────
 ```
 
-The header is always there: the title (kept invisible on the start page, which shows it large), a **Log out** button (only when `login` is `Some`), and the **Light mode / Dark mode** toggle. Log out calls `logout`, clears both `identity` and `login` and goes back to the start page, so it also works as the way out of a stuck Connect screen. A session restored at startup goes straight to its screen and skips the start page.
+The header is always there: the title (kept invisible on the start page, which shows it large), a **Log out** button (only when `login` is `Some`), and the theme toggle: a sun in dark mode and a moon in light mode, the mode it switches to (`SunIcon`, `MoonIcon`). Log out calls `logout`, clears both `identity` and `login` and goes back to the start page, so it also works as the way out of a stuck Connect screen. A session restored at startup goes straight to its screen and skips the start page.
 
 ### Start page (`WelcomeScreen`)
 
@@ -187,38 +187,48 @@ One button. It calls `bootstrap`, shows "Connecting..." while it runs, and moves
 ```
 MainScreen
 ├─ NetworkWarning               thin bar while the network is unstable
-├─ IdentityCard                 your name, "Present QR code", token/key, settings,
-│                               simulated loss, network stats
+├─ IdentityCard                 your name
 ├─ QrCodeModal                  your QR code
 ├─ div.columns
-│  ├─ ContactPanel              contact list, add contact, scanner dialog
+│  ├─ div.side-column           scrolls as one
+│  │  ├─ ContactPanel           contact list, "+" menu, manual add and scanner dialogs
+│  │  └─ SettingsPanel          the Settings and Network folds
 │  └─ ChatPanel                 header, transcript, composer
 └─ ConnectionRequestNotice      pop-up when a stranger tries to connect
 ```
 
 ### `NetworkWarning`
 
-A thin amber bar across the top of the main screen, above the chat on a phone too, while `network_stats().unstable` is true. That's when either direction's loss over the last 10 s reaches 80%; it stays until the loss is below 78% again, so it doesn't flicker. It says how much is lost and which way, or that nothing has come back from the relay at all.
+A thin amber bar across the top of the main screen, above the chat on a phone too, while `network_stats().unstable` is true. That's when either direction's loss over the last 10 s reaches 90%; it stays until the loss is below 88% again, so it doesn't flicker. It says how much is lost and which way, or that nothing has come back from the relay at all.
 
 ### `IdentityCard`
 
-- Your username and a **Present QR code** button, which opens `QrCodeModal` with the QR for your contact code (§6).
-- A folded **"Show token and key"** section: name, routing token and Ed25519 key as hex, each with a `CopyButton` (copies, shows a tick for 1.2 s). This is the manual alternative to the QR.
-- A folded **Settings** section, shown only where `notification_settings().posted` is true (Android): one checkbox, *"Say who each message is from in notifications"*, off by default.
-- A folded **Simulated network loss** section (`SimulatedLoss`): a sending and a receiving percentage of packets to drop on this device (`set_simulated_loss`), reset when the app closes.
-- A folded **Network** section (`NetworkStats`), updated every second from `MainScreen`'s `network_stats` poll:
+Your username. Your QR code is under the contact list's **+** (**Show QR code**).
+
+### `SettingsPanel`
+
+A section of its own after the contact list, holding two folds:
+
+- **Settings:**
+  - **Show token and key,** a fold inside it: name, routing token and Ed25519 key as hex, each with a `CopyButton` (copies, shows a tick for 1.2 s). This is what someone needs to add you by hand.
+  - **Notifications:** where `notification_settings().posted` is true (Android), one checkbox, *"Say who each message is from in notifications"*, off by default.
+- **Network** (`NetworkStats`), updated every second from `MainScreen`'s `network_stats` poll:
   - **The relay:** its address, and its status. It's connected if heard from in the last 40 s, quiet if not, or reconnecting.
   - **Packets:** sent and received, with any dropped by the simulated loss. These count since the app started.
   - **Loss, last 10 s:** each way (`client/src/link_quality.rs`). The relay answers every sync and receipt request with 3 copies of one numbered packet, and numbers everything it sends in order. So the answers it sent are those that arrived plus the gaps in the numbering. The receiving side is the copies that arrived out of 3 per answer sent, and the sending side is the answers sent out of the requests sent. While the stats are polled, the client probes with 8 receipt requests a second, so a 10 s window has enough samples. That costs about 4 KB/s, and nothing while the app is in the background. On a real link through the lossy proxy, it read 52/51% at 50% loss each way, 67/64% at 70%, and 86/85% at 85%.
   - **Retransmissions:** contact-setup resends, reconnects, PQ refreshes asked for and resent, messages retried, and deliveries received twice. These count since login.
+  - **Simulated loss** (`SimulatedLoss`): a sending and a receiving percentage of packets to drop on this device (`set_simulated_loss`), reset when the app closes. It sits outside the part that redraws every second, so a half-typed value isn't wiped.
 
 ### `ContactPanel`
 
 - **Contact list.** Each row: the contact's name (or the first 8 hex characters of their token until their name arrives), a status badge, and a bin icon with the same inline **"Remove? Yes / No"** confirm as identity delete. `pending` rows add *"Waiting for them to scan your code"*; `connecting` rows add *"They've added you. Connecting..."*. Clicking a row sets `selected`.
 - The list's `<For>` is keyed on `(token, status, name)`, so a row is redrawn when its status or name changes.
-- **Add contact.** Two paths, both ending in the same `connect_to_peer(token, key)` call:
+- **Empty list:** a hint to tap **+**, and that you each add the other.
+- **The + menu,** at the far right of the "Contacts" heading (a `Menu`, like the chat's ⋮):
+  - **Show QR code** opens `QrCodeModal` with the QR for your contact code (§6).
   - **Scan QR code** opens the scanner dialog (`scanning = true`).
-  - Two hex fields and **Send Connection Request** as the fallback.
+  - **Manual add** opens a dialog (`adding_manually = true`) with two hex fields and **Send connection request**. Errors show in the dialog, and it closes once the request is sent.
+  - **Same call:** scanning and adding by hand both end in the same `connect_to_peer(token, key)` call.
 - If requests are muted, a hint with an **Unmute** link.
 
 Both people must add each other. Adding someone only sends them a KeyExchange; they ignore it until they've added you too.
@@ -344,8 +354,8 @@ One hand-written stylesheet, `style.css` (no framework, no component-scoped CSS)
 - **Theme choice** (`initial_theme` in `app.rs`): the saved value in `localStorage` (`e2e-messenger-theme`) if there is one, else the system's `prefers-color-scheme`, else dark. An `Effect` writes the attribute and saves the choice whenever the toggle flips it.
 - **Page layout:** `body` doesn't scroll. `.app` is a full-height flex column (max width 1100 px); the panels inside scroll on their own, so the composer stays put while the transcript scrolls.
 - **Login / Create / Connect** are a centred column, max 440 px.
-- **Main screen, wide:** a two-column grid, contacts (220–300 px) beside the chat.
-- **Main screen, narrow** (`max-width: 719px`): one column. `MainScreen` adds the class `chat-open` when a contact is selected, and CSS shows *either* the identity card and contact list *or* the chat. The **←** button sets `selected` back to `None`. No JavaScript-side layout logic is involved. Each layer open over the contact list (a chat, your QR code, the scanner) also gets a browser-history entry, so Android's back button (which goes back in the web view's history before leaving the app) closes the topmost one (scanner, then QR code, then chat) and only leaves the app when none is open. A layer closed any other way (its X, **←**, a scan) pops its entry again.
+- **Main screen, wide:** a two-column grid, the side column (220–300 px: contacts, then the settings section, scrolling as one) beside the chat.
+- **Main screen, narrow** (`max-width: 719px`): one column. `MainScreen` adds the class `chat-open` when a contact is selected, and CSS shows *either* the identity card and the side column (contacts and settings) *or* the chat. The **←** button sets `selected` back to `None`. No JavaScript-side layout logic is involved. Each layer open over the contact list (a chat, your QR code, the scanner, the manual add dialog) also gets a browser-history entry, so Android's back button (which goes back in the web view's history before leaving the app) closes the topmost one (the scanner or manual add, then the QR code, then the chat) and only leaves the app when none is open. A layer closed any other way (its X, **←**, a scan) pops its entry again.
 - **Touch** (`pointer: coarse`): 16 px text in fields (stops mobile webviews zooming on focus) and bigger tap targets.
 
 ---

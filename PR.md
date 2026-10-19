@@ -9,10 +9,11 @@ Closes issue: #
 - **Loss can be simulated on the device itself,** with a percentage each way, so testing no longer needs a lossy relay.
 - **Network stats and an unstable-network warning:**
   - **Network fold:** the relay's status, packet counts, loss each way over the last 10 s, and retransmissions.
-  - **Warning:** a thin amber bar while 80% or more is being lost either way.
+  - **Warning:** a thin amber bar while 90% or more is being lost either way.
 - **Chat UI:**
   - **New messages:** counts next to each contact, newest conversation first.
   - **Header:** a ⋮ menu, with the contact's name centred.
+  - **Main screen:** a **+** by "Contacts" for adding people, settings in their own section after the contacts, and a sun or moon for the theme.
   - **Sending:** a spinner while a message sends, and a retry button next to a **!**.
   - **QR codes:** they open and close around a scan.
   - **Android back:** closes what's on top instead of leaving the app.
@@ -62,12 +63,12 @@ Closes issue: #
   | After | 42, 30, 63 and 71 s | 41–233 s |
 
 **Simulated loss** (new `code/client/src/netsim.rs`)
-- **Two percentages:** outgoing and incoming, set under "Simulated network loss" on the identity card (`simulated_loss`, `set_simulated_loss` commands).
+- **Two percentages:** outgoing and incoming, set under "Simulated loss" at the bottom of the Network fold (`simulated_loss`, `set_simulated_loss` commands).
 - **Coverage:** every send to and receive from the relay goes through it: message bursts, keepalives, receipts, acks, contact requests and the relay handshake.
 - **Defaults:** off (0%) by default, and reset when the app closes.
 
 **Network stats** (`netsim.rs`, `Client::retransmissions`, `network_stats` command, `NetworkStats`)
-- **Where:** a "Network" fold on the identity card, updated every second.
+- **Where:** a "Network" fold in the settings section after the contacts, updated every second.
 - **What it shows:**
   - **The relay:** its address and status. It's connected if heard from in the last 40 s, quiet if not, or reconnecting.
   - **Packets:** sent and received since the app started, with any dropped by the simulated loss (`netsim::packet_counts`).
@@ -83,7 +84,7 @@ Closes issue: #
 - **Probes:** while the stats are polled, the client sends 8 receipt requests a second, so 10 s holds enough to measure. That's about 4 KB/s, and nothing while the app is in the background.
 - **The warning** (`NetworkWarning`):
   - **What:** a thin amber bar across the top of the main screen, above the chat on a phone too.
-  - **When:** shown once either way reaches 80%, and kept until it's below 78%, so it doesn't flicker.
+  - **When:** shown once either way reaches 90%, and kept until it's below 88%, so it doesn't flicker.
   - **What it says:** how much is lost and which way, or that nothing came back from the relay at all.
 - **Measured on real UDP** through the lossy proxy:
 
@@ -91,9 +92,11 @@ Closes issue: #
   |---|---|---|
   | 50% | 52% / 51% | never |
   | 70% | 67% / 64% | never |
-  | 85% | 86% / 85% | 96% of the time |
+  | 85% | 86% / 85% | 60% of the time |
 
-  After a step up to 85%, the warning came on about 9 s later. After a step back down, it cleared about 1 s later.
+  - **Step response:** after a step up to 85%, the warning came on about 16 s later. After a step back down, it cleared within a second.
+  - **How these were worked out:** the runs were recorded with the warning at 80%. The "Warning on" figures apply the 90%/88% thresholds to the same recorded estimates.
+  - **Not measured:** loss of 90% or more each way.
 
 **Chat UI** (`code/frontend/src/app.rs`, `style.css`)
 - **New-message counts:**
@@ -111,8 +114,8 @@ Closes issue: #
 - **QR codes** (new `QrCodeModal`, owned by `MainScreen`):
   - **They scanned you first:** scanning their code closes yours.
   - **You scanned first:** scanning someone who hasn't scanned you yet opens your code, which closes once they have (their status leaves "pending").
-- **Android back:** each layer over the contact list (a chat, your QR code, the scanner) gets a browser-history entry, and Tauri goes back in the web view's history before leaving the app.
-  - **Order:** back closes the scanner, then the QR code, then the chat, and only then leaves the app.
+- **Android back:** each layer over the contact list (a chat, your QR code, the scanner, the Manual add dialog) gets a browser-history entry, and Tauri goes back in the web view's history before leaving the app.
+  - **Order:** back closes the scanner or Manual add, then the QR code, then the chat, and only then leaves the app.
   - **Other ways of closing:** closing a layer some other way (X, ←, a scan) takes its entry back off.
 - **Keyboard:** opening it shrinks the web view, and the transcript's scroll position counts from the top, so the newest messages slipped out of sight. The transcript now stays at the newest message through a resize if it was there.
 
@@ -128,6 +131,14 @@ Closes issue: #
   - **Who sees it:** someone already signed in goes straight to their contacts.
   - **Getting back to it:** log out, or Android back from Login or Create Identity.
 - **Connect:** the main screen appears no sooner than 2 s after **Connect** is clicked (`CONNECT_MIN_WAIT`), however fast the relay answers. Errors show straight away.
+- **Main screen layout:**
+  - **Identity card:** just your name, at the top. Its **Present QR code** button is gone, as **Show QR code** under the **+** does the same.
+  - **Adding contacts:** a **+** at the far right of the "Contacts" heading opens a menu with **Show QR code**, **Scan QR code** and **Manual add**. **Manual add** opens a dialog for the token and key. Android's back button closes it, like the scanner.
+  - **Empty list:** says to tap **+**, in place of the old "Add contact" section.
+  - **Settings section:** after the contacts, scrolling with them, with two folds:
+    - **Settings:** the "Show token and key" fold, and the notification setting on Android.
+    - **Network:** the stats and the simulated loss together.
+  - **Theme toggle:** a sun in dark mode and a moon in light mode, for the mode it switches to, in place of the "Light mode" / "Dark mode" text.
 - **Small fixes:**
   - The notification setting's checkbox is no longer full width.
   - Logging out with a chat open takes its back-button history entries off.
@@ -142,9 +153,9 @@ Closes issue: #
 - **logcat:** debug Android builds send stdout and stderr to logcat under the tag `E2E` (`adb logcat -s E2E`), so the client's reports can be watched on a phone. Release builds don't, as the client also prints messages as they arrive.
 - **CLI `repair <token>`:** does what the app's "Repair session" does. It was used to time repairs through the lossy proxy.
 - **Docs:**
-  - **`Frontend-UI-info.md`:** the start page, chat header, back behaviour, network stats and the warning, how loss is estimated, the palette and the icon sources.
+  - **`Frontend-UI-info.md`:** the start page, chat header, back behaviour, the main screen's layout and + menu, network stats and the warning, how loss is estimated, the palette and the icon sources.
   - **`code/README.md`:** the CLI `repair` command.
-  - **`code/frontend/README.md` and `ANDROID.md`:** the 10 s resend and setup copies.
+  - **`code/frontend/README.md` and `ANDROID.md`:** the 10 s resend and setup copies, and adding contacts from the **+**.
 
 ### Compatibility
 - **No relay changes:** the relay doesn't need redeploying.
@@ -176,7 +187,7 @@ Closes issue: #
   - **Contact order:** the latest-message query.
   - **Simulated loss:** 0% never drops a packet, and 100% always does.
   - **Setup copies:** only to contacts who have added us, each sealed on its own.
-  - **The loss estimate** (8 tests): loss each way, from copies, gaps and requests; nothing back; too little to tell; only the last 10 s counting; probing only while watched; the 80%/78% warning thresholds.
+  - **The loss estimate** (8 tests): loss each way, from copies, gaps and requests; nothing back; too little to tell; only the last 10 s counting; probing only while watched; the 90%/88% warning thresholds.
   - **Measuring the link:** the relay's sync acks, replayed copies included, feed the estimate.
   - **Retry:** looking up and deleting one message in the history.
 
@@ -187,10 +198,13 @@ Closes issue: #
   - **Repair session:** pressed twice on the phone, both times on a session broken before the fix. Messages got through again after each.
   - **Old requests:** requests from before a repair were refused, as they should be.
 - **Through the lossy proxy, on this PC:** the repair and contact-setup times, and the loss estimate's readings, in the tables above.
-- **In a browser:** the start page, both themes, the chat screen and the warning bar were rendered in headless Firefox with a mocked backend.
-- **Commits:** each of the 17 code commits builds and lints on its own.
+- **In a browser:** these were rendered in headless Firefox with a mocked backend:
+  - **Screens:** the start page and the chat screen, in both themes.
+  - **The warning bar.**
+  - **The new main screen layout:** the + menu, the Manual add dialog, an empty contact list, and the settings section with every fold open, at desktop and phone widths.
+- **Commits:** each of the 20 code commits builds and lints on its own.
 - **Not yet tested:**
-  - on a device: the ⋮ menu and centred title, new-message counts and ordering, the QR code popups, Android back, the keyboard fix, network stats and the warning, the spinner and retry, and the new name, icon and start page (all in the latest APK, which built)
+  - on a device: the ⋮ menu and centred title, new-message counts and ordering, the QR code popups, Android back, the keyboard fix, network stats and the warning, the spinner and retry, the new name, icon and start page, and the main screen's new layout
   - the desktop app by hand
   - `runpeer.sh -ip …` beyond its argument handling, which was checked with a stub `cargo`
   - mirroring the phone with scrcpy now that `FLAG_SECURE` is gone
@@ -203,7 +217,7 @@ Closes issue: #
 - **Loss pattern:** simulated loss drops packets independently at random, with no bursts.
 - **Loss estimate:**
   - **Only while watched:** it's measured only while the main screen polls the stats, so there's no estimate for when the app was in the background.
-  - **Near the threshold:** 10 s of samples is noisy, so between about 75% and 85% loss the warning can come and go.
+  - **Near the threshold:** 10 s of samples is noisy, so between about 85% and 90% loss the warning can come and go.
 - **Retrying a message:** if the first try reached the contact after all, they get it twice.
 - **The old name:** the identifier, Android package, crate names and saved-theme key still say e2e-messenger. Changing the identifier would make it a separate app, without the old one's data.
 - **A stale comment:** `chunks.rs` says the relay keeps at most 50 packets per recipient. It's actually 2 MiB (`MAX_QUEUED_BYTES_PER_TOKEN`).
