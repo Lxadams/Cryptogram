@@ -753,6 +753,43 @@ button.danger {
   font-weight: 700;
 }
 
+/* Still waiting for the relay to confirm it: a small spinning ring. */
+.transcript .msg-status.sending {
+  width: 0.7rem;
+  height: 0.7rem;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  opacity: 0.8;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Next to a "!": send the message again. */
+.transcript .retry-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: inherit;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  width: 1.1rem;
+  height: 1.1rem;
+  min-height: 0;
+  padding: 0;
+  line-height: 0;
+}
+
+.transcript .retry-btn:hover {
+  background: color-mix(in srgb, currentColor 20%, transparent);
+}
+
 .transcript .msg-status.failed {
   display: inline-flex;
   align-items: center;

@@ -1450,10 +1450,55 @@ pub async fn send_message(
     token_hex: String,
     text: String,
 ) -> Result<SentMessageDto, String> {
+    let token = parse_token(&token_hex)?;
+    send_text(&state, token, &text).await
+}
+
+/// Send a message the relay didn't confirm (a "!") again, as a new message,
+/// and take the failed one out of the chat history so it isn't there twice.
+/// Returns the new one, as `send_message` does. If the first try reached
+/// the contact after all, they get it twice.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn retry_message(
+    state: State<'_, AppState>,
+    token_hex: String,
+    id: i64,
+) -> Result<SentMessageDto, String> {
+    let token = parse_token(&token_hex)?;
+    let text = {
+        let guard = state.runtime.lock().await;
+        let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
+        let history = rt.client.history.as_ref().ok_or("No chat history")?;
+        match history.message(id).map_err(|e| e.to_string())? {
+            Some((contact, message))
+                if contact == token
+                    && message.from_me
+                    && message.status == Some(SendStatus::Failed) =>
+            {
+                message.text
+            }
+            _ => return Err("That message can't be sent again.".into()),
+        }
+    };
+    let sent = send_text(&state, token, &text).await?;
+    let mut guard = state.runtime.lock().await;
+    if let Some(rt) = guard.as_mut() {
+        rt.client.note_message_retry();
+        if let Some(history) = &rt.client.history {
+            history.delete(id).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(sent)
+}
+
+/// `send_message`'s work, shared with `retry_message`.
+async fn send_text(
+    state: &State<'_, AppState>,
+    token: RoutingToken,
+    text: &str,
+) -> Result<SentMessageDto, String> {
     let mut guard = state.runtime.lock().await;
     let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
-
-    let token = parse_token(&token_hex)?;
 
     let packets = rt
         .client

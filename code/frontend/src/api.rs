@@ -326,6 +326,18 @@ pub async fn send_message(token_hex: &str, text: &str) -> Result<SentMessageDto,
     call("send_message", &SendMessageArgs { token_hex, text }).await
 }
 
+#[derive(Serialize)]
+struct RetryMessageArgs<'a> {
+    token_hex: &'a str,
+    id: i64,
+}
+
+/// Send message `id` (its chat-history row id) again, as the relay didn't
+/// confirm it. The failed one leaves the history; returns the new one.
+pub async fn retry_message(token_hex: &str, id: i64) -> Result<SentMessageDto, String> {
+    call("retry_message", &RetryMessageArgs { token_hex, id }).await
+}
+
 /// Mirrors `NetworkStatsDto` in `src-tauri/src/commands.rs`.
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct NetworkStatsDto {

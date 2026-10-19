@@ -118,6 +118,12 @@ fn history_message_id(row_id: i64) -> u64 {
     (row_id as u64) | (1u64 << 63)
 }
 
+/// The chat-history row id behind a `history_message_id`, or `None` for a
+/// `next_message_id` one.
+fn history_row_id(id: u64) -> Option<i64> {
+    (id & (1u64 << 63) != 0).then_some((id & !(1u64 << 63)) as i64)
+}
+
 /// Light/dark preference. Applied to `<html data-theme="...">` (see
 /// style.css, which keys both palettes' CSS custom properties off that
 /// attribute) and persisted to localStorage so it survives a reload.
@@ -213,6 +219,17 @@ fn UnreadBadge(count: usize) -> impl IntoView {
         };
         view! { <span class="unread-badge" title=title>{label}</span> }
     })
+}
+
+/// A circular arrow, for sending a message again.
+#[component]
+fn RetryIcon() -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13 8a5 5 0 1 1-1.5-3.55" />
+            <path d="M13 2.5v3h-3" />
+        </svg>
+    }
 }
 
 /// Three dots, for a button that opens a menu (see `Menu`).
@@ -1877,6 +1894,60 @@ fn ChatPanel(
                             .find(|c| c.token == status_token)
                             .map(|c| c.status.clone())
                     };
+                    // Send a message the relay didn't confirm (a "!") again.
+                    // It shows as sending meanwhile, and on success is
+                    // replaced, at the bottom, by the new message.
+                    let retry_token = StoredValue::new(token.clone());
+                    let retry = move |old_id: u64| {
+                        let Some(row_id) = history_row_id(old_id) else {
+                            return;
+                        };
+                        let token = retry_token.get_value();
+                        let set_status = move |status: SendStatus| {
+                            let token = retry_token.get_value();
+                            messages.update(|map| {
+                                if let Some(m) = map
+                                    .get_mut(&token)
+                                    .and_then(|list| list.iter_mut().find(|m| m.id == old_id))
+                                {
+                                    m.status = Some(status);
+                                }
+                            });
+                        };
+                        error.set(None);
+                        set_status(SendStatus::Sending);
+                        leptos::task::spawn_local(async move {
+                            match api::retry_message(&token, row_id).await {
+                                Ok(sent) => {
+                                    let id = sent
+                                        .id
+                                        .map(history_message_id)
+                                        .unwrap_or_else(next_message_id);
+                                    let status = early_updates
+                                        .try_update_value(|early| early.remove(&id))
+                                        .flatten()
+                                        .unwrap_or(SendStatus::Sending);
+                                    messages.update(|map| {
+                                        let list = map.entry(token).or_default();
+                                        if let Some(at) = list.iter().position(|m| m.id == old_id) {
+                                            let old = list.remove(at);
+                                            list.push(ChatMessage {
+                                                id,
+                                                from_me: true,
+                                                text: old.text,
+                                                timestamp_ms: Some(sent.timestamp_ms),
+                                                status: Some(status),
+                                            });
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    set_status(SendStatus::Failed);
+                                    error.try_set(Some(e));
+                                }
+                            }
+                        });
+                    };
                     let history = move || messages.get().get(&token).cloned().unwrap_or_default();
                     let chat_label = move || {
                         contacts.get()
@@ -1984,13 +2055,30 @@ fn ChatPanel(
                                             <span class="msg-time">{format_time(ms)}</span>
                                         })}
                                         {match msg.status {
+                                            Some(SendStatus::Sending) => Some(view! {
+                                                <span class="msg-status sending" title="Sending" aria-label="Sending"></span>
+                                            }.into_any()),
                                             Some(SendStatus::Sent) => Some(view! {
                                                 <span class="msg-status sent" title="The relay has it">"✓"</span>
                                             }.into_any()),
-                                            Some(SendStatus::Failed) => Some(view! {
-                                                <span class="msg-status failed" title="It didn't get to the relay. Try sending it again.">"!"</span>
-                                            }.into_any()),
-                                            _ => None,
+                                            Some(SendStatus::Failed) => {
+                                                let id = msg.id;
+                                                Some(view! {
+                                                    <span class="msg-status failed" title="It didn't get to the relay.">"!"</span>
+                                                    {history_row_id(id).map(|_| view! {
+                                                        <button
+                                                            type="button"
+                                                            class="retry-btn"
+                                                            title="Send it again"
+                                                            aria-label="Send it again"
+                                                            on:click=move |_| retry(id)
+                                                        >
+                                                            <RetryIcon />
+                                                        </button>
+                                                    })}
+                                                }.into_any())
+                                            }
+                                            None => None,
                                         }}
                                     </span>
                                 </p>

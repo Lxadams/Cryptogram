@@ -150,6 +150,38 @@ impl ChatHistory {
         Ok(())
     }
 
+    /// Message `id`: who it's with, and the message itself, if there's one
+    /// with that id.
+    pub fn message(&self, id: i64) -> Result<Option<(RoutingToken, StoredMessage)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT contact_token, from_me, body, timestamp_ms, status FROM messages WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let mut contact = [0u8; 16];
+        hex::decode_to_slice(row.get::<_, String>(0)?, &mut contact)
+            .context("malformed contact token in chat history")?;
+        Ok(Some((
+            contact,
+            StoredMessage {
+                id,
+                from_me: row.get::<_, i64>(1)? != 0,
+                text: row.get(2)?,
+                timestamp_ms: row.get(3)?,
+                status: SendStatus::from_code(row.get(4)?),
+            },
+        )))
+    }
+
+    /// Delete message `id`, as when it's been sent again as a new one.
+    pub fn delete(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// Permanently delete all locally-stored history with `contact_token`.
     /// Local-only, by the owning peer's own choice — never triggered by
     /// anything arriving over the network (see the `remove_contact` Tauri
@@ -254,6 +286,23 @@ mod tests {
         assert_eq!(msgs[1].text, "hello back");
         // Oldest-first ordering, and ids strictly increasing.
         assert!(msgs[0].id < msgs[1].id);
+    }
+
+    #[test]
+    fn test_one_message_can_be_looked_up_and_deleted() {
+        let db = ScratchDb::new("one-message");
+        let history = ChatHistory::open(&db.0, &[5u8; 32]).unwrap();
+        let (alice, bob) = ([1u8; 16], [2u8; 16]);
+        let first = history.append_at(alice, true, "first", 100).unwrap();
+        let second = history.append_at(bob, false, "second", 200).unwrap();
+
+        let (contact, message) = history.message(first).unwrap().unwrap();
+        assert_eq!(contact, alice);
+        assert_eq!((message.text.as_str(), message.from_me), ("first", true));
+        history.delete(first).unwrap();
+        assert!(history.message(first).unwrap().is_none());
+        assert_eq!(history.message(second).unwrap().unwrap().0, bob);
+        assert!(history.recent(alice, 10).unwrap().is_empty());
     }
 
     #[test]
