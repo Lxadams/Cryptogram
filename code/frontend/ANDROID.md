@@ -300,9 +300,9 @@ must be on the same Wi-Fi.
 instead of `./runserver-lan.sh` in step 1. It drops 70% of packets each
 way, and phones connect to it the same way.
 - **Changing the loss:** type a new one and press Enter, `0` for none.
-  Adding a contact at 70% can take many minutes, as its packets are only
-  resent after 30 s, then 60 s and so on. So add contacts at `0`, then type
-  `0.7`.
+  Adding a contact at 70% can take a few minutes: the first request each
+  way is a single packet, resent after 10 s, then 20 s and so on (later
+  steps go out three times). So add contacts at `0`, then type `0.7`.
 - **Jamming only one phone:** port 4431 reaches the relay with no loss.
   Build the other phone with the `:4431` command `./runserver-lan-lossy.sh`
   prints, `SERVER_PUBKEY=<key> ./runpeer-lan.sh --mobile <this PC's IP>:4431`

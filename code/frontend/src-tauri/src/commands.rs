@@ -1185,6 +1185,10 @@ pub async fn connect_to_peer(
     netsim::send_to(&rt.socket, &req_packet, rt.client.server_addr)
         .await
         .map_err(|e| e.to_string())?;
+    // Its further copies (see `Client::take_extra_packets`).
+    for packet in rt.client.take_extra_packets() {
+        let _ = netsim::send_to(&rt.socket, &packet, rt.client.server_addr).await;
+    }
 
     Ok(())
 }
@@ -1338,6 +1342,10 @@ pub async fn repair_session(state: State<'_, AppState>, token_hex: String) -> Re
     netsim::send_to(&rt.socket, &kx_packet, rt.client.server_addr)
         .await
         .map_err(|e| e.to_string())?;
+    // Its further copies (see `Client::take_extra_packets`).
+    for packet in rt.client.take_extra_packets() {
+        let _ = netsim::send_to(&rt.socket, &packet, rt.client.server_addr).await;
+    }
     Ok(())
 }
 

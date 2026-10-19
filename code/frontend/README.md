@@ -143,8 +143,10 @@ Android, set up the toolchain first; see [ANDROID.md](ANDROID.md).
 
 The setup carries on by itself if a packet goes missing, or if one of you
 was offline when the other added you: until a contact is established, the
-app sends them its KeyExchange again now and then (after 30 seconds, then
-twice as long each time, up to 8 times). Adding them again, from either
+app sends them its KeyExchange again now and then (after 10 seconds, then
+twice as long each time, up to 8 times). Once they've added you, each
+setup packet also goes out three times, so heavy loss rarely stops all of
+them. Adding them again, from either
 side, also picks the setup up where it stopped, and starts those resends
 over. If the relay restarts, the app notices its syncs going unanswered
 and reconnects by itself once it has heard nothing from the relay for two minutes, or straight away after a phone wakes from a long sleep. Someone who tries to connect before you've added them

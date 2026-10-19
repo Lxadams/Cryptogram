@@ -144,11 +144,21 @@ const LINK_SILENCE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 // (see `Client::setup_resends`) after this long, then twice as long each
 // time, up to `MAX_SETUP_RETRY_DELAY`, at most `MAX_SETUP_RETRIES` times.
 // Each step of the setup is a single UDP packet to the relay, which nothing
-// resends, so this is what gets a setup past a lost one. Any progress, or a
-// new link, starts the count again.
-const FIRST_SETUP_RETRY: Duration = Duration::from_secs(30);
+// resends until it gets there, so this is what gets a setup past a lost
+// one: soon, as a repair at heavy loss takes several steps. Any progress,
+// or a new link, starts the count again.
+const FIRST_SETUP_RETRY: Duration = Duration::from_secs(10);
 const MAX_SETUP_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 const MAX_SETUP_RETRIES: u32 = 8;
+
+// Setup packets (KeyExchange, SessionEstablish) to a contact who has added
+// us go out this many times, each sealed on its own: a one-packet message
+// can't be spread over FEC symbols, so copies are its redundancy. At 70%
+// loss on our uplink, one gets to the relay 30% of the time, three 66%, and
+// the relay resends what it has until the contact acks it. To someone who
+// hasn't added us (no admission tag yet), just once: those share a small
+// queue at the relay with everyone else's first requests.
+const SETUP_COPIES: usize = 3;
 
 // Connection requests from people who aren't contacts (see
 // `Client::connection_requests`): how long one is listed, and how many new
@@ -835,9 +845,11 @@ pub struct Client {
     /// When we last sent each contact refreshes they asked for again (see
     /// `MIN_PQ_RESEND_GAP`). Live state.
     pq_resent_at: HashMap<RoutingToken, Instant>,
-    /// Packets handling an incoming packet produced beyond its one reply
-    /// (refreshes a contact asked for again), for `handle_relay_packet` to
-    /// send after it. Live state.
+    /// Packets to send along with what a call returned: the further copies
+    /// of setup packets (see `SETUP_COPIES`), and refreshes a contact asked
+    /// for again. `handle_relay_packet` and `keepalive` send them after
+    /// their own; a front end sending what `add_contact` or
+    /// `repair_session` returned sends `take_extra_packets` too. Live state.
     extra_replies: Vec<Vec<u8>>,
 }
 
@@ -1151,6 +1163,7 @@ impl Client {
         }
         let mut out = self.sync_packets();
         out.extend(self.setup_resends(now));
+        out.append(&mut self.extra_replies);
         out
     }
 
@@ -1179,6 +1192,7 @@ impl Client {
         println!(">> Reconnected to the relay.");
         let mut out = self.sync_packets();
         out.extend(self.setup_resends(Instant::now()));
+        out.append(&mut self.extra_replies);
         out
     }
 
@@ -1189,6 +1203,20 @@ impl Client {
     ) -> Vec<u8> {
         let tag = self.admission_tag_for(&target_token);
         self.wrap_data(Lane::Direct, target_token, tag.as_ref(), inner_payload)
+    }
+
+    /// A setup packet (KeyExchange or SessionEstablish) for `target`, sealed
+    /// on our link: the first copy, with the rest (see `SETUP_COPIES`) in
+    /// `extra_replies`, if they've added us.
+    fn wrap_setup(&mut self, target: RoutingToken, inner: &[u8]) -> Vec<u8> {
+        let first = self.wrap_link_encryption(target, inner);
+        if self.admission_tag_for(&target).is_some() {
+            for _ in 1..SETUP_COPIES {
+                let copy = self.wrap_link_encryption(target, inner);
+                self.extra_replies.push(copy);
+            }
+        }
+        first
     }
 
     /// `inner_payload` for `target_token`, sealed on our link in `lane`,
@@ -1338,6 +1366,12 @@ impl Client {
             .collect()
     }
 
+    /// The packets `extra_replies` holds, for a front end to send after
+    /// what `add_contact` or `repair_session` returned.
+    pub fn take_extra_packets(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.extra_replies)
+    }
+
     /// `peer` has sent us something that moved our setup with them on:
     /// start the count of KeyExchange resends again (see `setup_resends`).
     fn note_setup_progress(&mut self, peer: &RoutingToken) {
@@ -1477,7 +1511,7 @@ impl Client {
         );
         let mut inner = vec![0x02];
         inner.extend_from_slice(&payload.to_bytes());
-        self.wrap_link_encryption(target_token, &inner)
+        self.wrap_setup(target_token, &inner)
     }
 
     /// Whether we're the one of the two contacts who sends the
@@ -1558,7 +1592,7 @@ impl Client {
         );
         let mut inner = vec![0x04];
         inner.extend_from_slice(&est.to_bytes());
-        Some(self.wrap_link_encryption(*peer, &inner))
+        Some(self.wrap_setup(*peer, &inner))
     }
 
     /// `peer` has the session we offered them: stop offering it, and start
@@ -5621,12 +5655,14 @@ mod tests {
 
         let first = bob.handle_relay_packet(&packet);
         let types: Vec<u8> = first.iter().map(|packet| packet[0]).collect();
+        let reply = relay_link::TYPE_ADMITTED_DATA;
         assert_eq!(
             types,
-            [relay_link::TYPE_ADMITTED_DATA, TYPE_SYNC, TYPE_ACK],
-            "KeyExchange reply (which now carries Alice's admission tag), a sync registering \
-             the one she'll use, then the ack"
+            [reply, reply, reply, TYPE_SYNC, TYPE_ACK],
+            "KeyExchange reply (which now carries Alice's admission tag) in SETUP_COPIES \
+             copies, a sync registering the one she'll use, then the ack"
         );
+        assert_eq!(SETUP_COPIES, 3);
         assert!(
             bob.handle_relay_packet(&packet).is_empty(),
             "a copy of the very same packet isn't taken in at all"
@@ -5836,6 +5872,31 @@ mod tests {
         assert!(a.is_connected(&tb) && b.is_connected(&ta));
         let later = Instant::now() + MAX_SETUP_RETRY_DELAY;
         assert!(a.setup_resends(later).is_empty() && b.setup_resends(later).is_empty());
+        cleanup(&[&a, &b]);
+    }
+
+    /// Setup packets to someone who has added us go out in `SETUP_COPIES`
+    /// copies, each sealed on its own; to someone who hasn't, just once.
+    #[test]
+    fn test_setup_packets_are_copied_only_to_contacts_who_added_us() {
+        let (mut a, mut b) = (new_client(), new_client());
+        let tb = b.identity.routing_token;
+        a.add_contact(tb, b.identity.ed25519_public).unwrap();
+        assert!(a.take_extra_packets().is_empty(), "no admission tag yet");
+
+        // B adds A back, so A has B's keys, and with them an admission tag.
+        let kx = b
+            .add_contact(a.identity.routing_token, a.identity.ed25519_public)
+            .unwrap();
+        a.handle_incoming_packet(&relay(&kx, &b)).unwrap();
+        a.take_extra_packets();
+        let again = a.create_kx_request(tb);
+        let copies = a.take_extra_packets();
+        assert_eq!(copies.len(), SETUP_COPIES - 1);
+        for copy in &copies {
+            assert_ne!(copy, &again, "each copy is sealed on its own");
+            assert_eq!(relay(copy, &a), relay(&again, &a), "the same KeyExchange");
+        }
         cleanup(&[&a, &b]);
     }
 

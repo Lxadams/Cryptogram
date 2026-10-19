@@ -147,6 +147,7 @@ async fn main() -> Result<()> {
     println!("Commands:");
     println!("  connect <routing_token_hex> <ed25519_pub_hex>");
     println!("  msg <routing_token_hex> <text...>");
+    println!("  repair <routing_token_hex>");
 
     // Simple stdin REPL: `connect <token> <ed25519>` to start a key
     // exchange with a peer, `msg <token> <text>` to send an E2E message.
@@ -177,7 +178,36 @@ async fn main() -> Result<()> {
                 match c.add_contact(token, bob_ed25519) {
                     Ok(req_packet) => {
                         socket.send_to(&req_packet, server_addr).await.unwrap();
+                        for packet in c.take_extra_packets() {
+                            let _ = socket.send_to(&packet, server_addr).await;
+                        }
                         println!("Sent connection request! They need to connect to you too.");
+                    }
+                    Err(e) => println!("Error: {e}"),
+                }
+            }
+            "repair" => {
+                // A new session with a contact whose one has broken (see
+                // `Client::repair_session`).
+                let token = match parts.get(1).map(|t| parse_routing_token(t)) {
+                    Some(Ok(token)) => token,
+                    Some(Err(e)) => {
+                        println!("Error: {e}");
+                        continue;
+                    }
+                    None => {
+                        println!("Usage: repair <token>");
+                        continue;
+                    }
+                };
+                let mut c = client.lock().await;
+                match c.repair_session(token) {
+                    Ok(packet) => {
+                        let _ = socket.send_to(&packet, server_addr).await;
+                        for packet in c.take_extra_packets() {
+                            let _ = socket.send_to(&packet, server_addr).await;
+                        }
+                        println!("Repairing the session: they'll set up a new one with you.");
                     }
                     Err(e) => println!("Error: {e}"),
                 }
