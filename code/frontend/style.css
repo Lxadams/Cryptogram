@@ -156,6 +156,15 @@ h3 {
   background: var(--hover);
 }
 
+/* The sun or moon (see `SunIcon`): square, and as tall as "Log out". */
+.theme-toggle.theme-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.3rem;
+  line-height: 0;
+}
+
 code {
   background: var(--sunken);
   padding: 0.1rem 0.35rem;

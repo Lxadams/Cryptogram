@@ -254,6 +254,27 @@ fn PlusIcon() -> impl IntoView {
     }
 }
 
+/// A sun, for switching to light mode.
+#[component]
+fn SunIcon() -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <circle cx="12" cy="12" r="4.5" />
+            <path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8" />
+        </svg>
+    }
+}
+
+/// A crescent moon, for switching to dark mode.
+#[component]
+fn MoonIcon() -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20.5 14.5A8.5 8.5 0 1 1 9.5 3.5a7 7 0 0 0 11 11z" />
+        </svg>
+    }
+}
+
 /// Clears a polling interval when the component that started it unmounts.
 /// A `set_interval` otherwise outlives its screen: after logging in, the
 /// Login screen's poll kept firing against disposed signals (panicking), and
@@ -457,13 +478,23 @@ pub fn App() -> impl IntoView {
                             "Log out"
                         </button>
                     })}
+                    // A sun in dark mode and a moon in light: the mode it
+                    // switches to.
                     <button
-                        class="theme-toggle"
+                        class="theme-toggle theme-icon"
+                        title=move || match theme.get() {
+                            Theme::Dark => "Switch to light mode",
+                            Theme::Light => "Switch to dark mode",
+                        }
+                        aria-label=move || match theme.get() {
+                            Theme::Dark => "Switch to light mode",
+                            Theme::Light => "Switch to dark mode",
+                        }
                         on:click=move |_| theme.update(|t| *t = t.flipped())
                     >
                         {move || match theme.get() {
-                            Theme::Dark => "Light mode",
-                            Theme::Light => "Dark mode",
+                            Theme::Dark => view! { <SunIcon /> }.into_any(),
+                            Theme::Light => view! { <MoonIcon /> }.into_any(),
                         }}
                     </button>
                 </div>
