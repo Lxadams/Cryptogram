@@ -38,7 +38,11 @@ accepts commands:
 ```
 connect <their_routing_token_hex> <their_ed25519_pub_hex>
 msg <routing_token_hex> <message text...>
+repair <routing_token_hex>
 ```
+
+`repair` sets up a new session with a contact whose session has broken,
+as the app's "Repair session" does.
 
 Session/identity state persists in the `client_state` volume, shared by
 every `docker compose run client` invocation — fine for one peer. To run

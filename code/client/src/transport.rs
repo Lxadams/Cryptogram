@@ -20,9 +20,11 @@
 //! inject itself names the chain position it applies at, so it's mixed in
 //! at exactly that point however early or late it arrives. Only sealed
 //! messages are parked: the seal proves the sender, so strangers can't fill
-//! the queue.
+//! the queue. If the bundle never arrives at all, the receiver, holding the
+//! messages after it, asks the sender for the inject again (see
+//! `Client::pq_inject_requests`), which keeps its recent ones for that.
 
-use crate::{HKDF_SALT, RoutingToken};
+use crate::{HKDF_SALT, RoutingToken, netsim};
 use anyhow::Result;
 use chacha20poly1305::{
     Key, KeyInit, XChaCha20Poly1305, XNonce,
@@ -330,7 +332,7 @@ async fn send_paced(
 ) {
     for packet in packets {
         ticker.tick().await; // the first tick after idling is immediate
-        let _ = socket.send_to(packet, addr).await;
+        let _ = netsim::send_to(socket, packet, addr).await;
     }
 }
 
@@ -350,7 +352,7 @@ pub async fn send_burst(
     };
     let mut ticker = pacer();
     ticker.tick().await;
-    socket.send_to(first, addr).await?;
+    netsim::send_to(socket, first, addr).await?;
     send_paced(&mut ticker, socket, addr, rest).await;
     Ok(())
 }
@@ -378,7 +380,7 @@ impl BurstSender {
                     continue;
                 };
                 ticker.tick().await;
-                let result = socket.send_to(first, addr).await.map(drop);
+                let result = netsim::send_to(&socket, first, addr).await.map(drop);
                 let failed = result.is_err();
                 let _ = first_sent.send(result);
                 if !failed {
@@ -429,6 +431,7 @@ mod tests {
             .get(sender)
             .map_or(0, |session| session.parked.0.len())
     }
+    use crate::packets::PQInjectRequestPayload;
     use crate::{Client, MAX_MESSAGE_LEN};
 
     /// Each message's burst, as the relay hands it to the recipient.
@@ -1104,5 +1107,184 @@ mod tests {
             "ratchets in step after 200 PQ injections"
         );
         cleanup(&[&alice, &bob]);
+    }
+
+    // ==========================================
+    // Asking for a lost PQ inject again
+    // ==========================================
+
+    /// Hand every packet in `packets` from `from` to `to`, as the relay
+    /// would, and return what `to` sends back beyond its replies: the
+    /// refreshes it sends again.
+    fn hand_all(from: &Client, to: &mut Client, packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        for packet in packets {
+            to.handle_incoming_packet(&relay(packet, from)).unwrap();
+        }
+        std::mem::take(&mut to.extra_replies)
+    }
+
+    /// Bob's messages from `sender` held for one sent before them, handed
+    /// over as if `REORDER_WAIT` had passed: what's left once a message
+    /// that was lost for good stops holding up the ones after it.
+    fn texts_after_reorder_wait(bob: &mut Client, sender: &RoutingToken) -> Vec<String> {
+        let wait = crate::REORDER_WAIT.as_millis() as u64;
+        let session = bob.e2e_sessions.get_mut(sender).unwrap();
+        for held in session.delivery.held.values_mut() {
+            held.held_at_ms -= wait;
+        }
+        inbox_texts(bob)
+    }
+
+    /// What two devices hit: the burst carrying a PQ inject (message 4's)
+    /// never got anywhere, so the messages after it can't be decrypted.
+    /// Bob asks again (not straight away, as the inject is usually just
+    /// behind), the first request is lost too, the second gets the inject
+    /// sent again, and the messages after it come through.
+    #[test]
+    fn lost_pq_inject_is_asked_for_and_sent_again() {
+        let (mut alice, mut bob) = connected_pair();
+        let alice_token = alice.identity.routing_token;
+        let bursts = bursts(&mut alice, &bob, 7);
+        for i in [0, 1, 2, 3, 5, 6] {
+            deliver(&mut bob, &bursts[i]);
+        }
+        assert_eq!(inbox_texts(&mut bob), ["m0", "m1", "m2", "m3"]);
+        assert_eq!(parked_count(&bob, &alice_token), 2);
+
+        let now = Instant::now();
+        assert!(bob.pq_inject_requests_at(now).is_empty());
+        let lost = bob.pq_inject_requests_at(now + crate::FIRST_PQ_INJECT_ASK);
+        assert_eq!(lost.len(), crate::PQ_RECOVERY_COPIES);
+        assert!(
+            bob.pq_inject_requests_at(now + crate::FIRST_PQ_INJECT_ASK * 2)
+                .is_empty(),
+            "the next ask waits longer"
+        );
+        let requests = bob.pq_inject_requests_at(now + crate::FIRST_PQ_INJECT_ASK * 3);
+        assert_eq!(requests.len(), crate::PQ_RECOVERY_COPIES);
+
+        let resent = hand_all(&bob, &mut alice, &requests);
+        assert_eq!(
+            resent.len(),
+            crate::PQ_RECOVERY_COPIES,
+            "one inject, answered once for all the request's copies"
+        );
+        hand_all(&alice, &mut bob, &resent);
+        assert_eq!(parked_count(&bob, &alice_token), 0);
+        assert_eq!(
+            texts_after_reorder_wait(&mut bob, &alice_token),
+            ["m5", "m6"]
+        );
+        assert_eq!(
+            bob.retransmissions().pq_requests,
+            2,
+            "the lost request and the answered one"
+        );
+        assert_eq!(alice.retransmissions().pq_resends, 1);
+        assert_eq!(
+            session(&alice, &bob).send_chain_key,
+            session(&bob, &alice).recv_chain_key
+        );
+        assert!(
+            bob.pq_inject_requests_at(now + Duration::from_secs(3600))
+                .is_empty(),
+            "nothing left to ask for"
+        );
+        cleanup(&[&alice, &bob]);
+    }
+
+    /// The inject sent again is lost too, and the sender has restarted
+    /// since: the next request still gets it, as it's saved with the
+    /// session.
+    #[test]
+    fn pq_inject_is_sent_again_after_a_restart_until_it_arrives() {
+        let (mut alice, mut bob) = connected_pair();
+        let (alice_token, bob_token) = (alice.identity.routing_token, bob.identity.routing_token);
+        let bursts = bursts(&mut alice, &bob, 6);
+        for i in [0, 1, 2, 3, 5] {
+            deliver(&mut bob, &bursts[i]);
+        }
+        let now = Instant::now();
+        assert!(bob.pq_inject_requests_at(now).is_empty());
+        let requests = bob.pq_inject_requests_at(now + crate::FIRST_PQ_INJECT_ASK);
+        assert_eq!(
+            hand_all(&bob, &mut alice, &requests).len(),
+            crate::PQ_RECOVERY_COPIES
+        );
+
+        alice.save();
+        let mut alice = crate::ClientStateDto::load(&alice.state_path).unwrap();
+        let requests = bob.pq_inject_requests_at(now + Duration::from_secs(3600));
+        let resent = hand_all(&bob, &mut alice, &requests);
+        assert_eq!(resent.len(), crate::PQ_RECOVERY_COPIES);
+        hand_all(&alice, &mut bob, &resent);
+        assert_eq!(
+            texts_after_reorder_wait(&mut bob, &alice_token),
+            ["m0", "m1", "m2", "m3", "m5"]
+        );
+        assert!(alice.pq_resent_at.contains_key(&bob_token));
+        cleanup(&[&alice, &bob]);
+    }
+
+    /// The sender keeps only its latest injects, and drops the ones a
+    /// request shows the receiver has already mixed in.
+    #[test]
+    fn sent_pq_injects_are_bounded_and_pruned_by_requests() {
+        let (mut alice, bob) = connected_pair();
+        let bob_token = bob.identity.routing_token;
+        let count = crate::PQ_INJECT_INTERVAL as usize * (crate::KEPT_PQ_INJECTS + 3);
+        bursts(&mut alice, &bob, count);
+        let kept = &session(&alice, &bob).sent_pq_injects;
+        assert_eq!(kept.len(), crate::KEPT_PQ_INJECTS);
+        let newest = *kept.keys().next_back().unwrap();
+        assert_eq!(newest, count as u64);
+
+        let binding = session(&bob, &alice).pq_inject_binding();
+        let request = PQInjectRequestPayload::generate(
+            &bob.identity,
+            alice.identity.routing_token,
+            newest,
+            newest,
+            &binding,
+        );
+        let packet = bob_request_packet(&request);
+        alice.handle_incoming_packet(&packet).unwrap();
+        assert_eq!(alice.extra_replies.len(), crate::PQ_RECOVERY_COPIES);
+        assert_eq!(
+            alice.e2e_sessions[&bob_token]
+                .sent_pq_injects
+                .keys()
+                .collect::<Vec<_>>(),
+            [&newest]
+        );
+        cleanup(&[&alice, &bob]);
+    }
+
+    /// A request that doesn't verify on this session (forged, or made on an
+    /// earlier one) gets nothing sent, and nothing dropped.
+    #[test]
+    fn pq_inject_request_from_another_session_is_ignored() {
+        let (mut alice, bob) = connected_pair();
+        bursts(&mut alice, &bob, 6);
+        let request = PQInjectRequestPayload::generate(
+            &bob.identity,
+            alice.identity.routing_token,
+            6,
+            6,
+            &[0u8; 32],
+        );
+        alice
+            .handle_incoming_packet(&bob_request_packet(&request))
+            .unwrap();
+        assert!(alice.extra_replies.is_empty());
+        assert_eq!(session(&alice, &bob).sent_pq_injects.len(), 1);
+        cleanup(&[&alice, &bob]);
+    }
+
+    /// `request` as the 0x08 payload the relay hands over.
+    fn bob_request_packet(request: &PQInjectRequestPayload) -> Vec<u8> {
+        let mut packet = vec![0x08];
+        packet.extend_from_slice(&request.to_bytes());
+        packet
     }
 }

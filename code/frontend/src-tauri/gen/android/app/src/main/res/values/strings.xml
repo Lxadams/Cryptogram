@@ -1,6 +1,6 @@
 <resources>
-    <string name="app_name">"e2e-messenger"</string>
-    <string name="main_activity_title">"e2e-messenger"</string>
+    <string name="app_name">Cryptogram</string>
+    <string name="main_activity_title">Cryptogram</string>
     <string name="channel_messages">New messages</string>
     <string name="channel_connection">Background connection</string>
     <string name="channel_connection_description">Shown while you\'re logged in, so the app keeps receiving messages in the background.</string>

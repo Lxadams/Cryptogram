@@ -125,6 +125,10 @@ pub(crate) fn connect(initiator: &mut Client, responder: &mut Client) {
     );
     assert!(initiator.is_connected(&responder.identity.routing_token));
     assert!(responder.is_connected(&initiator.identity.routing_token));
+    // The further copies of setup packets (see `SETUP_COPIES`): a clean
+    // link doesn't need them.
+    initiator.extra_replies.clear();
+    responder.extra_replies.clear();
 }
 
 /// Two fresh clients, ordered so the first sends the SessionEstablish

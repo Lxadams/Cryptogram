@@ -109,7 +109,9 @@ from git afterwards. They're all under
 - `java/.../MainActivity.kt`, `NativeBridge.kt` and `MessageService.kt`:
   background receiving and notifications (see
   [Receiving in the background](#receiving-in-the-background)), plus
-  keeping the UI clear of the status bar, navigation bar and keyboard.
+  keeping the UI clear of the status bar, navigation bar and keyboard,
+  and the back button, which `MainActivity` hands to the page on every
+  activity (Tauri's own back handling only covers the first).
 - `res/values/strings.xml`, `res/drawable/ic_stat_message.xml` and
   `res/xml/data_extraction_rules.xml`.
 
@@ -200,8 +202,9 @@ cargo tauri android build --debug --apk --target aarch64
    you about them.
 2. **Create identity**, then log in, the same way as on desktop.
 3. Press **Connect**. The relay's public key is already built in (step 6).
-4. Add contacts with **Scan QR code** (Android asks for camera permission
-   the first time) or by pasting a routing token and Ed25519 key. You each
+4. Add contacts from the **+** by "Contacts": **Scan QR code** (Android
+   asks for camera permission the first time) or **Manual add**, pasting
+   a routing token and Ed25519 key. You each
    add the other; a contact stays "pending" until both have, then shows
    "connecting" while the session is set up. The app sends its
    KeyExchange again by itself if a packet goes missing, and adding them
@@ -300,9 +303,9 @@ must be on the same Wi-Fi.
 instead of `./runserver-lan.sh` in step 1. It drops 70% of packets each
 way, and phones connect to it the same way.
 - **Changing the loss:** type a new one and press Enter, `0` for none.
-  Adding a contact at 70% can take many minutes, as its packets are only
-  resent after 30 s, then 60 s and so on. So add contacts at `0`, then type
-  `0.7`.
+  Adding a contact at 70% can take a few minutes: the first request each
+  way is a single packet, resent after 10 s, then 20 s and so on (later
+  steps go out three times). So add contacts at `0`, then type `0.7`.
 - **Jamming only one phone:** port 4431 reaches the relay with no loss.
   Build the other phone with the `:4431` command `./runserver-lan-lossy.sh`
   prints, `SERVER_PUBKEY=<key> ./runpeer-lan.sh --mobile <this PC's IP>:4431`

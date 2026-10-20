@@ -29,6 +29,8 @@ mod chunks;
 mod confirmations;
 mod deliveries;
 mod history;
+mod link_quality;
+pub mod netsim;
 mod ordering;
 mod padding;
 pub mod pq;
@@ -37,6 +39,7 @@ mod transport;
 pub use chunks::MAX_MESSAGE_LEN;
 pub use confirmations::CONFIRM_TIMEOUT;
 pub use history::{ChatHistory, SendStatus, StoredMessage};
+pub use link_quality::Loss;
 pub use ordering::{DeliveryOrder, REORDER_WAIT};
 /// Routing tokens, link session IDs and delivery IDs are the relay link's
 /// (see the `relay-link` crate), as is how a routing token is derived.
@@ -78,6 +81,27 @@ const MAX_TIMESTAMP_DRIFT: u64 = 300;
 // their position. Refreshes come at least PQ_INJECT_INTERVAL steps apart and
 // messages more than 100 steps ahead are rejected anyway, so this is ample.
 const MAX_PENDING_PQ_INJECTS: usize = 32;
+
+// Our latest PQ refreshes kept per session, to send again if the peer never
+// got one (see `SymmetricSessionState::sent_pq_injects`). The receive chain
+// looks at most 100 messages ahead, which spans this many refreshes; one
+// missing from further back can't be recovered anyway.
+const KEPT_PQ_INJECTS: usize = 100 / PQ_INJECT_INTERVAL as usize;
+
+// While holding messages for a PQ refresh that hasn't arrived, we ask the
+// sender for it again (see `Client::pq_inject_requests`): first after this
+// long, as a refresh is often just a moment behind the message after it,
+// then twice as long each time, up to `MAX_PQ_INJECT_ASK_DELAY`.
+const FIRST_PQ_INJECT_ASK: Duration = Duration::from_secs(3);
+const MAX_PQ_INJECT_ASK_DELAY: Duration = Duration::from_secs(30);
+// Copies of each request, and of each refresh sent again, as each is a
+// single packet with nothing else to make up for losing it. At 70% loss on
+// both uplinks, three copies each way get a refresh through four times in
+// ten; the asking repeats until one does.
+const PQ_RECOVERY_COPIES: usize = 3;
+// Requests from a peer closer together than this get one answer: the
+// copies of one request arrive together.
+const MIN_PQ_RESEND_GAP: Duration = Duration::from_secs(1);
 /// Most send statuses kept for a front end to collect (see
 /// `Client::drain_send_updates`).
 const MAX_SEND_UPDATES: usize = 256;
@@ -122,11 +146,21 @@ const LINK_SILENCE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 // (see `Client::setup_resends`) after this long, then twice as long each
 // time, up to `MAX_SETUP_RETRY_DELAY`, at most `MAX_SETUP_RETRIES` times.
 // Each step of the setup is a single UDP packet to the relay, which nothing
-// resends, so this is what gets a setup past a lost one. Any progress, or a
-// new link, starts the count again.
-const FIRST_SETUP_RETRY: Duration = Duration::from_secs(30);
+// resends until it gets there, so this is what gets a setup past a lost
+// one: soon, as a repair at heavy loss takes several steps. Any progress,
+// or a new link, starts the count again.
+const FIRST_SETUP_RETRY: Duration = Duration::from_secs(10);
 const MAX_SETUP_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 const MAX_SETUP_RETRIES: u32 = 8;
+
+// Setup packets (KeyExchange, SessionEstablish) to a contact who has added
+// us go out this many times, each sealed on its own: a one-packet message
+// can't be spread over FEC symbols, so copies are its redundancy. At 70%
+// loss on our uplink, one gets to the relay 30% of the time, three 66%, and
+// the relay resends what it has until the contact acks it. To someone who
+// hasn't added us (no admission tag yet), just once: those share a small
+// queue at the relay with everyone else's first requests.
+const SETUP_COPIES: usize = 3;
 
 // Connection requests from people who aren't contacts (see
 // `Client::connection_requests`): how long one is listed, and how many new
@@ -394,6 +428,13 @@ pub struct SymmetricSessionState {
     /// The peer's chat payloads that can't be decrypted until a PQ inject
     /// still on its way arrives (see `ParkedPayloads`).
     pub parked: transport::ParkedPayloads,
+    /// Our latest PQ refreshes on this session, as the signed 0x05 payloads
+    /// we sent, by the position they apply at: if one never reaches the
+    /// peer, it asks for it (see `Client::pq_inject_requests`) and gets it
+    /// again, as only its Kyber ciphertext can bring their receive chain
+    /// back in step with our send chain. Nothing secret: the ciphertext is
+    /// for their key. The latest `KEPT_PQ_INJECTS`.
+    pub sent_pq_injects: BTreeMap<u64, Vec<u8>>,
 }
 
 /// PQ refreshes received from the peer, tracked by the position the sender
@@ -456,6 +497,7 @@ impl SymmetricSessionState {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: BTreeMap::new(),
         }
     }
 
@@ -582,6 +624,15 @@ impl SymmetricSessionState {
     /// Mix fresh PQ shared secret into the send chain key via HKDF (called by sender)
     pub fn inject_pq_secret_send(&mut self, pq_secret_bytes: &[u8]) {
         mix_pq_secret(&mut self.send_chain_key, pq_secret_bytes);
+    }
+
+    /// Keep the refresh we mixed in at `applies_at` (its signed 0x05
+    /// payload), to send again if asked (see `sent_pq_injects`).
+    fn keep_sent_pq_inject(&mut self, applies_at: u64, payload: Vec<u8>) {
+        self.sent_pq_injects.insert(applies_at, payload);
+        while self.sent_pq_injects.len() > KEPT_PQ_INJECTS {
+            self.sent_pq_injects.pop_first();
+        }
     }
 }
 
@@ -790,6 +841,55 @@ pub struct Client {
     listed_requests: VecDeque<Instant>,
     /// Whose requests were dismissed ("Not now"), and when. Live state.
     dismissed_requests: HashMap<RoutingToken, Instant>,
+    /// When to next ask each contact we're holding messages from for the
+    /// PQ refresh they need (see `pq_inject_requests`). Live state.
+    pq_inject_asks: HashMap<RoutingToken, PqInjectAsk>,
+    /// When we last sent each contact refreshes they asked for again (see
+    /// `MIN_PQ_RESEND_GAP`). Live state.
+    pq_resent_at: HashMap<RoutingToken, Instant>,
+    /// Packets to send along with what a call returned: the further copies
+    /// of setup packets (see `SETUP_COPIES`), and refreshes a contact asked
+    /// for again. `handle_relay_packet` and `keepalive` send them after
+    /// their own; a front end sending what `add_contact` or
+    /// `repair_session` returned sends `take_extra_packets` too. Live state.
+    extra_replies: Vec<Vec<u8>>,
+    /// What we've sent again, and received twice (see `Retransmissions`).
+    /// Live state.
+    retransmissions: Retransmissions,
+    /// How much of our traffic with the relay is being lost (see
+    /// `link_quality`). Live state.
+    link_quality: link_quality::LinkQuality,
+}
+
+/// What this client has had to send again, and what reached it twice,
+/// since it started: for a front end's network stats (see
+/// `Client::retransmissions`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Retransmissions {
+    /// KeyExchanges sent again to contacts still setting up a session (see
+    /// `setup_resends`).
+    pub contact_setup: u64,
+    /// Times the link to the relay was set up again after it went quiet
+    /// (see `keepalive`).
+    pub reconnects: u64,
+    /// Requests for PQ refreshes that never arrived (see
+    /// `pq_inject_requests`), each counted once however many copies.
+    pub pq_requests: u64,
+    /// PQ refreshes sent again because a contact asked for them.
+    pub pq_resends: u64,
+    /// Messages sent again by hand after the relay didn't confirm them
+    /// (see `note_message_retry`).
+    pub message_retries: u64,
+    /// Packets the relay delivered again because our ack didn't reach it,
+    /// recognised and skipped.
+    pub duplicates_received: u64,
+}
+
+/// When `Client::pq_inject_requests` next asks a contact for a PQ refresh,
+/// and how long it waits after that.
+struct PqInjectAsk {
+    at: Instant,
+    delay: Duration,
 }
 
 /// Where a new identity's add-ID counter starts (see `AddIds`): somewhere
@@ -844,6 +944,11 @@ impl Client {
             connection_requests: Vec::new(),
             listed_requests: VecDeque::new(),
             dismissed_requests: HashMap::new(),
+            pq_inject_asks: HashMap::new(),
+            pq_resent_at: HashMap::new(),
+            extra_replies: Vec::new(),
+            retransmissions: Retransmissions::default(),
+            link_quality: Default::default(),
         }
     }
 
@@ -925,6 +1030,36 @@ impl Client {
         }
     }
 
+    /// Throw away our E2E session with the contact `token` and set up a new
+    /// one, for when it has broken (say a lost PQ inject has left one side
+    /// unable to decrypt). Returns the KeyExchange to send them. The contact
+    /// stays, with their name and chat history; only the session goes.
+    ///
+    /// It works as removing and re-adding them would: the KeyExchange
+    /// carries a new add ID (see `AddIds`), so they drop their side of the
+    /// old session when it arrives (see `set_their_add_id`), and the two of
+    /// us set up a fresh one, PQ keys and all, the usual way. Either side
+    /// can do it. Messages held for one sent before them are handed over
+    /// first; anything else still in flight on the old session is lost.
+    pub fn repair_session(&mut self, token: RoutingToken) -> Result<Vec<u8>> {
+        if !self.pending_contacts.contains_key(&token) {
+            return Err(anyhow!("That's not one of your contacts."));
+        }
+        self.hand_over_held(&token);
+        self.e2e_sessions.remove(&token);
+        self.session_setups.remove(&token);
+        self.reassembler.forget(&token);
+        let mine = self.next_add_id;
+        self.next_add_id = self.next_add_id.saturating_add(1);
+        self.add_ids.entry(token).or_default().mine = mine;
+        self.setup_retries.insert(
+            token,
+            SetupRetry::starting(Instant::now(), FIRST_SETUP_RETRY),
+        );
+        self.save();
+        Ok(self.create_kx_request(token))
+    }
+
     /// Persist identity/session state to `identity_store` if one is
     /// attached (the SQLCipher-encrypted path), otherwise fall back to the
     /// legacy plaintext `client_state.json` at `state_path` — mirrors how
@@ -997,6 +1132,8 @@ impl Client {
             self.link.keys(),
             self.admission_tags_in(),
         );
+        // The relay answers it, which measures the link (see `link_quality`).
+        self.link_quality.request_sent(Instant::now());
         self.link.seal(Lane::Direct, TYPE_SYNC, &sync.to_bytes())
     }
 
@@ -1054,6 +1191,7 @@ impl Client {
             if link_gone {
                 if self.pending_handshake.is_none() {
                     println!(">> The relay stopped answering; reconnecting...");
+                    self.retransmissions.reconnects += 1;
                 }
                 let (secret, packet) = self.generate_handshake_packet();
                 self.pending_handshake = Some((secret, now));
@@ -1062,6 +1200,7 @@ impl Client {
         }
         let mut out = self.sync_packets();
         out.extend(self.setup_resends(now));
+        out.append(&mut self.extra_replies);
         out
     }
 
@@ -1090,6 +1229,7 @@ impl Client {
         println!(">> Reconnected to the relay.");
         let mut out = self.sync_packets();
         out.extend(self.setup_resends(Instant::now()));
+        out.append(&mut self.extra_replies);
         out
     }
 
@@ -1100,6 +1240,20 @@ impl Client {
     ) -> Vec<u8> {
         let tag = self.admission_tag_for(&target_token);
         self.wrap_data(Lane::Direct, target_token, tag.as_ref(), inner_payload)
+    }
+
+    /// A setup packet (KeyExchange or SessionEstablish) for `target`, sealed
+    /// on our link: the first copy, with the rest (see `SETUP_COPIES`) in
+    /// `extra_replies`, if they've added us.
+    fn wrap_setup(&mut self, target: RoutingToken, inner: &[u8]) -> Vec<u8> {
+        let first = self.wrap_link_encryption(target, inner);
+        if self.admission_tag_for(&target).is_some() {
+            for _ in 1..SETUP_COPIES {
+                let copy = self.wrap_link_encryption(target, inner);
+                self.extra_replies.push(copy);
+            }
+        }
+        first
     }
 
     /// `inner_payload` for `target_token`, sealed on our link in `lane`,
@@ -1244,9 +1398,54 @@ impl Client {
             retry.delay = (retry.delay * 2).min(MAX_SETUP_RETRY_DELAY);
             due.push(token);
         }
+        self.retransmissions.contact_setup += due.len() as u64;
         due.into_iter()
             .map(|token| self.create_kx_request(token))
             .collect()
+    }
+
+    /// What we've had to send again, and what reached us twice, so far (see
+    /// `Retransmissions`).
+    pub fn retransmissions(&self) -> Retransmissions {
+        self.retransmissions
+    }
+
+    /// A front end has sent a message again by hand, as the relay didn't
+    /// confirm the first try: count it (see `Retransmissions`).
+    pub fn note_message_retry(&mut self) {
+        self.retransmissions.message_retries += 1;
+    }
+
+    /// Whether we're setting up a new link to the relay, after it went
+    /// quiet (see `keepalive`).
+    pub fn reconnecting(&self) -> bool {
+        self.pending_handshake.is_some()
+    }
+
+    /// When we last heard from the relay, in Unix milliseconds.
+    pub fn last_heard_from_relay_ms(&self) -> u64 {
+        self.last_heard_ms
+    }
+
+    /// The estimated share of packets lost each way between us and the
+    /// relay over the last 10 s, or `None` when too little went either way
+    /// to tell (see `link_quality`).
+    pub fn link_loss(&self) -> Option<Loss> {
+        self.link_quality.estimate(Instant::now())
+    }
+
+    /// Whether the network is unstable enough to warn about: 90% or more
+    /// lost either way over the last 10 s, until it's below 88% again (see
+    /// `link_quality`). Asking also has `receipt_requests` probe the link
+    /// for a few seconds, so there's something to measure.
+    pub fn unstable_network(&mut self) -> bool {
+        self.link_quality.unstable(Instant::now())
+    }
+
+    /// The packets `extra_replies` holds, for a front end to send after
+    /// what `add_contact` or `repair_session` returned.
+    pub fn take_extra_packets(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.extra_replies)
     }
 
     /// `peer` has sent us something that moved our setup with them on:
@@ -1388,7 +1587,7 @@ impl Client {
         );
         let mut inner = vec![0x02];
         inner.extend_from_slice(&payload.to_bytes());
-        self.wrap_link_encryption(target_token, &inner)
+        self.wrap_setup(target_token, &inner)
     }
 
     /// Whether we're the one of the two contacts who sends the
@@ -1469,7 +1668,7 @@ impl Client {
         );
         let mut inner = vec![0x04];
         inner.extend_from_slice(&est.to_bytes());
-        Some(self.wrap_link_encryption(*peer, &inner))
+        Some(self.wrap_setup(*peer, &inner))
     }
 
     /// `peer` has the session we offered them: stop offering it, and start
@@ -1586,6 +1785,59 @@ impl Client {
         }
     }
 
+    /// Ask each contact we're holding messages from (see `ParkedPayloads`)
+    /// for the PQ refreshes those messages need, when that's due: first
+    /// `FIRST_PQ_INJECT_ASK` after we start holding them, then less and less
+    /// often, until they decrypt. A refresh travels once, in the burst of
+    /// the message that triggered it, so if that burst is lost, this is the
+    /// only way it comes again; without it, nothing from them would decrypt
+    /// again on this session. Returns the packets to send. Call it a few
+    /// times a second.
+    pub fn pq_inject_requests(&mut self) -> Vec<Vec<u8>> {
+        self.pq_inject_requests_at(Instant::now())
+    }
+
+    fn pq_inject_requests_at(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        // Who we're holding messages from: from our receive position to the
+        // furthest message held.
+        let waiting: Vec<(RoutingToken, u64, u64)> = self
+            .e2e_sessions
+            .iter()
+            .filter_map(|(token, session)| {
+                let through = *session.parked.0.keys().next_back()?;
+                Some((*token, session.recv_count, through))
+            })
+            .collect();
+        self.pq_inject_asks
+            .retain(|token, _| waiting.iter().any(|(waiting, ..)| waiting == token));
+        let mut packets = Vec::new();
+        for (token, from, through) in waiting {
+            let ask = self.pq_inject_asks.entry(token).or_insert(PqInjectAsk {
+                at: now + FIRST_PQ_INJECT_ASK,
+                delay: FIRST_PQ_INJECT_ASK,
+            });
+            if now < ask.at {
+                continue;
+            }
+            ask.delay = (ask.delay * 2).min(MAX_PQ_INJECT_ASK_DELAY);
+            ask.at = now + ask.delay;
+            let binding = self.e2e_sessions[&token].pq_inject_binding();
+            let request =
+                PQInjectRequestPayload::generate(&self.identity, token, from, through, &binding);
+            let mut inner = vec![0x08];
+            inner.extend_from_slice(&request.to_bytes());
+            println!(
+                ">> [PQ] Holding messages from {} for a post-quantum refresh that hasn't arrived: asking for it again.",
+                short(&token)
+            );
+            for _ in 0..PQ_RECOVERY_COPIES {
+                packets.push(self.wrap_link_encryption(token, &inner));
+            }
+            self.retransmissions.pq_requests += 1;
+        }
+        packets
+    }
+
     /// Ask the relay which of the messages we sent it has, when that's due,
     /// and give up on any it hasn't confirmed within `CONFIRM_TIMEOUT`.
     /// Returns the packets to send. Call it a few times a second.
@@ -1594,11 +1846,18 @@ impl Client {
         for message in self.confirmations.expire(now) {
             self.settle(message, SendStatus::Failed);
         }
-        if !self.confirmations.request_due(now) {
-            return Vec::new();
-        }
-        (0..REQUEST_COPIES)
-            .map(|_| self.link.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[]))
+        let copies = if self.confirmations.request_due(now) {
+            REQUEST_COPIES
+        } else {
+            // Nothing to ask about, but someone may be watching how much is
+            // being lost: requests to measure by (see `link_quality`).
+            self.link_quality.probes_due(now) as usize
+        };
+        (0..copies)
+            .map(|_| {
+                self.link_quality.request_sent(now);
+                self.link.seal(Lane::Direct, TYPE_RECEIPT_REQUEST, &[])
+            })
             .collect()
     }
 
@@ -1714,8 +1973,6 @@ impl Client {
             (e2e_payloads, pq_ct)
         };
         // mutable borrow on self.e2e_sessions released
-        self.save();
-        self.record_message(target_token, true, plaintext);
 
         // Phase 2: build the signed PQ inject payload (immutable borrow on self)
         let pq_payload = pq_ct.map(|(applies_at, kyber_ct, binding)| {
@@ -1728,10 +1985,19 @@ impl Client {
             );
             let mut inner = vec![0x05];
             inner.extend_from_slice(&pqi_payload.to_bytes());
-            inner
+            (applies_at, inner)
         });
+        // Kept, and saved along with the ratchet it moved, in case the peer
+        // never gets it and asks again.
+        if let Some((applies_at, inner)) = &pq_payload
+            && let Some(session) = self.e2e_sessions.get_mut(&target_token)
+        {
+            session.keep_sent_pq_inject(*applies_at, inner.clone());
+        }
+        self.save();
+        self.record_message(target_token, true, plaintext);
 
-        Ok((e2e_payloads, pq_payload))
+        Ok((e2e_payloads, pq_payload.map(|(_, inner)| inner)))
     }
 
     /// Whether a signed control payload's timestamp is within
@@ -1805,7 +2071,26 @@ impl Client {
         if packet.first() == Some(&TYPE_HANDSHAKE_RESP) {
             return self.finish_handshake(packet);
         }
-        let Ok((header, plaintext)) = self.link.open(packet) else {
+        let opened = self.link.open(packet);
+        // Every packet from the relay, and every copy of its answers to our
+        // requests, measures how much is being lost (see `link_quality`).
+        // It sends each answer several times as the same packet, so the
+        // link turns the later copies away as replays, but only after
+        // authenticating them: they count too.
+        let authentic = match &opened {
+            Ok((header, _)) => Some(*header),
+            Err(relay_link::LinkError::Replayed) => relay_link::header(packet),
+            Err(_) => None,
+        };
+        if let Some(header) = authentic {
+            self.link_quality.received(
+                Instant::now(),
+                header.session_id,
+                header.packet_number,
+                matches!(header.packet_type, TYPE_SYNC_ACK | TYPE_RECEIPT),
+            );
+        }
+        let Ok((header, plaintext)) = opened else {
             return Vec::new();
         };
         // Authentic, and not a replay: the link is alive.
@@ -1839,11 +2124,13 @@ impl Client {
         let payload = inner.to_vec();
         let needs_ack = delivery_id != [0u8; 16];
         let mut out = Vec::new();
-        if (!needs_ack || self.recent_deliveries.first_time(delivery_id))
-            && let Ok(Some(reply)) = self.handle_incoming_packet(&payload)
-        {
+        let first_time = !needs_ack || self.recent_deliveries.first_time(delivery_id);
+        if !first_time {
+            self.retransmissions.duplicates_received += 1;
+        } else if let Ok(Some(reply)) = self.handle_incoming_packet(&payload) {
             out.push(reply);
         }
+        out.append(&mut self.extra_replies);
         if self.admission_changed {
             out.push(self.generate_sync_packet());
         }
@@ -1985,6 +2272,79 @@ impl Client {
                         }
                     } else {
                         println!(">> PQInject received but sender unknown (not in contacts).");
+                    }
+                }
+                Ok(None)
+            }
+            0x08 => {
+                // PQ inject request: a contact is holding our messages for a
+                // refresh that never reached them (see `pq_inject_requests`).
+                // Signed on this session, so only they can ask.
+                let Ok(request) = PQInjectRequestPayload::from_bytes(pkt_data) else {
+                    return Ok(None);
+                };
+                if !self.is_addressed_to_us("PQ inject request", &request.target_token) {
+                    return Ok(None);
+                }
+                let peer = request.routing_token;
+                let (Some(&peer_ed25519), Some(session)) = (
+                    self.pending_contacts.get(&peer),
+                    self.e2e_sessions.get_mut(&peer),
+                ) else {
+                    return Ok(None);
+                };
+                // Most often one they sent before the session was repaired,
+                // which the relay was still holding: routine, not an alert.
+                if request
+                    .verify(&peer_ed25519, &session.pq_inject_binding())
+                    .is_err()
+                {
+                    println!(
+                        ">> Ignored a PQ inject request from {} that isn't for your current session (sent before a repair?).",
+                        short(&peer)
+                    );
+                    return Ok(None);
+                }
+                // They've mixed in every refresh before `from`: no need to
+                // keep those.
+                let kept_before = session.sent_pq_injects.len();
+                session
+                    .sent_pq_injects
+                    .retain(|&applies_at, _| applies_at >= request.from);
+                let wanted: Vec<Vec<u8>> = session
+                    .sent_pq_injects
+                    .iter()
+                    .filter(|&(&applies_at, _)| applies_at <= request.through)
+                    .map(|(_, payload)| payload.clone())
+                    .collect();
+                if session.sent_pq_injects.len() != kept_before {
+                    self.save();
+                }
+                if self
+                    .pq_resent_at
+                    .get(&peer)
+                    .is_some_and(|at| at.elapsed() < MIN_PQ_RESEND_GAP)
+                {
+                    return Ok(None);
+                }
+                self.pq_resent_at.insert(peer, Instant::now());
+                if wanted.is_empty() {
+                    println!(
+                        ">> [PQ] {} is missing a post-quantum refresh we no longer have. Repair the session.",
+                        short(&peer)
+                    );
+                    return Ok(None);
+                }
+                println!(
+                    ">> [PQ] {} is missing post-quantum refreshes: sending {} again.",
+                    short(&peer),
+                    wanted.len()
+                );
+                self.retransmissions.pq_resends += wanted.len() as u64;
+                for payload in wanted {
+                    for _ in 0..PQ_RECOVERY_COPIES {
+                        let packet = self.wrap_link_encryption(peer, &payload);
+                        self.extra_replies.push(packet);
                     }
                 }
                 Ok(None)
@@ -2457,10 +2817,10 @@ pub async fn perform_handshake(
             if copy > 0 {
                 tokio::time::sleep(HANDSHAKE_COPY_SPACING).await;
             }
-            socket.send_to(&init, client.server_addr).await?;
+            netsim::send_to(socket, &init, client.server_addr).await?;
         }
         loop {
-            match tokio::time::timeout_at(attempt_ends, socket.recv_from(&mut buf)).await {
+            match tokio::time::timeout_at(attempt_ends, netsim::recv_from(socket, &mut buf)).await {
                 Err(_) => break, // this attempt's time is up
                 Ok(Err(_)) => {
                     // A receive error, like an ICMP "port unreachable" while
@@ -2498,7 +2858,7 @@ pub async fn perform_handshake(
     };
     client.complete_handshake(client_secret, server_pub, &reply)?;
     for sync in client.sync_packets() {
-        socket.send_to(&sync, client.server_addr).await?;
+        netsim::send_to(socket, &sync, client.server_addr).await?;
     }
     Ok(())
 }
@@ -2869,6 +3229,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -2881,6 +3242,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         for i in 0..10 {
             let alice_mk = alice_state.symmetric_ratchet();
@@ -2903,6 +3265,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         let mut seen_keys = std::collections::HashSet::new();
         for _ in 0..100 {
@@ -2930,6 +3293,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
             },
         );
         bob.e2e_sessions.insert(
@@ -2945,6 +3309,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
             },
         );
         let (packet, _pq) = alice
@@ -2987,6 +3352,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -3045,6 +3411,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
                 peer_kyber_pub: None, // No Kyber key!
             },
         );
@@ -3083,6 +3450,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -3098,6 +3466,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
                 peer_kyber_pub: Some(alice_kyber_copy),
             },
         );
@@ -3160,6 +3529,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
                 peer_kyber_pub: Some(bob_kyber_copy),
             },
         );
@@ -3207,6 +3577,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         for _ in 0..5 {
             no_pq_state.symmetric_ratchet();
@@ -3518,6 +3889,66 @@ mod tests {
             assert_ne!(session(&e, &r).root_key, old_root, "a new session");
             cleanup(&[&e, &r]);
         }
+    }
+
+    /// One side's session is broken (here: the other side's decrypt state
+    /// is lost) and either side repairs it: both drop the old session, set
+    /// up a new one, and can message each other again, still contacts with
+    /// their names.
+    #[test]
+    fn test_repair_session_replaces_a_broken_session() {
+        for repairer_is_establisher in [true, false] {
+            let (mut e, mut r) = establisher_and_responder();
+            connect(&mut e, &mut r);
+            let old_root = session(&e, &r).root_key;
+            let (repairer, other) = if repairer_is_establisher {
+                (&mut e, &mut r)
+            } else {
+                (&mut r, &mut e)
+            };
+            let other_token = other.identity.routing_token;
+            let repairer_token = repairer.identity.routing_token;
+            repairer.local_name = "repairer".into();
+            // Break it: the other side can no longer decrypt.
+            other
+                .e2e_sessions
+                .get_mut(&repairer_token)
+                .unwrap()
+                .recv_chain_key = [0; 32];
+
+            let kx = repairer.repair_session(other_token).unwrap();
+            exchange(repairer, other, kx);
+            assert_one_session_with_pq_keys(&e, &r);
+            assert_ne!(session(&e, &r).root_key, old_root, "a new session");
+
+            let (repairer, other) = if repairer_is_establisher {
+                (&mut e, &mut r)
+            } else {
+                (&mut r, &mut e)
+            };
+            assert_eq!(
+                other.contact_names.get(&repairer_token).map(String::as_str),
+                Some("repairer")
+            );
+            fn send(from: &mut Client, to: &mut Client, text: &str) {
+                let (packets, _) = from
+                    .create_encrypted_packets(to.identity.routing_token, text.as_bytes())
+                    .unwrap();
+                let inner = strip_link(&packets[0], &from.link.keys().to_relay);
+                to.handle_incoming_packet(&inner).unwrap();
+                assert_eq!(inbox_texts(to), [text]);
+            }
+            send(repairer, other, "there");
+            send(other, repairer, "back");
+            cleanup(&[&e, &r]);
+        }
+    }
+
+    #[test]
+    fn test_repair_session_refuses_someone_not_a_contact() {
+        let (mut alice, bob) = (new_client(), new_client());
+        assert!(alice.repair_session(bob.identity.routing_token).is_err());
+        cleanup(&[&alice, &bob]);
     }
 
     /// One side removes the other, then both add each other again at once.
@@ -4189,6 +4620,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
             },
         );
         let chain_before = bob.e2e_sessions[&alice_id.routing_token].recv_chain_key;
@@ -4238,6 +4670,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4250,6 +4683,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
 
         let mk1 = alice_state.symmetric_ratchet();
@@ -4296,6 +4730,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4308,6 +4743,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
 
         // Receive packet with seq_no 150 (exceeds MAX_SKIP_DICT_ENTRIES of 100)
@@ -4377,6 +4813,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
         let mut bob_state = SymmetricSessionState {
             root_key: [0x42u8; 32],
@@ -4389,6 +4826,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
 
         let mk0 = alice_state.symmetric_ratchet();
@@ -4563,6 +5001,7 @@ mod tests {
                         parked_at_ms: 5678,
                     },
                 )])),
+                sent_pq_injects: BTreeMap::from([(5, vec![0x05, 9, 8])]),
             },
         );
         original
@@ -4624,6 +5063,7 @@ mod tests {
         assert_eq!(orig_sess.recv_count, load_sess.recv_count);
         assert_eq!(orig_sess.skip_dict.len(), load_sess.skip_dict.len());
         assert_eq!(orig_sess.skip_dict[&1], load_sess.skip_dict[&1]);
+        assert_eq!(orig_sess.sent_pq_injects, load_sess.sent_pq_injects);
         assert_eq!(
             orig_sess.recv_pq_injects.pending,
             load_sess.recv_pq_injects.pending
@@ -4679,6 +5119,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
             },
         );
 
@@ -4695,6 +5136,7 @@ mod tests {
                 recv_pq_injects: RecvPqInjects::default(),
                 delivery: Default::default(),
                 parked: Default::default(),
+                sent_pq_injects: Default::default(),
             },
         );
 
@@ -4709,6 +5151,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
 
         let mut charlie_sender = SymmetricSessionState {
@@ -4722,6 +5165,7 @@ mod tests {
             recv_pq_injects: RecvPqInjects::default(),
             delivery: Default::default(),
             parked: Default::default(),
+            sent_pq_injects: Default::default(),
         };
 
         let mut bob_pkts = vec![];
@@ -5316,12 +5760,14 @@ mod tests {
 
         let first = bob.handle_relay_packet(&packet);
         let types: Vec<u8> = first.iter().map(|packet| packet[0]).collect();
+        let reply = relay_link::TYPE_ADMITTED_DATA;
         assert_eq!(
             types,
-            [relay_link::TYPE_ADMITTED_DATA, TYPE_SYNC, TYPE_ACK],
-            "KeyExchange reply (which now carries Alice's admission tag), a sync registering \
-             the one she'll use, then the ack"
+            [reply, reply, reply, TYPE_SYNC, TYPE_ACK],
+            "KeyExchange reply (which now carries Alice's admission tag) in SETUP_COPIES \
+             copies, a sync registering the one she'll use, then the ack"
         );
+        assert_eq!(SETUP_COPIES, 3);
         assert!(
             bob.handle_relay_packet(&packet).is_empty(),
             "a copy of the very same packet isn't taken in at all"
@@ -5329,6 +5775,7 @@ mod tests {
         // The relay seals each resend afresh.
         let resend = bob.handle_relay_packet(&relay_forward(&bob, delivery_id, &kx_inner));
         assert_eq!(resend.len(), 1, "a resend is only acked again");
+        assert_eq!(bob.retransmissions().duplicates_received, 1);
 
         let ack = &resend[0];
         let header = relay_link::header(ack).unwrap();
@@ -5527,11 +5974,87 @@ mod tests {
         let _lost = b.add_contact(ta, a.identity.ed25519_public).unwrap();
         let mut resent = a.setup_resends(Instant::now() + FIRST_SETUP_RETRY);
         assert_eq!(resent.len(), 1);
+        assert_eq!(a.retransmissions().contact_setup, 1);
         exchange(&mut a, &mut b, resent.remove(0));
         assert!(a.is_connected(&tb) && b.is_connected(&ta));
         let later = Instant::now() + MAX_SETUP_RETRY_DELAY;
         assert!(a.setup_resends(later).is_empty() && b.setup_resends(later).is_empty());
         cleanup(&[&a, &b]);
+    }
+
+    /// Setup packets to someone who has added us go out in `SETUP_COPIES`
+    /// copies, each sealed on its own; to someone who hasn't, just once.
+    #[test]
+    fn test_setup_packets_are_copied_only_to_contacts_who_added_us() {
+        let (mut a, mut b) = (new_client(), new_client());
+        let tb = b.identity.routing_token;
+        a.add_contact(tb, b.identity.ed25519_public).unwrap();
+        assert!(a.take_extra_packets().is_empty(), "no admission tag yet");
+
+        // B adds A back, so A has B's keys, and with them an admission tag.
+        let kx = b
+            .add_contact(a.identity.routing_token, a.identity.ed25519_public)
+            .unwrap();
+        a.handle_incoming_packet(&relay(&kx, &b)).unwrap();
+        a.take_extra_packets();
+        let again = a.create_kx_request(tb);
+        let copies = a.take_extra_packets();
+        assert_eq!(copies.len(), SETUP_COPIES - 1);
+        for copy in &copies {
+            assert_ne!(copy, &again, "each copy is sealed on its own");
+            assert_eq!(relay(copy, &a), relay(&again, &a), "the same KeyExchange");
+        }
+        cleanup(&[&a, &b]);
+    }
+
+    /// The relay's answers to our syncs, every copy of them, feed the loss
+    /// estimate (see `link_quality`).
+    #[test]
+    fn test_sync_acks_measure_the_link() {
+        let mut client = new_client();
+        link_with(&mut client, 9, [5, 6, 7, 8]);
+        for number in 0..12 {
+            let sync = client.generate_sync_packet();
+            let acked = relay_link::header(&sync).unwrap().packet_number;
+            // Numbered in order, as the relay numbers what it sends us
+            // (`from_relay`'s numbers are shared by every test, so they'd
+            // look like gaps), and sent `REPLY_COPIES` times as the same
+            // packet: the copies after the first are replays, and count too.
+            let ack = relay_link::seal(
+                &client.link.keys().to_client,
+                TYPE_SYNC_ACK,
+                &client.link.session_id(),
+                number,
+                &relay_link::sync_ack_plaintext(acked),
+            );
+            for _ in 0..relay_link::REPLY_COPIES {
+                client.handle_relay_packet(&ack);
+            }
+        }
+        let loss = client
+            .link_quality
+            .estimate(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert!(loss.sending < 0.01 && loss.receiving < 0.01, "{loss:?}");
+        cleanup(&[&client]);
+    }
+
+    /// While a front end watches the network, an otherwise idle client
+    /// probes the relay with receipt requests, and only then.
+    #[test]
+    fn test_watching_the_network_probes_the_link() {
+        let mut client = new_client();
+        link_with(&mut client, 9, [5, 6, 7, 8]);
+        assert!(client.receipt_requests().is_empty(), "nobody's watching");
+        client.unstable_network();
+        let probes = client.receipt_requests();
+        assert!(!probes.is_empty());
+        for probe in &probes {
+            let header = relay_link::header(probe).unwrap();
+            assert_eq!(header.packet_type, TYPE_RECEIPT_REQUEST);
+        }
+        assert!(client.receipt_requests().is_empty(), "not again so soon");
+        cleanup(&[&client]);
     }
 
     #[test]

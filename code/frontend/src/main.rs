@@ -6,6 +6,7 @@
 // JS runtime to actually be present to succeed.
 mod api;
 mod app;
+mod back_button;
 mod contact_code;
 mod qr;
 

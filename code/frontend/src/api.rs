@@ -71,6 +71,10 @@ pub struct ContactDto {
     pub token: String,
     pub status: String,
     pub name: Option<String>,
+    /// When the latest message with them was recorded (Unix milliseconds):
+    /// the list comes newest first.
+    #[serde(default)]
+    pub last_message_ms: Option<i64>,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -216,6 +220,12 @@ pub async fn remove_contact(token_hex: &str) -> Result<(), String> {
     call("remove_contact", &RemoveContactArgs { token_hex }).await
 }
 
+/// Replace a broken session with a contact with a new one, keeping the
+/// contact and chat history (see `repair_session` in commands.rs).
+pub async fn repair_session(token_hex: &str) -> Result<(), String> {
+    call("repair_session", &RemoveContactArgs { token_hex }).await
+}
+
 /// Mirrors `ConnectionRequestsDto` in `src-tauri/src/commands.rs`.
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct ConnectionRequestsDto {
@@ -283,6 +293,26 @@ pub async fn set_notify_with_names(on: bool) -> Result<(), String> {
     call("set_notify_with_names", &NotifyWithNamesArgs { on }).await
 }
 
+/// Mirrors `SimulatedLossDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct SimulatedLossDto {
+    /// Percentage of outgoing packets dropped.
+    pub send: u8,
+    /// Percentage of incoming packets dropped.
+    pub receive: u8,
+}
+
+/// The network loss this device is simulating.
+pub async fn simulated_loss() -> Result<SimulatedLossDto, String> {
+    call("simulated_loss", &()).await
+}
+
+/// Drop `send`% of outgoing packets and `receive`% of incoming ones on this
+/// device, until changed or the app closes.
+pub async fn set_simulated_loss(send: u8, receive: u8) -> Result<(), String> {
+    call("set_simulated_loss", &SimulatedLossDto { send, receive }).await
+}
+
 #[derive(Serialize)]
 struct SendMessageArgs<'a> {
     token_hex: &'a str,
@@ -294,6 +324,55 @@ struct SendMessageArgs<'a> {
 /// of this message with the same id `chat_history` would later report.
 pub async fn send_message(token_hex: &str, text: &str) -> Result<SentMessageDto, String> {
     call("send_message", &SendMessageArgs { token_hex, text }).await
+}
+
+#[derive(Serialize)]
+struct RetryMessageArgs<'a> {
+    token_hex: &'a str,
+    id: i64,
+}
+
+/// Send message `id` (its chat-history row id) again, as the relay didn't
+/// confirm it. The failed one leaves the history; returns the new one.
+pub async fn retry_message(token_hex: &str, id: i64) -> Result<SentMessageDto, String> {
+    call("retry_message", &RetryMessageArgs { token_hex, id }).await
+}
+
+/// Mirrors `NetworkStatsDto` in `src-tauri/src/commands.rs`.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct NetworkStatsDto {
+    pub relay: String,
+    /// "connected", "quiet" or "reconnecting".
+    pub status: String,
+    pub last_heard_ms_ago: u64,
+    pub packets_sent: u64,
+    pub packets_send_dropped: u64,
+    pub packets_received: u64,
+    pub packets_receive_dropped: u64,
+    pub contact_setup_resends: u64,
+    pub reconnects: u64,
+    pub pq_requests: u64,
+    pub pq_resends: u64,
+    pub message_retries: u64,
+    pub duplicates_received: u64,
+    /// Estimated share of packets lost each way over the last 10 s, in
+    /// percent, when there's enough to tell.
+    #[serde(default)]
+    pub loss_sending_pct: Option<u8>,
+    #[serde(default)]
+    pub loss_receiving_pct: Option<u8>,
+    /// Nothing came back from the relay at all in those 10 s.
+    #[serde(default)]
+    pub nothing_back: bool,
+    /// Whether to warn of an unstable network (90% or more lost either way).
+    #[serde(default)]
+    pub unstable: bool,
+}
+
+/// The link to the relay, packets to and from it, and what had to be sent
+/// again.
+pub async fn network_stats() -> Result<NetworkStatsDto, String> {
+    call("network_stats", &()).await
 }
 
 pub async fn poll_inbox() -> Result<Vec<IncomingMessageDto>, String> {

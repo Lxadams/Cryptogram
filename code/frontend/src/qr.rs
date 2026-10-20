@@ -446,7 +446,7 @@ mod tests {
 
     /// Rasterises `data` as a QR code the way a camera frame would present
     /// it (4px modules, white quiet zone), then checks the decoder reads
-    /// the same string back — i.e. what "Present QR code" draws is what
+    /// the same string back — i.e. what "Show QR code" draws is what
     /// "Scan QR code" understands.
     #[test]
     fn decoder_reads_back_what_the_encoder_draws() {

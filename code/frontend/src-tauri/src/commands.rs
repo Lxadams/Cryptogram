@@ -7,9 +7,9 @@
 use crate::background;
 use crate::state::{AppState, ClientRuntime, PendingIdentity};
 use client::{
-    derive_vault_key, hash_passcode, parse_routing_token, parse_verifying_key, perform_handshake,
-    BurstSender, ChatHistory, Client, ClientStateDto, ContactStatus, IdentityStateStore,
-    RoutingToken, SendStatus,
+    derive_vault_key, hash_passcode, netsim, parse_routing_token, parse_verifying_key,
+    perform_handshake, BurstSender, ChatHistory, Client, ClientStateDto, ContactStatus,
+    IdentityStateStore, RoutingToken, SendStatus,
 };
 use serde::Serialize;
 use std::{
@@ -790,6 +790,9 @@ pub struct ContactDto {
     /// The display name this contact chose for themselves, learned from
     /// their KeyExchange (see `Client::contact_names`), if they set one.
     pub name: Option<String>,
+    /// When the latest message with them, sent or received, was recorded
+    /// (Unix milliseconds), or `None` if there's none yet.
+    pub last_message_ms: Option<i64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1010,14 +1013,16 @@ fn spawn_keepalive_loop(
             let server_addr = rt.client.server_addr;
             drop(guard);
             for packet in packets {
-                let _ = socket.send_to(&packet, server_addr).await;
+                let _ = netsim::send_to(&socket, &packet, server_addr).await;
             }
         }
     })
 }
 
 /// Background task, twice a second: ask the relay which of our messages it
-/// has (see `Client::receipt_requests`), and hand over any message held for
+/// has (see `Client::receipt_requests`), ask contacts for any PQ refresh we're
+/// holding their messages for (see `Client::pq_inject_requests`), and hand
+/// over any message held for
 /// one sent before it that has waited long enough (see
 /// `Client::release_held_messages`), with a notification, as the receive
 /// loop would have if a packet had come in.
@@ -1034,11 +1039,12 @@ fn spawn_tick_loop(app: AppHandle, socket: Arc<UdpSocket>) -> tauri::async_runti
             let inbox_before = rt.client.inbox.len();
             rt.client.release_held_messages();
             notify_new_messages(&rt.client, inbox_before);
-            let packets = rt.client.receipt_requests();
+            let mut packets = rt.client.receipt_requests();
+            packets.extend(rt.client.pq_inject_requests());
             let server_addr = rt.client.server_addr;
             drop(guard);
             for packet in packets {
-                let _ = socket.send_to(&packet, server_addr).await;
+                let _ = netsim::send_to(&socket, &packet, server_addr).await;
             }
         }
     })
@@ -1067,7 +1073,7 @@ fn spawn_receive_loop(
         let state = app.state::<AppState>();
         let mut buf = [0u8; 4096];
         loop {
-            let len = match socket.recv_from(&mut buf).await {
+            let len = match netsim::recv_from(&socket, &mut buf).await {
                 Ok((len, _addr)) => len,
                 // Back off briefly rather than spinning a core if the
                 // socket keeps erroring (e.g. repeated ICMP "port
@@ -1086,7 +1092,7 @@ fn spawn_receive_loop(
             let replies = rt.client.handle_relay_packet(&buf[..len]);
             notify_new_messages(&rt.client, inbox_before);
             for packet in replies {
-                let _ = socket.send_to(&packet, rt.client.server_addr).await;
+                let _ = netsim::send_to(&socket, &packet, rt.client.server_addr).await;
             }
         }
     })
@@ -1110,12 +1116,18 @@ fn notification_sender(client: &Client, from: &RoutingToken) -> Option<String> {
 /// — everyone the UI should show in the contact list, with a status badge
 /// for which stage they're at (see `ContactDto::status`): "established"
 /// only once both sides have the session (see `Client::is_connected`).
+/// Newest conversation first (see `ContactDto::last_message_ms`).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>, String> {
     let guard = state.runtime.lock().await;
     let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
 
     let client = &rt.client;
+    let latest = client
+        .history
+        .as_ref()
+        .and_then(|history| history.latest_per_contact().ok())
+        .unwrap_or_default();
     let tokens: HashSet<&RoutingToken> = client
         .pending_contacts
         .keys()
@@ -1132,11 +1144,17 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>
             }
             .to_string(),
             name: client.contact_names.get(token).cloned(),
+            last_message_ms: latest.get(token).copied(),
         })
         .collect();
-    // A stable order (by name, then token) so the list doesn't reshuffle
-    // between polls — hash-map iteration order is arbitrary.
-    contacts.sort_by(|a, b| (&a.name, &a.token).cmp(&(&b.name, &b.token)));
+    // Whoever messaged (or was messaged) most recently first, then those
+    // with no messages yet, by name then token. Stable between polls, as
+    // hash-map iteration order is arbitrary.
+    contacts.sort_by(|a, b| {
+        b.last_message_ms
+            .cmp(&a.last_message_ms)
+            .then_with(|| (&a.name, &a.token).cmp(&(&b.name, &b.token)))
+    });
 
     Ok(contacts)
 }
@@ -1164,10 +1182,13 @@ pub async fn connect_to_peer(
         .client
         .add_contact(token, peer_ed25519)
         .map_err(|e| e.to_string())?;
-    rt.socket
-        .send_to(&req_packet, rt.client.server_addr)
+    netsim::send_to(&rt.socket, &req_packet, rt.client.server_addr)
         .await
         .map_err(|e| e.to_string())?;
+    // Its further copies (see `Client::take_extra_packets`).
+    for packet in rt.client.take_extra_packets() {
+        let _ = netsim::send_to(&rt.socket, &packet, rt.client.server_addr).await;
+    }
 
     Ok(())
 }
@@ -1248,6 +1269,113 @@ pub async fn set_notify_with_names(state: State<'_, AppState>, on: bool) -> Resu
     Ok(())
 }
 
+/// What `network_stats` reports: the link to the relay, packets to and from
+/// it, and what had to be sent again (see `client::Retransmissions`).
+#[derive(Serialize, Clone)]
+pub struct NetworkStatsDto {
+    /// The relay's address.
+    pub relay: String,
+    /// "connected", "quiet" (nothing heard from the relay for a while, so
+    /// the link may be gone) or "reconnecting".
+    pub status: String,
+    /// How long since we last heard from the relay, in milliseconds.
+    pub last_heard_ms_ago: u64,
+    /// Packets since the app started (see `client::netsim::PacketCounts`).
+    pub packets_sent: u64,
+    pub packets_send_dropped: u64,
+    pub packets_received: u64,
+    pub packets_receive_dropped: u64,
+    pub contact_setup_resends: u64,
+    pub reconnects: u64,
+    pub pq_requests: u64,
+    pub pq_resends: u64,
+    pub message_retries: u64,
+    pub duplicates_received: u64,
+    /// Estimated share of packets lost each way over the last 10 s, in
+    /// percent, or `None` when too little went either way to tell (see
+    /// `Client::link_loss`).
+    pub loss_sending_pct: Option<u8>,
+    pub loss_receiving_pct: Option<u8>,
+    /// Nothing came back from the relay at all in those 10 s.
+    pub nothing_back: bool,
+    /// Whether to warn of an unstable network: 90% or more lost either way
+    /// (see `Client::unstable_network`).
+    pub unstable: bool,
+}
+
+/// Silence from the relay longer than this shows as "quiet": the client
+/// syncs every 15s and the relay acks each one, so this is two missed.
+const QUIET_AFTER_MS: u64 = 40_000;
+
+/// The network stats the app shows (see `NetworkStatsDto`).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn network_stats(state: State<'_, AppState>) -> Result<NetworkStatsDto, String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+    let unstable = rt.client.unstable_network();
+    let loss = rt.client.link_loss();
+    let client = &rt.client;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let last_heard_ms_ago = now_ms.saturating_sub(client.last_heard_from_relay_ms());
+    let status = if client.reconnecting() {
+        "reconnecting"
+    } else if last_heard_ms_ago > QUIET_AFTER_MS {
+        "quiet"
+    } else {
+        "connected"
+    };
+    let packets = netsim::packet_counts();
+    let resent = client.retransmissions();
+    Ok(NetworkStatsDto {
+        relay: client.server_addr.to_string(),
+        status: status.to_string(),
+        last_heard_ms_ago,
+        packets_sent: packets.sent,
+        packets_send_dropped: packets.send_dropped,
+        packets_received: packets.received,
+        packets_receive_dropped: packets.receive_dropped,
+        contact_setup_resends: resent.contact_setup,
+        reconnects: resent.reconnects,
+        pq_requests: resent.pq_requests,
+        pq_resends: resent.pq_resends,
+        message_retries: resent.message_retries,
+        duplicates_received: resent.duplicates_received,
+        loss_sending_pct: loss.map(|l| (l.sending * 100.0).round() as u8),
+        loss_receiving_pct: loss.map(|l| (l.receiving * 100.0).round() as u8),
+        nothing_back: loss.is_some_and(|l| l.nothing_back),
+        unstable,
+    })
+}
+
+/// What `simulated_loss` reports: the percentage of packets this device
+/// drops on purpose in each direction (see `client::netsim`).
+#[derive(Serialize, Clone)]
+pub struct SimulatedLossDto {
+    pub send: u8,
+    pub receive: u8,
+}
+
+/// The simulated network loss on this device (see `client::netsim`).
+#[tauri::command(rename_all = "snake_case")]
+pub fn simulated_loss() -> SimulatedLossDto {
+    let (send, receive) = netsim::loss();
+    SimulatedLossDto { send, receive }
+}
+
+/// Drop `send`% of outgoing packets and `receive`% of incoming ones, to
+/// test on a bad connection without making the relay lossy for everyone.
+/// Lasts until changed or the app closes.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_simulated_loss(send: u8, receive: u8) -> Result<(), String> {
+    if send > 100 || receive > 100 {
+        return Err("Loss is a percentage, from 0 to 100".into());
+    }
+    netsim::set_loss(send, receive);
+    Ok(())
+}
+
 /// Stop listing a connection request ("Not now"), and don't list another
 /// from them for a day (see `Client::dismiss_connection_request`).
 #[tauri::command(rename_all = "snake_case")]
@@ -1279,6 +1407,28 @@ pub async fn remove_contact(state: State<'_, AppState>, token_hex: String) -> Re
     Ok(())
 }
 
+/// Throw away the E2E session with a contact and set up a new one, for
+/// when it has broken, e.g. one side can't decrypt the other's messages
+/// any more (see `Client::repair_session`). Keeps the contact and the chat
+/// history; the contact shows as connecting until the new session is up.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn repair_session(state: State<'_, AppState>, token_hex: String) -> Result<(), String> {
+    let mut guard = state.runtime.lock().await;
+    let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
+
+    let token = parse_token(&token_hex)?;
+
+    let kx_packet = rt.client.repair_session(token).map_err(|e| e.to_string())?;
+    netsim::send_to(&rt.socket, &kx_packet, rt.client.server_addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Its further copies (see `Client::take_extra_packets`).
+    for packet in rt.client.take_extra_packets() {
+        let _ = netsim::send_to(&rt.socket, &packet, rt.client.server_addr).await;
+    }
+    Ok(())
+}
+
 /// Encrypt and send an E2E message to an already-established session, as a
 /// burst of FEC packets sized to survive heavy loss (see `client`'s
 /// `create_fec_packets`/`BurstSender`). A long message's chunks, and the PQ
@@ -1300,10 +1450,55 @@ pub async fn send_message(
     token_hex: String,
     text: String,
 ) -> Result<SentMessageDto, String> {
+    let token = parse_token(&token_hex)?;
+    send_text(&state, token, &text).await
+}
+
+/// Send a message the relay didn't confirm (a "!") again, as a new message,
+/// and take the failed one out of the chat history so it isn't there twice.
+/// Returns the new one, as `send_message` does. If the first try reached
+/// the contact after all, they get it twice.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn retry_message(
+    state: State<'_, AppState>,
+    token_hex: String,
+    id: i64,
+) -> Result<SentMessageDto, String> {
+    let token = parse_token(&token_hex)?;
+    let text = {
+        let guard = state.runtime.lock().await;
+        let rt = guard.as_ref().ok_or("Not connected to relay yet")?;
+        let history = rt.client.history.as_ref().ok_or("No chat history")?;
+        match history.message(id).map_err(|e| e.to_string())? {
+            Some((contact, message))
+                if contact == token
+                    && message.from_me
+                    && message.status == Some(SendStatus::Failed) =>
+            {
+                message.text
+            }
+            _ => return Err("That message can't be sent again.".into()),
+        }
+    };
+    let sent = send_text(&state, token, &text).await?;
+    let mut guard = state.runtime.lock().await;
+    if let Some(rt) = guard.as_mut() {
+        rt.client.note_message_retry();
+        if let Some(history) = &rt.client.history {
+            history.delete(id).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(sent)
+}
+
+/// `send_message`'s work, shared with `retry_message`.
+async fn send_text(
+    state: &State<'_, AppState>,
+    token: RoutingToken,
+    text: &str,
+) -> Result<SentMessageDto, String> {
     let mut guard = state.runtime.lock().await;
     let rt = guard.as_mut().ok_or("Not connected to relay yet")?;
-
-    let token = parse_token(&token_hex)?;
 
     let packets = rt
         .client

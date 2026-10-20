@@ -125,8 +125,9 @@ async fn main() -> Result<()> {
     // Background task, twice a second: print any message held for one sent
     // before it that has waited long enough (see
     // `Client::release_held_messages`), whether or not another packet comes
-    // in meanwhile, and ask the relay which of our messages it has (see
-    // `Client::receipt_requests`).
+    // in meanwhile, ask the relay which of our messages it has (see
+    // `Client::receipt_requests`), and ask contacts for any PQ refresh we're
+    // holding their messages for (see `Client::pq_inject_requests`).
     let tick_socket = Arc::clone(&socket);
     let tick_client = Arc::clone(&client);
     tokio::spawn(async move {
@@ -135,7 +136,9 @@ async fn main() -> Result<()> {
             ticker.tick().await;
             let mut c = tick_client.lock().await;
             c.release_held_messages();
-            for packet in c.receipt_requests() {
+            let mut packets = c.receipt_requests();
+            packets.extend(c.pq_inject_requests());
+            for packet in packets {
                 let _ = tick_socket.send_to(&packet, c.server_addr).await;
             }
         }
@@ -144,6 +147,7 @@ async fn main() -> Result<()> {
     println!("Commands:");
     println!("  connect <routing_token_hex> <ed25519_pub_hex>");
     println!("  msg <routing_token_hex> <text...>");
+    println!("  repair <routing_token_hex>");
 
     // Simple stdin REPL: `connect <token> <ed25519>` to start a key
     // exchange with a peer, `msg <token> <text>` to send an E2E message.
@@ -174,7 +178,36 @@ async fn main() -> Result<()> {
                 match c.add_contact(token, bob_ed25519) {
                     Ok(req_packet) => {
                         socket.send_to(&req_packet, server_addr).await.unwrap();
+                        for packet in c.take_extra_packets() {
+                            let _ = socket.send_to(&packet, server_addr).await;
+                        }
                         println!("Sent connection request! They need to connect to you too.");
+                    }
+                    Err(e) => println!("Error: {e}"),
+                }
+            }
+            "repair" => {
+                // A new session with a contact whose one has broken (see
+                // `Client::repair_session`).
+                let token = match parts.get(1).map(|t| parse_routing_token(t)) {
+                    Some(Ok(token)) => token,
+                    Some(Err(e)) => {
+                        println!("Error: {e}");
+                        continue;
+                    }
+                    None => {
+                        println!("Usage: repair <token>");
+                        continue;
+                    }
+                };
+                let mut c = client.lock().await;
+                match c.repair_session(token) {
+                    Ok(packet) => {
+                        let _ = socket.send_to(&packet, server_addr).await;
+                        for packet in c.take_extra_packets() {
+                            let _ = socket.send_to(&packet, server_addr).await;
+                        }
+                        println!("Repairing the session: they'll set up a new one with you.");
                     }
                     Err(e) => println!("Error: {e}"),
                 }

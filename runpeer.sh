@@ -9,6 +9,20 @@
 #   ./runpeer.sh
 #   ...
 #
+# or point it at a relay elsewhere (the deployed one, say), the same way
+# ./build-apk.sh does for the phone app:
+#
+#   ./runpeer.sh -ip 3.24.135.209 -p 443 -pk <hex>
+#
+#   -ip <ip>    the relay's IP or hostname (default: 127.0.0.1)
+#   -p <port>   the relay's UDP port (default: 4430)
+#   -pk <hex>   the relay's "Server Static Pubkey" (default: the local
+#               relay's; required with -ip, as the app refuses any relay
+#               but the one it was given)
+#
+# Each peer takes its own: one can use the deployed relay while another
+# uses the local one.
+#
 # Each window opens on its own login screen — choose a username + passcode
 # there (or pick one you've already used) to select which saved identity
 # this window uses; that's what used to be a `<name>` argument here. See
@@ -16,21 +30,56 @@
 #
 # The first peer started pays the one-time cost of building the app and
 # hosting the Trunk dev server (a minute or two); every peer after that
-# reuses it and starts almost instantly. Requires the relay server to
-# already be running (./runserver.sh in another terminal).
+# reuses it and starts almost instantly. Without -ip, requires the relay
+# server to already be running (./runserver.sh in another terminal).
 #
 # The app checks the relay against the public key it's given in
 # SERVER_PUBKEY, rather than asking the relay for one (see
 # relay_pubkey_hex() in code/frontend/src-tauri/src/commands.rs). For the
 # local relay this script reads it from the relay's identity file; for any
-# other (SERVER_ADDR set), set SERVER_PUBKEY to the "Server Static Pubkey"
-# that relay prints at startup.
+# other, pass -pk (or set SERVER_PUBKEY along with SERVER_ADDR, as
+# runpeer-lan.sh does) with the "Server Static Pubkey" that relay prints at
+# startup.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FRONTEND_DIR="$REPO_ROOT/code/frontend"
 BINARY="$FRONTEND_DIR/src-tauri/target/debug/e2e-messenger"
 DEV_PORT=1420
+
+usage() {
+  echo "usage: $0 [-ip <ip> -pk <pubkey-hex>] [-p <port>]" >&2
+  exit 1
+}
+
+ip=""
+port=""
+pubkey=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -ip) [ $# -ge 2 ] || usage; ip="$2"; shift 2 ;;
+    -p) [ $# -ge 2 ] || usage; port="$2"; shift 2 ;;
+    -pk) [ $# -ge 2 ] || usage; pubkey="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+case "$port" in *[!0-9]*) echo "error: -p needs a port number, not '$port'." >&2; exit 1 ;; esac
+if [ -n "$pubkey" ] && ! [[ "$pubkey" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  echo "error: -pk needs the relay's 64-character hex public key." >&2
+  exit 1
+fi
+if [ -n "$ip" ] && [ -z "$pubkey" ]; then
+  echo "error: -ip needs -pk too: the \"Server Static Pubkey\" that relay prints." >&2
+  exit 1
+fi
+# The flags win over SERVER_ADDR/SERVER_PUBKEY from the environment (which
+# runpeer-lan.sh sets); the app reads both when it starts.
+if [ -n "$ip" ] || [ -n "$port" ]; then
+  export SERVER_ADDR="${ip:-127.0.0.1}:${port:-4430}"
+fi
+if [ -n "$pubkey" ]; then
+  export SERVER_PUBKEY="$pubkey"
+fi
 
 # Needed so `cargo tauri dev`/the built binary can find tauri.conf.json and
 # the Trunk-built frontend assets. Identity storage does NOT depend on this:
@@ -51,6 +100,7 @@ if [ -z "${SERVER_PUBKEY:-}" ]; then
   SERVER_PUBKEY="$(cd "$REPO_ROOT/code/server" && cargo run -q -- --print-pubkey)"
   export SERVER_PUBKEY
 fi
+echo "Relay: ${SERVER_ADDR:-127.0.0.1:4430}"
 
 # VS Code installed as a snap leaks its sandbox environment into its
 # integrated terminal: GTK_PATH, GIO_MODULE_DIR etc. point at libraries under

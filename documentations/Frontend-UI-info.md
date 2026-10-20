@@ -101,7 +101,7 @@ All commands lock `AppState.runtime` (a `tokio::sync::Mutex<Option<ClientRuntime
 | `remove_contact` | `token_hex` | `()` (also deletes that chat's history) | bin icon → "Remove? Yes" |
 | `dismiss_connection_request` | `token_hex` | `()` | "Not now" |
 | `set_connection_requests_muted` | `muted` | `()` | "Mute connection requests" / "Unmute" |
-| `notification_settings` | none | `NotificationSettingsDto` (`posted`, `with_names`) | once, when the identity card mounts |
+| `notification_settings` | none | `NotificationSettingsDto` (`posted`, `with_names`) | once, when the settings section mounts |
 | `set_notify_with_names` | `on` | `()` | Settings checkbox |
 
 Contact `status` is one of three strings: `pending` (we added them, waiting for them to add us), `connecting` (they've added us, session being set up), `established` (can chat).
@@ -130,23 +130,27 @@ There is no router. `App` (`src/app.rs`) holds a few signals and picks a screen 
 | `restoring` | `bool` | `true` until the startup `current_session` call returns. Nothing is drawn while it's true. |
 | `login` | `Option<LoginDto>` | `Some` once `login` succeeds. |
 | `identity` | `Option<IdentityDto>` | `Some` once `bootstrap` succeeds. |
-| `auth_screen` | `Login` / `CreateIdentity` | Which of the two pre-login forms is showing. |
+| `auth_screen` | `Welcome` / `Login` / `CreateIdentity` | Which pre-login screen is showing: the start page, or one of the two forms. |
 | `theme` | `Light` / `Dark` | See §7. |
 
 ```
             app start
                │  current_session()
                ▼
-   ┌──────── login == None ────────┐         login == Some            login == Some
-   │                               │         identity == None         identity == Some
-   │  LoginScreen ⇄ CreateIdentity │ ──────▶ ConnectScreen ─────────▶ MainScreen
-   │      ▲    "Create identity" / │  login()        bootstrap()
-   │      │    "Back to login"     │
-   └──────┼────────────────────────┘
+   ┌──────────── login == None ─────────────┐   login == Some       login == Some
+   │                                        │   identity == None    identity == Some
+   │  WelcomeScreen ──"Sign in"──▶ LoginScreen ⇄ CreateIdentity ──▶ ConnectScreen ──▶ MainScreen
+   │      ▲          "Create identity" /    │  login()          bootstrap()
+   │      │          "Back to login"        │
+   └──────┼─────────────────────────────────┘
           └──────────────── "Log out" (header, any screen past Login) ◀──────────────
 ```
 
-The header is always there: the title, a **Log out** button (only when `login` is `Some`), and the **Light mode / Dark mode** toggle. Log out calls `logout` and clears both `identity` and `login`, so it also works as the way out of a stuck Connect screen.
+The header is always there: the title (kept invisible on the start page, which shows it large), a **Log out** button (only when `login` is `Some`), and the theme toggle: a sun in dark mode and a moon in light mode, the mode it switches to (`SunIcon`, `MoonIcon`). Log out calls `logout`, clears both `identity` and `login` and goes back to the start page, so it also works as the way out of a stuck Connect screen. A session restored at startup goes straight to its screen and skips the start page.
+
+### Start page (`WelcomeScreen`)
+
+The large logo, "Cryptogram" and a **Sign in** button, which goes to Login. It has two logos, `logo-dark.svg` and `logo-light.svg`, and shows the one for the theme (`.logo-for-dark` / `.logo-for-light`). Android's back button from Login or Create Identity comes back here (see `back_button` in §7).
 
 ### Login (`LoginScreen`)
 
@@ -162,7 +166,7 @@ Username, passcode, confirm passcode. The "passcodes match" check is done in the
 
 ### Connect (`ConnectScreen`)
 
-One button. It calls `bootstrap`, shows "Connecting..." while it runs, and shows the error underneath if it fails (relay down, wrong relay key, corrupt state). The relay's address and public key come from `SERVER_ADDR` / `SERVER_PUBKEY`, read at launch or baked in at build time, so there is nothing to type.
+One button. It calls `bootstrap`, shows "Connecting..." while it runs, and moves on to the main screen no sooner than 2 s after the click (`CONNECT_MIN_WAIT`), however fast the relay answers. It shows the error underneath straight away if it fails (relay down, wrong relay key, corrupt state). The relay's address and public key come from `SERVER_ADDR` / `SERVER_PUBKEY`, read at launch or baked in at build time, so there is nothing to type.
 
 ---
 
@@ -182,26 +186,50 @@ One button. It calls `bootstrap`, shows "Connecting..." while it runs, and shows
 
 ```
 MainScreen
-├─ IdentityCard                 your name, "Present QR code", token/key, settings
+├─ NetworkWarning               thin bar while the network is unstable
+├─ IdentityCard                 your name
+├─ QrCodeModal                  your QR code
 ├─ div.columns
-│  ├─ ContactPanel              contact list, add contact, scanner dialog
+│  ├─ div.side-column           scrolls as one
+│  │  ├─ ContactPanel           contact list, "+" menu, manual add and scanner dialogs
+│  │  └─ SettingsPanel          the Settings and Network folds
 │  └─ ChatPanel                 header, transcript, composer
 └─ ConnectionRequestNotice      pop-up when a stranger tries to connect
 ```
 
+### `NetworkWarning`
+
+A thin amber bar across the top of the main screen, above the chat on a phone too, while `network_stats().unstable` is true, so only while **Network stats** is on in Settings. That's when either direction's loss over the last 10 s reaches 90%; it stays until the loss is below 88% again, so it doesn't flicker. It says how much is lost and which way, or that nothing has come back from the relay at all.
+
 ### `IdentityCard`
 
-- Your username and a **Present QR code** button, which opens a `Modal` with the QR for your contact code (§6).
-- A folded **"Show token and key"** section: name, routing token and Ed25519 key as hex, each with a `CopyButton` (copies, shows a tick for 1.2 s). This is the manual alternative to the QR.
-- A folded **Settings** section, shown only where `notification_settings().posted` is true (Android): one checkbox, *"Say who each message is from in notifications"*, off by default.
+Your username. Your QR code is under the contact list's **+** (**Show QR code**).
+
+### `SettingsPanel`
+
+A section of its own after the contact list, holding two folds:
+
+- **Settings:**
+  - **Show token and key,** a fold inside it: name, routing token and Ed25519 key as hex, each with a `CopyButton` (copies, shows a tick for 1.2 s). This is what someone needs to add you by hand.
+  - **Network stats:** a checkbox, off by default and saved per device in `localStorage` (`e2e-messenger-network-stats`). While it's on, `MainScreen` polls `network_stats` every second for the Network fold and `NetworkWarning`, and the poll has the client probe the relay to measure loss (about 4 KB/s, see below). While it's off, or while the page is hidden (`document.hidden`: the app in the background or the screen off), the poll skips `network_stats`, so the probes stop 5 s later. The web view keeps the page's timers running in the background, so without that check it went on probing there.
+  - **Notifications:** where `notification_settings().posted` is true (Android), one checkbox, *"Say who each message is from in notifications"*, off by default.
+- **Network** (`NetworkStats`), updated every second from `MainScreen`'s `network_stats` poll while **Network stats** is on (with it off, the fold says so and shows only the simulated loss):
+  - **The relay:** its address, and its status. It's connected if heard from in the last 40 s, quiet if not, or reconnecting.
+  - **Packets:** sent and received, with any dropped by the simulated loss. These count since the app started.
+  - **Loss, last 10 s:** each way (`client/src/link_quality.rs`). The relay answers every sync and receipt request with 3 copies of one numbered packet, and numbers everything it sends in order. So the answers it sent are those that arrived plus the gaps in the numbering. The receiving side is the copies that arrived out of 3 per answer sent, and the sending side is the answers sent out of the requests sent. While the stats are polled, the client probes with 8 receipt requests a second, so a 10 s window has enough samples. That costs about 4 KB/s, and nothing while the app is in the background. On a real link through the lossy proxy, it read 52/51% at 50% loss each way, 67/64% at 70%, and 86/85% at 85%.
+  - **Retransmissions:** contact-setup resends, reconnects, PQ refreshes asked for and resent, messages retried, and deliveries received twice. These count since login.
+  - **Simulated loss** (`SimulatedLoss`), there whether stats are on or off: a sending and a receiving percentage of packets to drop on this device (`set_simulated_loss`), reset when the app closes. It sits outside the part that redraws every second, so a half-typed value isn't wiped.
 
 ### `ContactPanel`
 
 - **Contact list.** Each row: the contact's name (or the first 8 hex characters of their token until their name arrives), a status badge, and a bin icon with the same inline **"Remove? Yes / No"** confirm as identity delete. `pending` rows add *"Waiting for them to scan your code"*; `connecting` rows add *"They've added you. Connecting..."*. Clicking a row sets `selected`.
 - The list's `<For>` is keyed on `(token, status, name)`, so a row is redrawn when its status or name changes.
-- **Add contact.** Two paths, both ending in the same `connect_to_peer(token, key)` call:
+- **Empty list:** a hint to tap **+**, and that you each add the other.
+- **The + menu,** at the far right of the "Contacts" heading (a `Menu`, like the chat's ⋮):
+  - **Show QR code** opens `QrCodeModal` with the QR for your contact code (§6).
   - **Scan QR code** opens the scanner dialog (`scanning = true`).
-  - Two hex fields and **Send Connection Request** as the fallback.
+  - **Manual add** opens a dialog (`adding_manually = true`) with two hex fields and **Send connection request**. Errors show in the dialog, and it closes once the request is sent.
+  - **Same call:** scanning and adding by hand both end in the same `connect_to_peer(token, key)` call.
 - If requests are muted, a hint with an **Unmute** link.
 
 Both people must add each other. Adding someone only sends them a KeyExchange; they ignore it until they've added you too.
@@ -209,9 +237,9 @@ Both people must add each other. Adding someone only sends them a KeyExchange; t
 ### `ChatPanel`
 
 - Nothing selected: *"Select a contact to start chatting."*
-- Header: a **← Contacts** back button (only visible in the one-column layout) and "Chat with *name*".
+- Header: a **←** back button (only visible in the one-column layout, with the total of new messages from other contacts), the contact's name centred, and a **⋮** menu (`ChatMenu`, hidden while `pending`) holding **Repair session**.
 - A hint while the contact is still `pending` or `connecting`. The composer is still there, but sending fails until the session is established and the backend's error is shown.
-- **Transcript.** One `<p>` per message, `from-me` (right, accent colour) or `from-peer` (left). Under the text: the time (`format_time`: locale time, with the date in front if it isn't today) and, for your own messages, nothing while sending, **✓** once the relay has it, or a red **!** if it didn't confirm in time. Both marks have tooltips.
+- **Transcript.** One `<p>` per message, `from-me` (right, accent colour) or `from-peer` (left). Under the text: the time (`format_time`: locale time, with the date in front if it isn't today) and, for your own messages, a small spinner while sending, **✓** once the relay has it, or a red **!** if it didn't confirm in time, with a retry button next to it. Retrying (`retry_message`) sends the text again as a new message at the bottom and removes the failed one from the history. The marks have tooltips.
 - **Auto-scroll.** A `Memo` tracks only *this* chat's message count; when it changes, the transcript scrolls to the bottom on the next task (after the DOM has updated). Traffic in other chats doesn't move it.
 - **Composer.** Text field plus Send; Enter also sends. See §5 for what `send_now` does.
 
@@ -299,7 +327,7 @@ CG2:<Base45( routing token 16 bytes ‖ Ed25519 public key 32 bytes )>
 
 ### Presenting (`qr::svg_for`)
 
-The `qrcode` crate renders an SVG, always black on white with a quiet zone whatever the theme. `IdentityCard` builds it once and shows it in a wider-than-usual modal.
+The `qrcode` crate renders an SVG, always black on white with a quiet zone whatever the theme. `QrCodeModal` builds it once and shows it in a wider-than-usual modal.
 
 ### Scanning (`qr::QrScanner`)
 
@@ -322,12 +350,13 @@ Camera access per platform: Linux needs code (`enable_camera_for_qr_scanner` in 
 
 One hand-written stylesheet, `style.css` (no framework, no component-scoped CSS).
 
-- **Colours** are CSS custom properties on `:root` (`--bg`, `--panel`, `--sunken`, `--hover`, `--border`, `--text`, `--muted`, `--accent`, `--ok`, `--error`), with one block per theme keyed on `<html data-theme="light|dark">`.
+- **Logo and app icon:** the sources are in `code/frontend/branding/`. `logo-dark.svg` and `logo-light.svg` are the in-app logos, which Trunk copies into the build (`index.html`). `logo-app-icon.svg` is the home-screen icon. On Android, `android-icon-fg.svg` (the grid, shrunk into the safe zone) and `android-icon-bg.svg` make the adaptive icon. To regenerate every icon size after changing them, run `cargo tauri icon ../branding/icon.json` from `src-tauri`. It also writes Windows Store and iOS icons, which nothing here uses and can be deleted.
+- **Colours** are CSS custom properties on `:root` (`--bg`, `--panel`, `--sunken`, `--hover`, `--border`, `--text`, `--muted`, `--accent`, `--ok`, `--info`, `--error`), with one block per theme keyed on `<html data-theme="light|dark">`. They come from the Cryptogram palette, `#164858`, `#EFFBF2`, `#1F8A70` and `#02141A`, plus shades mixed from them. Dark uses `#02141A` behind panels shaded from `#164858`. Light uses `#EFFBF2` behind white panels. Both use `#1F8A70` for buttons and accents.
 - **Theme choice** (`initial_theme` in `app.rs`): the saved value in `localStorage` (`e2e-messenger-theme`) if there is one, else the system's `prefers-color-scheme`, else dark. An `Effect` writes the attribute and saves the choice whenever the toggle flips it.
 - **Page layout:** `body` doesn't scroll. `.app` is a full-height flex column (max width 1100 px); the panels inside scroll on their own, so the composer stays put while the transcript scrolls.
 - **Login / Create / Connect** are a centred column, max 440 px.
-- **Main screen, wide:** a two-column grid, contacts (220–300 px) beside the chat.
-- **Main screen, narrow** (`max-width: 719px`): one column. `MainScreen` adds the class `chat-open` when a contact is selected, and CSS shows *either* the identity card and contact list *or* the chat. The **← Contacts** button sets `selected` back to `None`. No JavaScript-side layout logic is involved.
+- **Main screen, wide:** a two-column grid, the side column (220–300 px: contacts, then the settings section, scrolling as one) beside the chat.
+- **Main screen, narrow** (`max-width: 719px`): one column. `MainScreen` adds the class `chat-open` when a contact is selected, and CSS shows *either* the identity card and the side column (contacts and settings) *or* the chat. The **←** button sets `selected` back to `None`. No JavaScript-side layout logic is involved. Android's back button closes the topmost layer over the contact list (the scanner or manual add, then the QR code, then the chat) and only leaves the app when none is open. `MainActivity` handles every back press by calling `window.__cryptogramBack()`, which `back_button.rs` installs. It runs the newest handler a component registered with `back_button::while_active` that has something open, and returns whether there was one. If there wasn't, back goes on to Android's default, which puts the app in the background. Two simpler ways didn't hold up on a phone. One was a history entry per layer: Chromium marks an entry for the back button to skip when the page adds the next one without a tap, and the web view then says it can't go back. The other was Tauri's back-button listener: Tauri attaches its back handling to the first activity only, so after the app was closed and reopened while still running in the background, back left the app from anywhere.
 - **Touch** (`pointer: coarse`): 16 px text in fields (stops mobile webviews zooming on focus) and bigger tap targets.
 
 ---
@@ -338,7 +367,7 @@ The UI code is identical; what differs is around it (`src-tauri/src/background.r
 
 | Piece | What it does |
 |---|---|
-| `MainActivity.kt` | Sets `FLAG_SECURE` (no screenshots, blank recents thumbnail). Pads the webview by the status bar, navigation bar and **keyboard** insets, so the composer stays visible while typing (done natively because older WebViews report CSS safe-area insets as zero). Asks for notification permission on Android 13+. Starts `NativeBridge`. |
+| `MainActivity.kt` | Allows screen capture (no `FLAG_SECURE`), so the phone can be mirrored for demos. Handles the back button on every activity by asking the page (`window.__cryptogramBack`, see §7). Pads the webview by the status bar, navigation bar and **keyboard** insets, so the composer stays visible while typing (done natively because older WebViews report CSS safe-area insets as zero). Asks for notification permission on Android 13+. Starts `NativeBridge`. |
 | `NativeBridge.kt` | A thread blocks in the JNI call `nextEvent()` and reacts to strings the Rust side emits: `session_started`, `session_ended`, `message`, `message\t<from>`. |
 | `MessageService.kt` | A foreground service that runs while someone is logged in. It does no work; it exists so Android doesn't freeze the process and its UDP socket. Also posts the "N new messages" notification, only when the app isn't on screen, and never with message text. |
 | `background.rs` | The Rust half: `session_started` (from `bootstrap`), `session_ended` (from logout), `message_received` (from the receive and tick loops). No-ops on desktop. |
