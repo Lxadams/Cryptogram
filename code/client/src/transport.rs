@@ -46,7 +46,7 @@ use tokio::time::{Interval, MissedTickBehavior};
 /// sender's uplink or the receiver's downlink) dropping 70% of packets.
 const FEC_DESIGN_LOSS: f64 = 0.7;
 /// Chance a chat message may fail to arrive at `FEC_DESIGN_LOSS`: 1 in
-/// 10,000 (27 packets for a short message).
+/// 10,000 (34 packets for a one-chunk message).
 const MESSAGE_MAX_FAILURE: f64 = 1e-4;
 /// Stricter target for a message carrying a PQ inject: losing one of those
 /// desyncs the ratchet for good, not just one message.
@@ -245,8 +245,10 @@ fn open_symbol(
 }
 
 /// Receive-side FEC state: per-session seal ciphers and half-rebuilt
-/// objects. Transient — never persisted (a restart just drops anything in
-/// flight, which the relay resends, as it isn't acked until rebuilt).
+/// objects. Transient — never persisted: a restart drops anything half
+/// rebuilt. Every symbol is acked to the relay once it's handled, rebuilt
+/// or not, so the relay only resends the ones not yet acked, and a message
+/// cut short this way is rebuilt only if those are enough.
 #[derive(Default)]
 pub struct FecReceiver {
     /// Keyed by (sender, session epoch): object ids are per-session seq

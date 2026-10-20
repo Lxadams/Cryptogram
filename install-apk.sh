@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs an already-built Android APK on a phone over USB, without
-# rebuilding. Build one first with ./runpeer-lan.sh --mobile (or see
-# code/frontend/ANDROID.md).
+# rebuilding. Build one first with ./build-apk.sh (or ./runpeer-lan.sh
+# --mobile, which also installs it; see code/frontend/ANDROID.md).
 #
 #   ./install-apk.sh               # newest debug APK, on the connected phone
 #   ./install-apk.sh path/to.apk   # a specific APK
@@ -40,7 +40,7 @@ done
 if [ -z "$apk" ]; then
   apk="$({ find "$APK_DIR" -name '*debug*.apk' -printf '%T@ %p\n' 2>/dev/null || true; } | sort -n | tail -1 | cut -d' ' -f2-)"
   if [ -z "$apk" ]; then
-    echo "error: no APK under $APK_DIR. Build one first: ./runpeer-lan.sh --mobile" >&2
+    echo "error: no APK under $APK_DIR. Build one first: ./build-apk.sh" >&2
     exit 1
   fi
 fi

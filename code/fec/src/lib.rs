@@ -170,7 +170,8 @@ pub fn packets_for(object_len: usize, loss: f64, max_failure: f64) -> u32 {
 /// Encode `object` into `packets` FEC packets (or the object's source symbol
 /// count, if that's more): the `K` source symbols first, then repair symbols.
 /// `object_id` must be unique among the sender's recent objects to the same
-/// receiver — callers pick it at random.
+/// receiver. The client uses the ratchet position of the message's last
+/// chunk, which is unique within a session.
 pub fn encode(object_id: u32, object: &[u8], packets: u32) -> Result<Vec<Vec<u8>>, FecError> {
     check_object_len(object.len())?;
     if packets > MAX_PACKETS_PER_OBJECT {

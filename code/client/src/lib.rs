@@ -3589,10 +3589,6 @@ mod tests {
     }
 
     // ==========================================
-    // Full 3-Way Handshake Integration Test
-    // ==========================================
-
-    // ==========================================
     // Contact Handshake Tests
     // ==========================================
 
@@ -4746,7 +4742,8 @@ mod tests {
             sent_pq_injects: Default::default(),
         };
 
-        // Receive packet with seq_no 150 (exceeds MAX_SKIP_DICT_ENTRIES of 100)
+        // Receive packet with seq_no 150 (more than 100 ahead, the most the
+        // receive chain looks ahead)
         for _ in 0..151 {
             alice_state.symmetric_ratchet();
         }

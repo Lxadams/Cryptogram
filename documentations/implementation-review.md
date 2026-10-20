@@ -21,6 +21,65 @@ This builds on [cryptographic_security_review.md](cryptographic_security_review.
 | **Low** | Hardening |
 | **Info** | Observation |
 
+## Status, 20 October 2026
+
+Checked against `main` at `52b49d8`. The findings below are as written on 5 October. This table says where each one stands now.
+
+- **Fixed:** the problem is gone.
+- **Mitigated:** the risk is smaller, but the cause is still there.
+- **Open:** unchanged.
+- **Obsolete:** the code it was about is gone.
+- **Still true:** an Info observation that still holds.
+
+**C-1 never landed.** The fix described as "in progress in a separate task" (§1, §6, §13) was not merged. Both chains still start at the root key, and the `0x01` header still isn't bound as AAD. Other changes mitigate it (see the table), but it isn't fixed.
+
+| Finding | Severity | Status | How, or where |
+|---|---|---|---|
+| R-1 Any client can register any routing token | High | Fixed | A routing token is now the hash of an Ed25519 token key (`routing_token_for`). A sync is signed by that key and bound to the link's keys. |
+| R-2 Any client can overwrite a session's link key | High | Fixed | The relay picks session IDs. |
+| R-3 Links expire after 1 h, never re-established | High | Fixed | Expiry is refreshed on use (1 h after last use). Clients re-handshake after 2 min of silence from the relay. Packets stay queued until acked. |
+| R-4 Resources are unbounded | Medium | Fixed | Caps on links, admission tags and queues, a 64 MiB shared budget, and a handshake rate limit per address. Still open: spoofed source addresses get past the per-address limit (a stateless cookie would close this). |
+| R-5 The relay logs metadata | Medium | Fixed | Only startup lines at info. Refused packets at debug. |
+| R-6 Single-shot handshake | Medium | Fixed | Init and reply each sent 3 times. Retries for up to 60 s. Copies of one init get the same reply and link. |
+| R-7 Dummy traffic disabled | Low | Open | Dummy packets exist but nothing sends them. Planned for Stage 3 Phase 1 ([stage-3-roadmap.md](stage-3-roadmap.md)). |
+| R-8 Relay identity key in plaintext JSON | Low | Fixed | `server_identity.json` is written with mode 0600. |
+| R-9 Not mutual authentication | Info | Obsolete | The handshake no longer carries a client key. A client proves its token with the signed sync. |
+| L-1 CLI stores secrets in plaintext | Medium | Open | The CLI's state (`client_state.json`, or `E2E_STATE_FILE`) is still plaintext JSON. The app encrypts at rest. |
+| L-2 CLI never re-syncs | Medium | Fixed | The CLI has the same 15 s keepalive and 500 ms tick as the app. |
+| L-3 Plaintext printed to stdout | Low | Open | Still prints `>> [From …]: text`. On Android debug builds that reaches logcat (tag `E2E`). |
+| L-4 Every send rewrites the whole state | Info | Open | Unchanged. |
+| C-1 Both ratchet directions start from the same key | High | Mitigated | Not fixed (see above). Chat only travels inside `0x07` seals, whose AAD binds sender and recipient. A bundle only accepts the sealing peer's own `0x01`/`0x05`. A packet claiming to be from yourself is dropped. |
+| C-2 Initial forward secrecy depends on long-term keys | Medium | Open | No prekeys yet. |
+| C-3 PQ injections reuse the static KEM key, one direction only | Medium | Open | Stage 3 item 3.1. |
+| C-4 Late PQ injections rejected | High | Fixed | `0x05` carries its chain position (`applies_at`). No freshness check applies to it. |
+| C-5 No recovery from a desynced session | Medium | Fixed | **Repair session** (the app's ⋮ menu, CLI `repair <token>`) sets up a fresh session and keeps the contact and history. For the common cause, a lost PQ injection, the receiver asks again with a signed `0x08` request. |
+| C-6 KeyExchange from strangers auto-accepted | Medium | Fixed | Both people must add each other. A KeyExchange from someone you haven't added is dropped and shown as a connection request. |
+| C-7 Root key not bound to the transcript | Low | Open | Still HKDF over the two shared secrets only, info `pqxdh-root-key`. |
+| C-8 Replay caches cleared wholesale | Low | Obsolete | Both caches are gone. Add IDs (a counter that only goes up) replaced `seen_session_keys`. |
+| C-9 Presence pings can be replayed | Low | Obsolete | Presence (`0x06`) was removed. |
+| C-10 Login/storage cryptography is sound | Info | Still true | Argon2id is now 64 MiB, 3 passes. Identities created before keep their old cost (19 MiB, 2 passes). |
+| P-1 Pre-standard Kyber, not ML-KEM | Low | Fixed | ML-KEM-768 (`libcrux-ml-kem`, behind `client/src/pq.rs`). |
+| F-1 Residual PQ desync | Medium | Fixed | A receiver with parked messages sends a signed `0x08` request, and the sender resends from its latest 20 injections. An older loss needs **Repair session**. |
+| F-2 Fixed redundancy | Low | Open | Every message is still sized for 70% loss. |
+| F-3 Traffic analysis | Low | Open | Packets are padded to fixed sizes. Timing and burst length still show. |
+| F-4 Seal key static per session | Low | Open | Unchanged. |
+| F-5 Random 32-bit object IDs | Low | Fixed | The object ID is the last chunk's `seq_no`, kept apart per session. |
+| F-6 Designed for one jammed side | Info | Still true | Still designed for 70% loss. |
+| W-1 KeyExchange datagram too big for small MTUs | Low | Open | 1,447 bytes with an admission tag, 1,439 without: still over 1,280. Setup copies help with loss, not fragmentation. |
+| W-2 Sizes and timing leak | Low | Mitigated | Padding fixes the sizes. Timing and burst length still show (F-3). |
+| W-3 Session IDs and type byte in clear | Info | Still true | Session IDs are now chosen by the relay. |
+| A-1 `"csp": null` | Low | Open | Unchanged. |
+| A-2 Inbox polled, not pushed | Info | Still true | The main screen still polls every 1 s. |
+| B-1 No Cargo workspace | Low | Open | Each crate still has its own lockfile. |
+| B-2 Windows builds need Strawberry Perl | Info | Still true | The client still builds SQLCipher with vendored OpenSSL. The Linux client image installs `make` and `perl` for the same reason. |
+| B-3 `runchecks.sh` checks only the server, and rewrites | Low | Open | Unchanged. |
+| B-4 Dockerfiles build release binaries per crate | Info | Still true | The client image copies `fec` and `relay-link`, the relay image `relay-link`. The relay binds `0.0.0.0:443/udp` and runs as its own unprivileged user. `deploy.yml` runs it read-only, with no capabilities. |
+
+Also since 5 October:
+- CI also runs `cargo deny check` for each crate, and covers `code/relay-link`.
+- Tests now total 301, all passing: relay-link 13, fec 25, relay 49, client 189, src-tauri 15, frontend 10.
+- §3's wire reference and §11's test table describe the 5 October code. For what changed in the link layer, see [Since this write-up](raptorq-fec-transport.md#since-this-write-up) in the FEC write-up.
+
 ## 1. Executive summary
 
 The cryptographic core is in good shape for a proof of concept:
@@ -34,15 +93,15 @@ The weakest area is **the relay's link and routing layer**. Anyone with a link s
 
 **Top priorities, in order:**
 
-| # | Finding | Severity |
-|---|---|---|
-| 1 | R-1 Any client can register any routing token (traffic hijack) | High |
-| 2 | R-2 Any client can overwrite any session's link key | High |
-| 3 | R-3 Links expire after 1 h with no re-handshake. Queued messages for that client are then dropped. | High |
-| 4 | C-4 Late PQ injections are rejected, which permanently desyncs the session (**fixed**: chain position replaces the freshness check) | High (for the loss goal) |
-| 5 | C-1 Both ratchet directions start from the same chain key (reflection) | High, **fix in progress in a separate task** |
-| 6 | C-6 KeyExchange from strangers is auto-accepted, contradicting the mutual-QR trust model | Medium |
-| 7 | R-5 The relay logs who talks to whom | Medium |
+| # | Finding | Severity | Status, 20 October |
+|---|---|---|---|
+| 1 | R-1 Any client can register any routing token (traffic hijack) | High | Fixed |
+| 2 | R-2 Any client can overwrite any session's link key | High | Fixed |
+| 3 | R-3 Links expire after 1 h with no re-handshake. Queued messages for that client are then dropped. | High | Fixed |
+| 4 | C-4 Late PQ injections are rejected, which permanently desyncs the session (**fixed**: chain position replaces the freshness check) | High (for the loss goal) | Fixed |
+| 5 | C-1 Both ratchet directions start from the same chain key (reflection) | High, **fix in progress in a separate task** | Mitigated. The fix never landed. |
+| 6 | C-6 KeyExchange from strangers is auto-accepted, contradicting the mutual-QR trust model | Medium | Fixed |
+| 7 | R-5 The relay logs who talks to whom | Medium | Fixed |
 
 ## 2. Architecture at a glance
 
@@ -314,13 +373,13 @@ Gaps:
 
 ## 13. Prioritised recommendations
 
-1. **Relay routing integrity (R-1, R-2):** bind tokens and session ids to the client's Ed25519 key. This is small, relay-side work plus a signature on syncs.
-2. **Link lifetime (R-3):** refresh expiry on use, re-handshake from clients, and stop dropping drained messages.
-3. **Late PQ injections (C-4):** exempt `0x05` from the 5-minute freshness window. Without this, offline or jammed recipients lose sessions.
-4. **Finish C-1** (in progress in a separate task).
-5. **Session reset (C-5 / F-1):** one signed control message that lets two clients recover any desync without re-scanning QR codes.
-6. **Contact acceptance (C-6):** answer KeyExchanges only from scanned contacts.
-7. **Relay hygiene (R-4, R-5):** a global memory budget, rate limits, metadata-free logs.
-8. **CLI parity (L-1, L-2):** encrypted state and a keepalive.
-9. **Standards and hardening (P-1, C-2, C-3, C-7):** move to ML-KEM, add prekeys, rotate the KEM key, bind the transcript.
-10. **Loss coverage beyond messaging:** FEC or repetition for the handshake, sync and presence, once those are in scope.
+1. ~~**Relay routing integrity (R-1, R-2):** bind tokens and session ids to the client's Ed25519 key. This is small, relay-side work plus a signature on syncs.~~ Fixed: a token is the hash of a token key, syncs are signed by it, and the relay picks session IDs.
+2. ~~**Link lifetime (R-3):** refresh expiry on use, re-handshake from clients, and stop dropping drained messages.~~ Fixed: expiry is refreshed on use, clients re-handshake, and packets stay queued until acked.
+3. ~~**Late PQ injections (C-4):** exempt `0x05` from the 5-minute freshness window. Without this, offline or jammed recipients lose sessions.~~ Fixed: `0x05` carries its chain position and has no freshness check.
+4. **Finish C-1** (in progress in a separate task). Not done: mitigated only (see the status table).
+5. ~~**Session reset (C-5 / F-1):** one signed control message that lets two clients recover any desync without re-scanning QR codes.~~ Fixed: **Repair session**, and `0x08` requests for a lost PQ injection.
+6. ~~**Contact acceptance (C-6):** answer KeyExchanges only from scanned contacts.~~ Fixed: both people add each other, and strangers show as connection requests.
+7. ~~**Relay hygiene (R-4, R-5):** a global memory budget, rate limits, metadata-free logs.~~ Fixed: caps, a global budget, a handshake rate limit, and only startup lines at info. A stateless cookie against spoofed addresses is still open.
+8. **CLI parity (L-1, L-2):** encrypted state and a keepalive. Partly done: the CLI has the keepalive, but its state is still plaintext.
+9. **Standards and hardening (P-1, C-2, C-3, C-7):** move to ML-KEM, add prekeys, rotate the KEM key, bind the transcript. Partly done: ML-KEM-768 is in. Prekeys, KEM rotation and transcript binding are not.
+10. ~~**Loss coverage beyond messaging:** FEC or repetition for the handshake, sync and presence, once those are in scope.~~ Fixed by repetition: the handshake init and reply go 3 times with retries, syncs 3 times, and setup packets 3 times to a contact who has added you, with a 10 s first resend. Presence was removed.

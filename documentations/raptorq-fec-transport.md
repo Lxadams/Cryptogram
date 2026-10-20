@@ -2,6 +2,23 @@
 
 Branch `claude/raptorq-e2e-integration-2c36af`, 5 October 2026. Companion document: [implementation-review.md](implementation-review.md), a review of the whole system as it now stands.
 
+## Since this write-up
+
+Status on 20 October 2026, `main` at `52b49d8`. The sections below are as written on 5 October, and their measurements and test tables are from that branch. What has changed since:
+
+| Area | In this write-up | Now |
+|---|---|---|
+| Link layer (§4) | XChaCha20-Poly1305 with a 24-byte nonce: 61 bytes per packet, counting the recipient token | ChaCha20-Poly1305. The packet number is the nonce, and the 13-byte header (type, session ID, packet number) is authenticated as AAD: 29 bytes of overhead, or 45 counting the recipient token as §4.2 does. The relay picks session IDs. |
+| Datagram size (§1, §4.2) | 1,154 bytes | 1,146 bytes phone → relay (with the recipient token and an 8-byte admission tag), 1,138 bytes relay → phone (with a 16-byte delivery ID). Still the same size for every message. |
+| Presence (`0x06`) | Sent once, only to an online recipient | Removed. |
+| Link lifetime (§8) | 7 days from last use; clients never re-handshake | 1 h after last use. Clients re-handshake after 2 min of silence from the relay, or at once after a long sleep. |
+| Lost PQ-carrying burst (§6, §13.1) | The session desyncs, with no recovery | The receiver asks for the injection again with a signed `0x08` request, and the sender resends it from its latest 20. Anything else: **Repair session**. |
+| Parked messages (§6) | 32 per peer, 60 s | 100 per peer, 7 days, saved with the session (as §12 already says). |
+| Setup under loss (§2, §13.5) | Out of scope: assumed a clean link | Handshake init and reply sent 3 times, with retries for up to 60 s. 3 syncs every 15 s. KeyExchange and SessionEstablish sent 3 times to a contact who has added you, first resent after 10 s. A repair at 70% loss each way took 30–71 s. Still repetition, not FEC. |
+| Sent ✓ | None | Relay receipts: ✓ once enough of a burst is queued at the relay, a red **!** after 30 s. |
+| KEM | Kyber768 | ML-KEM-768, same sizes. |
+| Tests (§1, §11) | 163 in §1, 134 in §11 | 301, all passing: relay-link 13, fec 25, relay 49, client 189, src-tauri 15, frontend 10. |
+
 ## 1. Summary
 
 **Goal:** Client A can send and Client B can receive while the jammed side's link loses up to **70% of all packets**. This must work with no ACKs, no retransmission and no change to the trust model.
@@ -306,10 +323,10 @@ To cover both sides being jammed at 70% (91% end to end), set `FEC_DESIGN_LOSS =
 
 ## 13. Known limitations and follow-ups
 
-1. **Residual PQ desync.** If a whole PQ-carrying burst is lost (≤ 10⁻⁶ per injection), the session breaks with no recovery. A resync/"session reset" message (roadmap Task 4.1b) would close this.
+1. ~~**Residual PQ desync.** If a whole PQ-carrying burst is lost (≤ 10⁻⁶ per injection), the session breaks with no recovery. A resync/"session reset" message (roadmap Task 4.1b) would close this.~~ Fixed: the receiver asks for a lost injection again with a signed `0x08` request, and the sender resends it from its latest 20. **Repair session** sets up a fresh session for anything else (review findings **F-1** and **C-5**).
 2. ~~**PQ injections older than 5 minutes are rejected.**~~ Fixed: 0x05 is exempt from the freshness window, and its signed chain position rules out replays instead (review finding **C-4**).
 3. **Fixed redundancy.** Every message pays for 70% loss even on a clean link (27× packets for a short message). Loss feedback from the receiver could adapt it.
 4. **Traffic analysis.** Bursts reveal send times, the chunk count (burst length), and which messages carry a PQ injection (larger burst). Padding is per chunk now, so packet size reveals nothing. The constant-rate tunnel mode would hide the rest.
-5. **Not FEC-protected (by agreement):** relay handshake, sync/keepalive, KeyExchange, SessionEstablish, presence. The jammed client's presence dot will flicker, and a jammed client can't (re)connect to the relay.
+5. ~~**Not FEC-protected (by agreement):** relay handshake, sync/keepalive, KeyExchange, SessionEstablish, presence. The jammed client's presence dot will flicker, and a jammed client can't (re)connect to the relay.~~ Fixed by repetition rather than FEC: the handshake init and reply go 3 times with retries, syncs 3 times, and setup packets 3 times to a contact who has added you, first resent after 10 s. Presence was removed. A repair at 70% loss each way took 30–71 s.
 6. **Seal key is static per session.** It's derived from the root key, so a root-key compromise exposes the envelopes. The messages inside remain protected by the ratchet.
 7. **No automated multi-process test in CI.** `lossy_link` is manual because it needs a running relay.

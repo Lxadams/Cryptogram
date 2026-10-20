@@ -4,10 +4,56 @@ Comprehensive audit of the cryptographic implementation, covering protocol desig
 
 ---
 
+## Status, 20 October 2026
+
+Checked against `main` at `52b49d8`. The findings below are as written in July. This section says where the items not marked PATCHED stand now. [implementation-review.md](implementation-review.md) (5 October) re-checked them too and has its own status table.
+
+Links in this review now point at files, not lines: the code has moved since July (most of `client/src/main.rs` is now in `client/src/lib.rs`), so line numbers in the text refer to the July code.
+
+| # | Finding | Status | How, or where |
+|---|---|---|---|
+| 1 | Private keys in plaintext on disk | Fixed in the app. Open in the CLI. | The app keeps each identity in SQLCipher databases, keyed by a vault key from Argon2id. The CLI still writes plaintext JSON (`client_state.json`, or `E2E_STATE_FILE`). See implementation review L-1. |
+| 3 | No mutual authentication in the link handshake | Doc mismatch fixed. The rest is by design. | The docs now say ephemeral-ephemeral DH. The handshake still doesn't authenticate clients, by design: a client proves it owns its routing token with a sync signed by its token key. |
+| 5 | `KeyExchangePayload::verify()` is self-authenticating | Fixed | `verify` takes an external key. A KeyExchange is only taken in from a contact you added, checked against the key you scanned. |
+| 6 | Only the sender's chain gets PQ injections | Open | Stage 3 item 3.1 ([stage-3-roadmap.md](stage-3-roadmap.md)). |
+| 7 | `seen_session_keys` grows unbounded, filled before validation | Obsolete | `seen_session_keys` is gone. Add IDs (a counter that only goes up) replaced it. |
+| 8 | No DH ratchet | Open | Stage 3 item 3.1. |
+| 9 | PQ injections use the recipient's static KEM key | Open | Stage 3 item 3.1. Kyber768 is now ML-KEM-768. |
+| 16 | `utils` crate has the wrong session ID size | Fixed | The `utils` crate is gone. |
+| 17 | `verify()` signatures differ | Fixed | Every payload's `verify` takes an external key (with #5). |
+| 18 | No constant-time token comparisons | Fixed | Target-token checks are constant-time. |
+| 19 | `client_state.json` committed to git | Fixed | It isn't tracked, and `code/.gitignore` lists it. |
+
+One PATCHED item has changed again: **#13**'s dummy packets are now a fixed 1,138 bytes, the size of every forwarded chat packet, not random sizes. Nothing sends them yet (implementation review R-7).
+
+**Documentation vs. code table, now:**
+
+| # | Then | Now |
+|---|---|---|
+| 1 | DH mismatch | Fixed: the docs say ephemeral-ephemeral. |
+| 2 | Routing token randomly generated | Changed in the code: a routing token is the hash of the identity's Ed25519 token key (`routing_token_for`). It's neither random nor from a shared secret. |
+| 3 | "X25519 Double Ratchet" | The Double Ratchet claims are gone from the docs. The code is still a symmetric hash ratchet with PQ injection. |
+| 4 | No RaptorQ | Implemented: `code/fec` ([raptorq-fec-transport.md](raptorq-fec-transport.md)). |
+| 5 | No metronome; server sends every second | Still no metronome: messages go out as bursts, 10 ms apart. The relay forwards on arrival, at most one packet per recipient every 5 ms. |
+| 6 | One routing token for everything | Still one routing token per identity. |
+| 7 | RAM-only not stated for the routing table | The relay keeps links, tokens, admission tags and queues in RAM. Its identity key is the only thing it writes to disk. |
+
+**Summary table, now:**
+
+| Severity | Then | Now |
+|---|---|---|
+| Critical | 1 open (#1) | #1 fixed in the app. The CLI still stores plaintext. |
+| High | 5 open | #5 fixed, #7 obsolete. #6, #8 and #9 open (Stage 3 item 3.1). |
+| Medium | 0 open | No change. |
+| Low | 3 open | All fixed (#16 to #19). |
+| Doc mismatches | 7 | See the table above. |
+
+---
+
 ## 🔴 CRITICAL Vulnerabilities
 
 ### 1. Private Keys Stored in Plaintext on Disk
-**File:** [storage.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/storage.rs) | **File:** [client_state.json](file:///home/lxadams/Documents/E2E-Messanger/code/client/client_state.json)
+**File:** [storage.rs](../code/client/src/storage.rs) | **File:** `client_state.json` (since removed from the repo)
 
 The `ClientStateDto::save()` writes **all private keys** — Ed25519 signing key, X25519 static secret, Kyber secret key, chain keys, and root keys — as plaintext hex to a JSON file on disk with no encryption, no file permissions restrictions, and no key wrapping.
 
@@ -23,7 +69,7 @@ The `ClientStateDto::save()` writes **all private keys** — Ed25519 signing key
 ---
 
 ### ~~2. Server Static Identity Is Ephemeral — Regenerated Every Restart~~ (PATCHED)
-**File:** [server/main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/server/src/main.rs#L43-L59)
+**File:** [server/main.rs](../code/server/src/main.rs)
 
 ~~The server generates a fresh Ed25519 identity on every boot.~~
 *Fixed: The server now persists its Ed25519 identity to `server_identity.json` on first run and loads it on subsequent boots. Clients no longer need to update their server pubkey after restarts.*
@@ -31,7 +77,7 @@ The `ClientStateDto::save()` writes **all private keys** — Ed25519 signing key
 ---
 
 ### 3. Asymmetric Link Handshake — No Mutual Authentication
-**File:** [server/main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/server/src/main.rs#L92-L128) | [client/main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L193-L222)
+**File:** [server/main.rs](../code/server/src/main.rs) | [client/main.rs](../code/client/src/main.rs)
 
 The link handshake performs `DH(ClientEph, ServerEph)` and the server signs `(ClientPub || ServerPub)`. However:
 
@@ -44,7 +90,7 @@ The link handshake performs `DH(ClientEph, ServerEph)` and the server signs `(Cl
 ---
 
 ### ~~4. `ed25519-dalek` Version Mismatch Between Client and Server~~ (PATCHED)
-**File:** [client/Cargo.toml](file:///home/lxadams/Documents/E2E-Messanger/code/client/Cargo.toml#L22) | [server/Cargo.toml](file:///home/lxadams/Documents/E2E-Messanger/code/server/Cargo.toml#L19)
+**File:** [client/Cargo.toml](../code/client/Cargo.toml) | [server/Cargo.toml](../code/server/Cargo.toml)
 
 ~~Different major versions of `ed25519-dalek` between client and server.~~
 *Fixed: Both client and server now use `ed25519-dalek = "3.0.0"` with identical features.*
@@ -54,7 +100,7 @@ The link handshake performs `DH(ClientEph, ServerEph)` and the server signs `(Cl
 ## 🟠 HIGH Severity Issues
 
 ### 5. `KeyExchangePayload::verify()` Is Self-Authenticating (Useless Against Forgery)
-**File:** [packets.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/packets.rs#L92-L103)
+**File:** [packets.rs](../code/client/src/packets.rs)
 
 ```rust
 pub fn verify(&self) -> Result<()> {
@@ -67,14 +113,14 @@ pub fn verify(&self) -> Result<()> {
 
 `KeyExchangePayload::verify()` verifies the signature **against the public key embedded in the payload itself**. This is a self-attestation — it only proves the payload is internally consistent, not that it came from a trusted party. An attacker (Mallory) can generate her own Ed25519 key, embed it in the payload, and the `verify()` call will succeed.
 
-The actual security relies on the *caller* in [main.rs L487-L495](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L487-L495) comparing `kx.ed25519_public` against the QR-scanned key in `pending_contacts`. However, this check only happens for the initiator. For the TOFU case (line 514), the embedded key is blindly trusted. 
+The actual security relies on the *caller* in [main.rs L487-L495](../code/client/src/main.rs) comparing `kx.ed25519_public` against the QR-scanned key in `pending_contacts`. However, this check only happens for the initiator. For the TOFU case (line 514), the embedded key is blindly trusted. 
 
 **Recommendation:** The `verify()` method should accept an external `VerifyingKey` parameter (like `SessionEstablishPayload::verify()` and `PQInjectPayload::verify()` already do), making it impossible to accidentally verify against an untrusted key.
 
 ---
 
 ### 6. Sender-Side PQ Injection Is Unilateral — Only Sender Ratchets
-**File:** [main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L381-L396) | [main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L580-L584)
+**File:** [main.rs](../code/client/src/main.rs) | [main.rs](../code/client/src/main.rs)
 
 When Alice sends her 5th message, her `create_encrypted_packet` does:
 1. `symmetric_ratchet()` — advances chain key for message 5
@@ -90,13 +136,13 @@ This means Alice's `send_count == 5` **after** PQ injection, but the chain key u
 ---
 
 ### 7. `seen_session_keys` Cache Grows Unbounded
-**File:** [main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L158) | [storage.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/storage.rs#L20)
+**File:** [main.rs](../code/client/src/main.rs) | [storage.rs](../code/client/src/storage.rs)
 
 ```rust
 pub seen_session_keys: HashSet<[u8; 32]>,
 ```
 
-The replay cache for `SessionEstablish` ephemeral keys grows forever — every SessionEstablish packet adds a 32-byte entry. This is persisted to disk on every save. Over time, this becomes a DoS vector if an attacker floods `SessionEstablish` packets (even with garbage that fails validation, the key is inserted into `seen_session_keys` **before** signature verification at [line 527](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L527)).
+The replay cache for `SessionEstablish` ephemeral keys grows forever — every SessionEstablish packet adds a 32-byte entry. This is persisted to disk on every save. Over time, this becomes a DoS vector if an attacker floods `SessionEstablish` packets (even with garbage that fails validation, the key is inserted into `seen_session_keys` **before** signature verification at [line 527](../code/client/src/main.rs)).
 
 > [!WARNING]
 > The `seen_session_keys` insertion at line 527 occurs **before** signature and timestamp validation. An attacker can exhaust memory by sending forged `SessionEstablish` packets with unique ephemeral keys. The cache should only be updated **after** full validation passes.
@@ -104,7 +150,7 @@ The replay cache for `SessionEstablish` ephemeral keys grows forever — every S
 ---
 
 ### 8. No Forward Secrecy on the Symmetric Ratchet (No DH Ratchet)
-**Documented:** [doable-cryptographic-flow.md](file:///home/lxadams/Documents/E2E-Messanger/documentations/doable-cryptographic-flow.md#L59)
+**Documented:** [doable-cryptographic-flow.md](doable-cryptographic-flow.md)
 
 > "uses a Symmetric Hash Ratchet (HMAC-SHA256) — not the Signal Double Ratchet. This was a deliberate simplification."
 
@@ -115,7 +161,7 @@ This means a compromise of the chain key only heals when a PQ injection occurs, 
 ---
 
 ### 9. PQ Inject Uses Recipient's Static Kyber Key — No Ephemeral KEM
-**File:** [main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L383-L384)
+**File:** [main.rs](../code/client/src/main.rs)
 
 ```rust
 if let Some(ref peer_kyber) = session.peer_kyber_pub {
@@ -132,7 +178,7 @@ Every PQ injection re-encapsulates against the **same static Kyber public key**.
 ## 🟡 MEDIUM Severity Issues
 
 ### 10. HKDF Used Without a Salt (PATCHED)
-**Files:** [main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L218) | [main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L284) | [main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L144)
+**Files:** [main.rs](../code/client/src/main.rs) | [main.rs](../code/client/src/main.rs) | [main.rs](../code/client/src/main.rs)
 
 ~~All HKDF invocations pass `None` for the salt.~~
 *Fixed: All HKDF derivations now use the domain-separation salt `b"e2e-messenger-v1"` for both client and server.*
@@ -140,7 +186,7 @@ Every PQ injection re-encapsulates against the **same static Kyber public key**.
 ---
 
 ### 11. `skip_dict` Is Bounded to 500 Keys (PATCHED)
-**File:** [main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L103-L131)
+**File:** [main.rs](../code/client/src/main.rs)
 
 ~~The skip dictionary was unbounded within the 100-message window.~~
 *Fixed: Added `MAX_SKIP_DICT_SIZE = 500` constant. When the skip dictionary exceeds this limit, the oldest entries are pruned before adding new ones.*
@@ -148,7 +194,7 @@ Every PQ injection re-encapsulates against the **same static Kyber public key**.
 ---
 
 ### ~~12. Timestamp Validation Uses `i64` Cast — Overflow Risk~~ (PATCHED)
-**File:** [main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L471)
+**File:** [main.rs](../code/client/src/main.rs)
 
 ~~Casting `u64` timestamps to `i64` risked overflow with attacker-controlled values.~~
 *Fixed: Replaced `(now as i64 - kx.timestamp as i64).abs()` with safe saturating arithmetic: `now.max(kx.timestamp) - now.min(kx.timestamp)`. All three timestamp validation sites (KeyExchange, SessionEstablish, PQInject) are fixed.*
@@ -156,7 +202,7 @@ Every PQ injection re-encapsulates against the **same static Kyber public key**.
 ---
 
 ### ~~13. Dummy Packets Are Distinguishable by Size~~ (PATCHED)
-**File:** [server/main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/server/src/main.rs#L279)
+**File:** [server/main.rs](../code/server/src/main.rs)
 
 ~~Dummy packets always had a fixed 64-byte payload before encryption.~~
 *Fixed: Dummy packets now have random sizes between 32–1500 bytes, matching the distribution of real message packets and preventing traffic analysis from distinguishing dummies.*
@@ -164,7 +210,7 @@ Every PQ injection re-encapsulates against the **same static Kyber public key**.
 ---
 
 ### ~~14. `outbound_messages()` Clones but Never Drains the Queue~~ (PATCHED)
-**File:** [stores.rs](file:///home/lxadams/Documents/E2E-Messanger/code/server/src/stores.rs#L95-L97)
+**File:** [stores.rs](../code/server/src/stores.rs)
 
 ~~`outbound_messages()` returns clones but doesn't remove them from the queue. Messages are only removed by `sweep_expired_messages()` based on TTL (1000 seconds).~~
 *Fixed: The server's routing architecture was overhauled. `outbound_messages` now properly `remove()`s and `drain(..)`s the individual token queues for active tokens, guaranteeing that offline messages are stored securely and online messages are instantly delivered and deleted from RAM exactly once.*
@@ -172,7 +218,7 @@ Every PQ injection re-encapsulates against the **same static Kyber public key**.
 ---
 
 ### ~~15. Server Re-encrypts Inner Payload Without Routing Token Prefix~~ (PATCHED)
-**File:** [server/main.rs](file:///home/lxadams/Documents/E2E-Messanger/code/server/src/main.rs#L289-L293)
+**File:** [server/main.rs](../code/server/src/main.rs)
 
 ~~The server forwarded messages without prepending a routing token prefix, causing the client to misparse the first 16 bytes of the E2E payload.~~
 *Fixed: The server now prepends a 16-byte zero routing token prefix (`vec![0u8; 16]`) before re-encrypting outbound messages. The client uniformly strips the first 16 bytes, and the E2E payload is correctly parsed.*
@@ -182,7 +228,7 @@ Every PQ injection re-encapsulates against the **same static Kyber public key**.
 ## 🔵 LOW Severity / Code Quality Issues
 
 ### 16. `utils` Crate Has Inconsistent Session ID Size
-**File:** [utils/lib.rs](file:///home/lxadams/Documents/E2E-Messanger/code/utils/src/lib.rs#L3)
+**File:** `utils/lib.rs` (crate since removed)
 
 ```rust
 pub const SESSION_ID_LEN: usize = 2;
@@ -197,7 +243,7 @@ The utils crate defines `SESSION_ID_LEN = 2`, but the client and server both use
 Token comparisons use `!=` which may be variable-time. While routing tokens are not secret, using non-constant-time comparison for `target_token` checks (e.g., line 461, 533) could leak information about the token values to timing side-channels in certain deployment contexts.
 
 ### 19. `client_state.json` Committed to Git
-The checked-in [client_state.json](file:///home/lxadams/Documents/E2E-Messanger/code/client/client_state.json) contains actual private keys. Even though this is a development file, it's a security hygiene issue — these keys should be in `.gitignore`.
+The checked-in `client_state.json` (since removed from the repo) contains actual private keys. Even though this is a development file, it's a security hygiene issue — these keys should be in `.gitignore`.
 
 ---
 
@@ -214,7 +260,7 @@ The checked-in [client_state.json](file:///home/lxadams/Documents/E2E-Messanger/
 | 7 | Section 3 says server stores `SessionID → LinkKey` in RAM | Correct in code — but server also stores `RoutingToken → (Addr, SessionID)` which is not mentioned as "RAM-only" explicitly |
 
 > [!WARNING]
-> The [architecture-diagrams.md](file:///home/lxadams/Documents/E2E-Messanger/documentations/architecture-diagrams.md) describes a significantly **more advanced** system than what's implemented. Features like RaptorQ, per-conversation routing tokens, 100ms metronome, and Double Ratchet are documented but not coded. The [doable-cryptographic-flow.md](file:///home/lxadams/Documents/E2E-Messanger/documentations/doable-cryptographic-flow.md) is more accurate but still has the DH mismatch noted above.
+> The [architecture-diagrams.md](architecture-diagrams.md) describes a significantly **more advanced** system than what's implemented. Features like RaptorQ, per-conversation routing tokens, 100ms metronome, and Double Ratchet are documented but not coded. The [doable-cryptographic-flow.md](doable-cryptographic-flow.md) is more accurate but still has the DH mismatch noted above.
 
 ---
 
@@ -246,8 +292,8 @@ The checked-in [client_state.json](file:///home/lxadams/Documents/E2E-Messanger/
 | 8 | **Link handshake signature verification** | No test verifies the client correctly rejects a handshake response with a bad server signature. |
 | 9 | **Concurrent session establishment** | No test for what happens if two `SessionEstablish` packets arrive for the same peer (race condition). |
 | 10 | **Storage round-trip** | No test for `ClientStateDto::save()` → `ClientStateDto::load()` round-trip verifying all keys survive serialization. |
-| 11 | **`timestamp_expiration` test is incomplete** | [test_edge_case_timestamp_expiration](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L911-L922) only checks the math — it **doesn't** test that `handle_incoming_packet` actually rejects the stale packet. It mutates the payload object after signing, so the signature is invalid anyway. |
-| 12 | **`target_misbinding` test is incomplete** | [test_edge_case_target_misbinding](file:///home/lxadams/Documents/E2E-Messanger/code/client/src/main.rs#L924-L933) only checks `assert_ne!` on tokens — it **doesn't** test that `handle_incoming_packet` drops the misbinding packet. |
+| 11 | **`timestamp_expiration` test is incomplete** | [test_edge_case_timestamp_expiration](../code/client/src/main.rs) only checks the math — it **doesn't** test that `handle_incoming_packet` actually rejects the stale packet. It mutates the payload object after signing, so the signature is invalid anyway. |
+| 12 | **`target_misbinding` test is incomplete** | [test_edge_case_target_misbinding](../code/client/src/main.rs) only checks `assert_ne!` on tokens — it **doesn't** test that `handle_incoming_packet` drops the misbinding packet. |
 
 ---
 

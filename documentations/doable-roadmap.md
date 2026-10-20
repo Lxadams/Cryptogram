@@ -1,5 +1,37 @@
 # E2E Messenger: Realistic Mobile MVP Roadmap (University Project Scope)
 
+## Status, 20 October 2026
+
+This is the July 2026 plan, kept as a record of what was planned. Everything below this section is the plan as written. For the system as it is, read [Logan-info.md](Logan-info.md), [Frontend-UI-info.md](Frontend-UI-info.md) and [doable-cryptographic-flow.md](doable-cryptographic-flow.md). What comes next is in [stage-3-roadmap.md](stage-3-roadmap.md).
+
+| Task | Status | What was built |
+|---|---|---|
+| 1.1 Keys and hybrid KDF | Done | Ed25519, X25519 and ML-KEM-768 (`libcrux-ml-kem`; round-3 Kyber at first). HKDF-SHA256 over the X25519 and ML-KEM secrets gives the session's root key. |
+| 1.2 RaptorQ | Done | `code/fec`, sized for 70% loss. Each message goes out as one burst, a packet every 10 ms. |
+| 1.3 App and bindings | Done differently | A Leptos UI (WebAssembly) in a Tauri shell, on desktop and Android. The UI calls 24 Tauri commands; there's no `uniffi`. See [tech-decision-leptos-client.md](tech-decision-leptos-client.md). |
+| 1.4 QR scanner | Done differently | Scanning runs in the WASM (`getUserMedia` and `rqrr`), with the device's `BarcodeDetector` as an option, off by default. Both people scan each other. The code is `CG2:` + Base45 of the routing token and the Ed25519 key; the X25519 and ML-KEM keys come in a KeyExchange signed with that key. |
+| 2.1 Hash ratchet with PQ injection | Done | A symmetric hash ratchet, with a PQ refresh (`0x05`) every 5 steps, applied at a position the refresh names and signs. |
+| 2.1b Skip dictionary | Done | Up to 100 steps ahead, at most 500 stored keys. |
+| 2.2 Raw UDP and the metronome | Partly done | Raw UDP, on port 443 in production. The metronome wasn't built: the relay can make dummy packets, but nothing sends them. The constant-rate tunnel is Stage 3 Phase 1, on a random clock rather than every 100 ms. |
+| 2.2b Link handshake and encryption | Done | An X25519 handshake signed with the relay's pinned Ed25519 key. ChaCha20-Poly1305 rather than XChaCha20-Poly1305, with a key per direction, numbered packets and a replay window. The relay picks the 4-byte session ID. |
+| 2.3 Foreground service | Done differently | `MessageService` keeps the process and its UDP socket alive while someone is logged in. There's no metronome for it to run. |
+| 3.1 Relay | Done | On AWS EC2, UDP 443, in Docker. Bounded tables and a handshake rate limit per address. A stateless cookie, against spoofed source addresses, is still open. |
+| 3.2 RAM-only routing and queue | Done | Packets wait in RAM for up to 7 days, and are resent until the recipient acks them. |
+| 3.3 Fetch request | Done differently | No fetch request: the relay resends what's queued when the client syncs from a new address or link, or after more than 30 s of silence. |
+| 4.1 Chat wired to the core | Done | Type → ratchet → RaptorQ → a burst of packets (not the metronome). |
+| 4.1b Session reset | Done differently | A **Repair session** item in the chat's ⋮ menu. No automatic reset every 100 messages: PQ refreshes come every 5 steps instead, and a lost one is asked for again (`0x08`). |
+| 4.2 UX polish | Done | Start page, login, contacts with **Show QR code**, **Scan QR code** and **Manual add**, and chats with ✓ and **!** marks. The app is called Cryptogram. |
+| 4.3 Demo at 90% loss | Done differently | Tested at 70% loss each way, through the lossy proxy (`runserver-lan-lossy.sh`), not at 90%. |
+| 5.1–5.3 Group chats | Not started | Still a stretch goal. |
+
+Other places the plan below no longer matches the code:
+- **Replay cache:** the "caching ephemeral X25519 keys" in §1 was built (`seen_session_keys`), then replaced by add IDs, a counter that only goes up.
+- **Routing tokens:** each identity has one routing token, the hash of a key it proves it holds. There's no shared rendezvous token per pair.
+- **Storage:** the app keeps its state and chat history in SQLCipher databases, keyed by a vault key from the passcode (Argon2id). The CLI still writes plaintext JSON.
+- **ML-KEM after the handshake:** §5 assumes ML-KEM only in the first handshake. PQ refreshes use it every 5 steps.
+
+---
+
 This document outlines a scoped-down, realistic Proof of Concept (PoC) roadmap suitable for a 4-person university engineering team completing a single-semester (12-16 week) final project. 
 
 The goal of this roadmap is to prove the core, novel concepts of the architecture—Extreme Loss Tolerance, Metadata Obfuscation, QR-based identity, and **Post-Quantum Key Exchange**—while aggressively cutting the most complex production-level requirements (HTTP/3 Evasion, Samsung Knox Hardware bindings, and asynchronous PQ ratcheting) to make it achievable in Rust on mobile.

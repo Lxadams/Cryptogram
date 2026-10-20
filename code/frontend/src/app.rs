@@ -551,11 +551,11 @@ fn WelcomeScreen(auth_screen: RwSignal<AuthScreen>) -> impl IntoView {
     }
 }
 
-/// Screen 1 (default): log in with a username + passcode that already has a
-/// saved identity. This is a UI-layer gate only — see `hash_passcode`'s doc
-/// comment in `code/client/src/lib.rs` — it decides which pseudonym's
-/// identity file the Connect screen's `bootstrap` call will load next,
-/// nothing here touches the network. No saved identity for that username?
+/// The login screen: log in with a username + passcode that already has a
+/// saved identity. `login` checks the passcode and derives the vault key
+/// that opens that identity's encrypted state and chat history (see
+/// `derive_vault_key` in `code/client/src/lib.rs`), which the Connect
+/// screen's `bootstrap` call then loads; nothing here touches the network. No saved identity for that username?
 /// The "Create identity" button hands off to `CreateIdentityScreen` instead
 /// of trying to create one inline.
 #[component]
@@ -791,12 +791,10 @@ fn LoginScreen(
     }
 }
 
-/// Screen 1b: mint a brand-new identity behind a chosen username + passcode.
-/// On success, hands back to `LoginScreen` rather than proceeding straight
-/// to Connect — the user logs in with what they just chose, same as any
-/// other identity. This is a UI-layer gate only, same caveat as
-/// `LoginScreen` — see `hash_passcode`'s doc comment in
-/// `code/client/src/lib.rs`.
+/// The create screen: mint a brand-new identity behind a chosen username +
+/// passcode (see `hash_passcode` in `code/client/src/lib.rs`). On success,
+/// hands back to `LoginScreen` rather than proceeding straight to Connect —
+/// the user logs in with what they just chose, same as any other identity.
 #[component]
 fn CreateIdentityScreen(
     auth_screen: RwSignal<AuthScreen>,
@@ -875,7 +873,7 @@ fn CreateIdentityScreen(
 /// earliest (see `ConnectScreen`).
 const CONNECT_MIN_WAIT: Duration = Duration::from_secs(2);
 
-/// Screen 1: perform the link handshake with the relay. The relay's Ed25519
+/// The Connect screen: perform the link handshake with the relay. The relay's Ed25519
 /// pubkey is built into the app (see `relay_pubkey_hex` in
 /// src-tauri/src/commands.rs), so there's nothing to paste.
 #[component]
@@ -927,9 +925,9 @@ fn ConnectScreen(identity: RwSignal<Option<api::IdentityDto>>) -> impl IntoView 
     }
 }
 
-/// Screen 2: everything after a successful handshake — our identity (to
-/// share with peers), the contact list, and a chat panel for whichever
-/// contact is selected.
+/// The main screen: everything after a successful handshake — our name,
+/// the contact list, the settings and network folds, and a chat panel for
+/// whichever contact is selected.
 #[component]
 fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     let contacts = RwSignal::new(Vec::<api::ContactDto>::new());
@@ -948,8 +946,8 @@ fn MainScreen(identity: api::IdentityDto) -> impl IntoView {
     let show_qr = RwSignal::new(false);
     let qr_waiting_for = RwSignal::new(None::<String>);
     let selected = RwSignal::new(None::<String>);
-    // token_hex -> transcript. Populated by both outgoing sends (added
-    // immediately, optimistically), incoming polls (added on arrival), and
+    // token_hex -> transcript. Populated by both outgoing sends (added once
+    // `send_message` returns), incoming polls (added on arrival), and
     // a one-time hydration from this peer's own persisted chat history the
     // first time each contact is selected (see the Effect below) — that
     // history is a full independent copy, so it's what makes a contact's

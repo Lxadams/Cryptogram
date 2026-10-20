@@ -47,13 +47,21 @@ fine here — you're not compiling Rust on it.
 ## After the first successful deploy
 
 Clients ship with the server's pubkey rather than asking the server for
-it: build the app with it in `SERVER_PUBKEY` (e.g.
-`SERVER_PUBKEY=<hex> ./runpeer-lan.sh --mobile <EC2_HOST>:443`), and pass
-it to the CLI client as its argument. Read it from the boot log:
+it. Read it from the boot log:
 
 ```
 ssh ubuntu@<EC2_HOST> "docker logs server 2>&1 | grep 'Static Pubkey'"
 ```
+
+Then, from the repo root, build clients for the deployed relay:
+
+- **Phone:** `./build-apk.sh -ip <EC2_HOST> -p 443 -pk <hex>`, then
+  `./install-apk.sh` to install it over USB.
+- **Desktop:** `./runpeer.sh -ip <EC2_HOST> -p 443 -pk <hex>`.
+- **CLI:** `SERVER_ADDR=<EC2_HOST>:443 cargo run -- <hex>` in `code/client`.
+
+The older form, `SERVER_PUBKEY=<hex> ./runpeer-lan.sh --mobile <EC2_HOST>:443`
+(or `--pc`), still works.
 
 The identity persists across deploys via the `server_identity` named
 volume mounted at `/data` — this pubkey should stay the same on every

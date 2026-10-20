@@ -22,9 +22,10 @@ const KIND_TEXT: u8 = 0x01;
 const HEADER_LEN: usize = 1 + 8 + 1 + 1;
 /// Message bytes carried per chunk.
 pub const CHUNK_DATA_LEN: usize = padding::MAX_PAYLOAD_LEN - HEADER_LEN;
-/// Kept small on purpose: the relay queues at most 50 packets per recipient
-/// (dropping the oldest), the receiving ratchet only accepts messages up to
-/// 100 steps ahead, and losing any one chunk loses the whole message.
+/// Kept small on purpose: the relay queues at most 2 MiB of contacts'
+/// packets per recipient (refusing new ones once full), the receiving
+/// ratchet only accepts messages up to 100 steps ahead, and losing any one
+/// chunk loses the whole message.
 pub const MAX_CHUNKS: usize = 16;
 /// Longest message, in UTF-8 bytes, that can be sent.
 pub const MAX_MESSAGE_LEN: usize = CHUNK_DATA_LEN * MAX_CHUNKS;

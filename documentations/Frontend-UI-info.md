@@ -12,13 +12,13 @@ What the app's user interface is made of, how it talks to the Rust core, and wha
 8. [Android specifics](#8-android-specifics)
 9. [Things I noticed](#9-things-i-noticed-while-tracing-this-possible-follow-ups)
 
-Everything here is from the code as of `Logan/Bug-Fixes` (commit `714eb51`). File references are relative to `code/frontend/`.
+Everything here is from the code as of `main` (commit `52b49d8`, 20 October 2026). File references are relative to `code/frontend/`.
 
 ---
 
 ## The big picture in one paragraph
 
-The UI is a **Leptos** app (Rust compiled to WebAssembly by **Trunk**) that runs inside a **Tauri** webview. The WASM side can't open sockets or touch files, so it does nothing but draw screens and call named **Tauri commands** through `window.__TAURI__.core.invoke`. Those commands live in the native half of the app (`src-tauri/`), which owns the one real `Client` from the `client` crate, its UDP socket, and three background loops. Nothing is pushed from the backend to the UI: the main screen **polls once a second** for contacts, connection requests, new messages and send-status changes. The same WASM and CSS run on desktop and Android. The only per-platform code is in `src-tauri/` (camera opt-in on Linux, a Kotlin foreground service and notifications on Android).
+The UI is a **Leptos** app (Rust compiled to WebAssembly by **Trunk**) that runs inside a **Tauri** webview. The WASM side can't open sockets or touch files, so it does nothing but draw screens and call named **Tauri commands** through `window.__TAURI__.core.invoke`. Those commands live in the native half of the app (`src-tauri/`), which owns the one real `Client` from the `client` crate, its UDP socket, and three background loops. Nothing is pushed from the backend to the UI: the main screen **polls once a second** for contacts, connection requests, new messages and send-status changes, and for the network stats while they're turned on. The same WASM and CSS run on desktop and Android. The only per-platform code is in `src-tauri/` (camera opt-in on Linux, a Kotlin foreground service and notifications on Android).
 
 ```
  ┌────────────────────────── webview (WASM, no sockets, no files) ───────────────────────────┐
@@ -27,10 +27,11 @@ The UI is a **Leptos** app (Rust compiled to WebAssembly by **Trunk**) that runs
  │  src/qr.rs     QR draw (qrcode) + camera scanner (getUserMedia + rqrr)                    │
  │  src/contact_code.rs   "CG2:<Base45>" contact code encode/parse                           │
  │  src/api.rs    one async fn per command, DTOs mirrored field for field                    │
+ │  src/back_button.rs    Android back: closes the top layer (window.__cryptogramBack)       │
  └───────────────────────────────────────┬───────────────────────────────────────────────────┘
                                          │ window.__TAURI__.core.invoke("name", args)  (JSON)
  ┌───────────────────────────────────────▼──────────── native process ──────────────────────┐
- │  src-tauri/src/lib.rs        registers the 19 commands, Linux camera opt-in               │
+ │  src-tauri/src/lib.rs        registers the 24 commands, Linux camera opt-in               │
  │  src-tauri/src/commands.rs   #[tauri::command] fns + receive / tick / keepalive loops     │
  │  src-tauri/src/state.rs      AppState { runtime, pending_identity, identity_lock }        │
  │  src-tauri/src/background.rs Android bridge (foreground service, notifications)           │
@@ -91,20 +92,27 @@ All commands lock `AppState.runtime` (a `tokio::sync::Mutex<Option<ClientRuntime
 
 | Command | Args | Returns | Called from |
 |---|---|---|---|
-| `list_contacts` | none | `Vec<ContactDto>` (`token`, `status`, `name`) | 1 s poll |
+| `list_contacts` | none | `Vec<ContactDto>` (`token`, `status`, `name`, `last_message_ms`), newest conversation first | 1 s poll |
 | `connection_requests` | none | `ConnectionRequestsDto` (`tokens`, `muted`) | 1 s poll |
 | `poll_inbox` | none | `Vec<IncomingMessageDto>` (drains the inbox) | 1 s poll |
 | `sent_message_updates` | none | `Vec<SentMessageUpdateDto>` (drains) | 1 s poll |
+| `network_stats` | none | `NetworkStatsDto` (relay and status, packet counts, retransmissions, loss each way, `unstable`) | 1 s poll, only while **Network stats** is on and the page is visible |
 | `chat_history` | `token_hex`, `limit` | `Vec<StoredMessageDto>`, oldest first | first time a contact is selected (limit 200) |
 | `send_message` | `token_hex`, `text` | `SentMessageDto` (`id`, `timestamp_ms`) | Send button / Enter |
+| `retry_message` | `token_hex`, `id` | `SentMessageDto` for the new message (deletes the failed one from the history) | retry button next to a **!** |
 | `connect_to_peer` | `token_hex`, `ed25519_hex` | `()` | QR scan or manual add |
 | `remove_contact` | `token_hex` | `()` (also deletes that chat's history) | bin icon → "Remove? Yes" |
+| `repair_session` | `token_hex` | `()` (sends a fresh KeyExchange, and its copies) | ⋮ → **Repair session** |
 | `dismiss_connection_request` | `token_hex` | `()` | "Not now" |
 | `set_connection_requests_muted` | `muted` | `()` | "Mute connection requests" / "Unmute" |
 | `notification_settings` | none | `NotificationSettingsDto` (`posted`, `with_names`) | once, when the settings section mounts |
 | `set_notify_with_names` | `on` | `()` | Settings checkbox |
+| `simulated_loss` | none | `SimulatedLossDto` (`send`, `receive`, percentages) | once, when **Simulated loss** mounts |
+| `set_simulated_loss` | `send`, `receive` | `()` | the two **Simulated loss** fields |
 
-Contact `status` is one of three strings: `pending` (we added them, waiting for them to add us), `connecting` (they've added us, session being set up), `established` (can chat).
+`simulated_loss` and `set_simulated_loss` are the exception: they set `client::netsim`, which belongs to the process, not the runtime, so they work before Connect too. The loss resets to 0 when the app closes.
+
+Contact `status` is one of three strings: `pending` (we added them, waiting for them to add us), `connecting` (they've added us, session being set up), `established` (can chat). `list_contacts` sorts by `last_message_ms`, the newest message sent or received (from `ChatHistory::latest_per_contact`), so the order survives a restart. Contacts with no messages follow, by name.
 
 ### Where things live on disk
 
@@ -181,8 +189,12 @@ One button. It calls `bootstrap`, shows "Connecting..." while it runs, and moves
 | `messages` | `HashMap<token, Vec<ChatMessage>>` | transcripts |
 | `requests` | `ConnectionRequestsDto` | request pop-up, "muted" hint |
 | `scanning` | `bool` | whether the QR scanner dialog is open |
+| `adding_manually` | `bool` | whether the **Manual add** dialog is open (here so Android back can close it) |
+| `show_qr`, `qr_waiting_for` | `bool`, `Option<token>` | your QR code, and who it's waiting for after a scan (§6) |
 | `history_loaded_for` | `HashSet<token>` | so each chat's history is fetched once |
+| `unread` | `HashMap<token, usize>` | new-message counts; opening a chat clears its count |
 | `early_updates` | `HashMap<id, SendStatus>` | ✓ results that beat their message (§5) |
+| `stats_on`, `net_stats` | `bool`, `Option<NetworkStatsDto>` | the **Network stats** setting, and the latest stats for the Network fold and `NetworkWarning` |
 
 ```
 MainScreen
@@ -222,7 +234,7 @@ A section of its own after the contact list, holding two folds:
 
 ### `ContactPanel`
 
-- **Contact list.** Each row: the contact's name (or the first 8 hex characters of their token until their name arrives), a status badge, and a bin icon with the same inline **"Remove? Yes / No"** confirm as identity delete. `pending` rows add *"Waiting for them to scan your code"*; `connecting` rows add *"They've added you. Connecting..."*. Clicking a row sets `selected`.
+- **Contact list.** Newest conversation first (the order `list_contacts` returns). Each row: the contact's name (or the first 8 hex characters of their token until their name arrives), a small square counting the messages that arrived while their chat wasn't open (`UnreadBadge`), a status badge, and a bin icon with the same inline **"Remove? Yes / No"** confirm as identity delete. `pending` rows add *"Waiting for them to scan your code"*; `connecting` rows add *"They've added you. Connecting..."*. Clicking a row sets `selected`. The counts live in the frontend only, so they start again at zero after a restart.
 - The list's `<For>` is keyed on `(token, status, name)`, so a row is redrawn when its status or name changes.
 - **Empty list:** a hint to tap **+**, and that you each add the other.
 - **The + menu,** at the far right of the "Contacts" heading (a `Menu`, like the chat's ⋮):
@@ -273,11 +285,11 @@ There are no events from the backend to the UI. Two timers do everything:
 | Timer | Period | Calls |
 |---|---|---|
 | `LoginScreen::refresh_known` | 1 s | `list_pseudonyms` |
-| `MainScreen::refresh` | 1 s | `list_contacts`, `connection_requests`, `poll_inbox`, `sent_message_updates` |
+| `MainScreen::refresh` | 1 s | `network_stats` (only while **Network stats** is on and `document.hidden` is false), `list_contacts`, `connection_requests`, `poll_inbox`, `sent_message_updates` |
 
-`refresh` only calls `set` on `contacts` and `requests` when the new value differs from the old one, so a quiet second redraws nothing. Results that land after the screen has unmounted are dropped safely (the `try_*` signal methods).
+`refresh` only calls `set` on `contacts` and `requests` when the new value differs from the old one, so a quiet second redraws nothing. Each message `poll_inbox` returns adds one to its sender's `unread` count, unless their chat is the one open. Results that land after the screen has unmounted are dropped safely (the `try_*` signal methods).
 
-Meanwhile, in the backend, three loops run regardless of the UI (`commands.rs`): the **receive loop** (every UDP packet), the **tick loop** (500 ms: reorder timeouts and ✓ requests) and the **keepalive loop** (15 s). They fill `Client::inbox` and the send-update queue; the UI's poll drains them. So a received message appears up to 1 s after it was decrypted.
+Meanwhile, in the backend, three loops run regardless of the UI (`commands.rs`): the **receive loop** (every UDP packet), the **tick loop** (500 ms: reorder timeouts, ✓ requests and requests for a missing PQ inject) and the **keepalive loop** (15 s). They fill `Client::inbox` and the send-update queue; the UI's poll drains them. So a received message appears up to 1 s after it was decrypted.
 
 ### Message ids: one identity for three sources
 
@@ -340,7 +352,10 @@ All of it runs in the shared WASM, so there is no native scanner plugin:
 5. Each decoded string goes to `on_scan`. `Ok` stops the camera; `Err(msg)` shows the message and keeps scanning, and the same rejected string isn't reported again while it stays in view.
 6. The camera is released when the dialog closes, including if it closes during the permission prompt.
 
-`ContactPanel`'s `on_scan` parses the contact code, clears any matching connection request, closes the scanner and calls `connect_to_peer`.
+`ContactPanel`'s `on_scan` parses the contact code, clears any matching connection request, closes the scanner and calls `connect_to_peer`. Then it opens or closes your own QR code, so the two of you can scan each other in one go:
+
+- **They scanned you first** (their connection request was listed): your QR code closes.
+- **You scanned first:** your QR code opens (`qr_waiting_for` = their token), and closes by itself once their status leaves `pending`, which means they've scanned you.
 
 Camera access per platform: Linux needs code (`enable_camera_for_qr_scanner` in `src-tauri/src/lib.rs` switches on WebKitGTK's media stream and allows video-only requests); Android needs the `CAMERA` permission in the manifest; Windows prompts by itself.
 
@@ -379,17 +394,20 @@ The UI code is identical; what differs is around it (`src-tauri/src/background.r
 3. The fresh webview loads the UI from scratch. `App` calls `current_session`, finds the backend still logged in and connected, and goes straight to the main screen.
 4. Transcripts are rebuilt from `chat_history` as each chat is opened.
 
-So on Android the UI is disposable and the backend is the long-lived part. That's also why all durable state (history, statuses, mute and notification settings) lives behind commands, and only the theme and the scanner preference live in `localStorage`.
+So on Android the UI is disposable and the backend is the long-lived part. That's also why all durable state (history, statuses, mute and notification settings) lives behind commands, and only per-device preferences live in `localStorage`: the theme, the **Network stats** setting and the scanner preference.
+
+Debug builds also send the client's stdout and stderr to logcat, tagged `E2E` (`adb logcat -s E2E`, `forward_stdout_to_logcat` in `src-tauri/src/lib.rs`). Release builds don't, as the client prints each message's text as it arrives.
 
 ---
 
 ## 9. Things I noticed while tracing this (possible follow-ups)
 
-1. **`code/frontend/README.md` is out of date.** Its "prototype shortcut" section says there is no camera or QR scanning, that message history isn't persisted, and that `client_state.json` is plaintext with the passcode only a UI gate. The code now has all three: the QR scanner, `chat_history.sqlite`, and SQLCipher stores keyed from the passcode. The doc comments on `LoginScreen` / `CreateIdentityScreen` in `app.rs` ("a UI-layer gate only") are stale in the same way, and `ConnectScreen` / `MainScreen` are still labelled "Screen 1" / "Screen 2".
-2. **A sent message isn't on screen until `send_message` returns.** The draft clears at once, but the bubble is only added in the `Ok` branch, which waits for the burst's first packet behind any earlier bursts. Sending several messages quickly leaves a gap where the text has left the box and isn't in the transcript yet. The comment on `messages` calls this "added immediately, optimistically", which isn't quite what happens.
-3. **No unread indicator.** Messages for a chat that isn't open go into `messages` silently; the contact list shows only name and status. On desktop there's no notification either.
+1. **A sent message isn't on screen until `send_message` returns.** The draft clears at once, but the bubble is only added in the `Ok` branch, which waits for the burst's first packet behind any earlier bursts. Sending several messages quickly leaves a gap where the text has left the box and isn't in the transcript yet.
+2. **No desktop notifications.** New messages are counted next to the contact (and on the ← button), but only Android posts a notification.
+3. **Unread counts aren't saved.** They start again at zero after a restart.
 4. **Removing a contact leaves its transcript in memory.** `do_remove` updates `contacts` and `selected`, but `messages[token]` and `history_loaded_for` keep the entry. If the same token is added again in the same session, the old bubbles would still be there although the history DB was wiped. Worth confirming and clearing both on remove.
 5. **Only the latest 200 messages load.** `chat_history` is called once per contact with `limit = 200`, and there's no "load older" in the UI (the DTO comment notes the id would work as a pagination cursor).
 6. **DTOs are duplicated by hand** between `api.rs` and `commands.rs`. A renamed field fails at runtime, as a deserialisation error string, not at compile time. A small shared crate would remove that.
-7. **Polling, not events.** Four command calls per second per window while the main screen is up, each taking the runtime lock. It's simple and it works; Tauri events would cut the up-to-1 s display delay if that ever matters.
-8. **Small things:** the Log out button reuses the `theme-toggle` CSS class; `tauri.conf.json` has `"csp": null` (no content security policy on the webview).
+7. **Polling, not events.** Four command calls per second per window while the main screen is up (five with Network stats on), each taking the runtime lock. It's simple and it works; Tauri events would cut the up-to-1 s display delay if that ever matters.
+8. **Android back doesn't close the connection request pop-up.** It closes the scanner, Manual add, the QR code and the chat, but `ConnectionRequestNotice` doesn't register with `back_button`.
+9. **Small things:** the Log out button reuses the `theme-toggle` CSS class; `tauri.conf.json` has `"csp": null` (no content security policy on the webview).

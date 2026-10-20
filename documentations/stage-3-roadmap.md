@@ -14,6 +14,13 @@ Items are ordered by how much they buy for the effort. The constant-rate tunnel 
   - **No cover traffic.** The relay's dummy packets exist but nothing sends them, so anyone watching sees when and how much people message.
   - **Readable contact requests.** The relay can read every KeyExchange.
   - **Guessable passcodes.** A captured phone's passcode can be guessed offline.
+- **Since then:** PR #43 (`Logan/PQ-Inject-Fixes`, merged 20 October 2026) added:
+  - **Lost PQ refresh recovery.** A receiver holding messages it can't decrypt asks for the missing refreshes with a signed PQ inject request (`0x08`), and the sender resends them from its latest 20.
+  - **Repair session.** A ⋮ menu item in the chat (and `repair <token>` in the CLI) that sets up a fresh session with a contact, keeping their name and the chat history.
+  - **Setup copies.** KeyExchange and SessionEstablish go out 3 times to a contact who has added you, and an unanswered KeyExchange is first resent after 10 s, not 30 s.
+  - **Simulated loss and network stats.** A loss percentage each way, set in the app, and a **Network stats** setting (off by default) that shows packets, loss each way and resends.
+  - **An unstable-network warning** when the measured loss reaches 90% either way.
+  - **Retrying a failed message** from its red **!**.
 
 ## At a glance
 
@@ -45,7 +52,7 @@ Items are ordered by how much they buy for the effort. The constant-rate tunnel 
 
 ## Phase 0: quick wins (week 1)
 
-**Status:** done on `Logan/Bug-Fixes` (8 October 2026), apart from pinning the toolchain (0.7). Each item ends with what was built, where that differs from the plan.
+**Status:** done on `Logan/Bug-Fixes` (8 October 2026), apart from pinning the toolchain (0.7). Screenshot blocking (0.2) was later taken out again, in PR #43. Each item ends with what was built, where that differs from the plan.
 
 ### 0.1 Retry and repeat the handshake
 
@@ -68,21 +75,23 @@ Items are ordered by how much they buy for the effort. The constant-rate tunnel 
 
 Set `FLAG_SECURE` in `MainActivity.onCreate`. That blocks screenshots and screen recording, and blanks the app's thumbnail in recent apps.
 
-**Done.** It blocks screenshots of your own QR code too, so that has to be shown in person.
+**Done, then removed.** It was set on `Logan/Bug-Fixes`, and PR #43 took it out of `MainActivity` so a phone can be mirrored to a laptop (with scrcpy, say) for demos. Screenshots, screen recordings and the recent-apps thumbnail all show the app again.
+
+**Still to do:** turn it back on for release builds, or make it a setting.
 
 ### 0.3 Notifications without names
 
 New-message notifications say "From <name>" on the lock screen (`message_notification_text`). Show just "New message" by default, and make showing names a setting.
 
 **Done:**
-- **The setting:** "Say who each message is from in notifications", under Settings on the identity card, adds "From <name>". It's off by default, and saved with the identity.
+- **The setting:** "Say who each message is from in notifications", under **Settings** in the section after the contact list, adds "From <name>". It's off by default, and saved with the identity.
 - **Where it shows:** only on Android, the one platform that posts notifications.
 
 ### 0.4 Make the README match the code
 
-**What it claims:** `documentations/README.md` describes a Double Ratchet, ML-KEM, a session reset every 100 messages and a 100 ms metronome.
+**What it claimed:** `documentations/README.md` described a Double Ratchet, ML-KEM, a session reset every 100 messages and a 100 ms metronome.
 
-**What's built:** a symmetric hash ratchet with PQ refreshes, round-3 Kyber, no session reset, and no cover traffic yet.
+**What was built** (8 October): a symmetric hash ratchet with PQ refreshes, round-3 Kyber (ML-KEM since, see 0.6), no session reset (a manual Repair session since PR #43), and no cover traffic yet.
 
 **Why it matters:** a security reviewer who spots one overclaim stops trusting the rest. Say what's built, and link this roadmap for what isn't.
 
@@ -166,12 +175,14 @@ It's ported from the QUIC branch, without QUIC: `code/cell`, `client/src/link.rs
   - sync acks: a link whose receipts stop is gone, so the client reconnects;
   - the relay's resend timer: it resends whatever a receipt shows was lost.
 - **Adaptive redundancy.** The client sends each message's FEC symbols from a queue, one symbol per cell. The first round is sized from the measured loss, and it tops up until the relay confirms enough. No more blind 70% budget on every message.
-- **Contact requests through FEC** (inner type `0x08`). The setup then survives the same loss as messages, and a request can grow past one packet (see 2.1).
+- **Contact requests through FEC** (inner type `0x09`; `0x08` is now the PQ inject request). The setup then survives the same loss as messages, and a request can grow past one packet (see 2.1).
 - **Queued while down.** Messages sent while the link is down wait, and go out once it's back.
 
 **What goes:**
 - `BurstSender`, and the paced lane of packet numbers
 - delivery IDs, acks and sync acks
+- receipt requests (the ✓) and the loss probes behind the network stats: every cell's receipt replaces both
+- setup copies (KeyExchange and SessionEstablish sent 3 times): contact requests through FEC replace them
 - the relay's `take_due` pacing and 2–60 s resend backoff
 - the 15 s keepalive (the clock keeps the NAT mapping open)
 
@@ -187,7 +198,7 @@ Cover traffic costs data and battery, because the radio never gets to idle. Make
 | Standard | 4 | ~417 MB | ~1 s |
 | Radio silence | none while idle | only what's sent | once a session opens |
 
-**Compared with other rates:** the README's 100 ms metronome would be about 1 GB a day each way. The QUIC branch measured about 770 MB at 4 cells/s, because QUIC's ACK-only packets nearly double its packet count. Over raw UDP, receipts ride inside the cells instead.
+**Compared with other rates:** the original roadmap's 100 ms metronome (`doable-roadmap.md`) would be about 1 GB a day each way. The QUIC branch measured about 770 MB at 4 cells/s, because QUIC's ACK-only packets nearly double its packet count. Over raw UDP, receipts ride inside the cells instead.
 
 **Radio silence** is for when transmitting at all is the risk. Nothing goes out until the user sends a message or checks for new ones. Then the tunnel runs at a constant rate for a fixed time, and goes quiet again. The relay holds messages in between, for up to 7 days.
 
@@ -198,7 +209,7 @@ Cover traffic costs data and battery, because the radio never gets to idle. Make
 | 1.1 | Cell format, receipts, loss estimate and Poisson clock in `relay-link`. Port the branch's `format.rs`, `window.rs` and `pace.rs` (about 750 lines), leaving out QUIC and its hello. | Transport | M |
 | 1.2 | Relay: a clock per link, one cell per tick (a queued payload or padding). Resend what receipts show was lost; a link is alive while its receipts keep coming. | Relay | M |
 | 1.3 | Client: a send loop on the clock, and a symbol queue with top-ups (`ObjectEncoder`, `sends_for`). Queue while down, reconnect when receipts stop, and remove what cells replace. | Transport | L |
-| 1.4 | Contact requests as FEC objects (`0x08`) | Transport | S |
+| 1.4 | Contact requests as FEC objects (`0x09`) | Transport | S |
 | 1.5 | Rate profiles, and a setting for them in the app | Transport, Mobile | S |
 | 1.6 | Android: a wake lock and the battery-optimisation exemption (from the branch). Measure battery on a real phone, for each profile. | Mobile | S |
 | 1.7 | Tests: in-memory lossy links on Tokio's paused clock (port the branch's `link/tests.rs`), a `lossy_link` loss sweep, and a packet capture | All | M |
@@ -220,7 +231,7 @@ Two people (Transport and Relay) can work on 1.1–1.3 in parallel once the cell
 
 **The fix:** encrypt each one to the recipient's Ed25519 key from their QR code, converted to X25519, with a fresh ephemeral key. libsodium and age do the same conversion, and `ed25519-dalek` has it. Nothing changes in the QR code.
 
-**Why it waits for Phase 1:** the request grows by about 48 bytes, past what fits in one unfragmented packet, so it needs contact requests sent through FEC (1.4).
+**Why it waits for Phase 1:** the request grows by about 48 bytes, past what fits in one unfragmented packet, so it needs contact requests sent through FEC (`0x09`, 1.4).
 
 **Effort:** S–M. **Reward:** high.
 
@@ -268,7 +279,7 @@ It's easier after Phase 1.
 ## Phase 3: bigger steps
 
 - **3.1 Post-compromise security.**
-  - **The problem:** PQ refreshes are encrypted to the peer's long-term Kyber key, so a captured phone exposes all of its future traffic too.
+  - **The problem:** PQ refreshes are encrypted to the peer's long-term ML-KEM key, so a captured phone exposes all of its future traffic too.
   - **The fix:** replace them with a ratchet that brings in fresh X25519 and ML-KEM keys as the conversation goes back and forth. A session then heals once the attacker loses access.
   - **Effort:** L. **Reward:** high.
 - **3.2 Several relays under one offline root key.**

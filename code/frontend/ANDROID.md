@@ -13,6 +13,18 @@ Written for Ubuntu, including WSL2 on Windows.
 It does steps 5–8 for you. Without a port it uses 4430, so for a relay on
 443 write `relay.example.com:443`.
 
+Or build and install separately, from the repo root:
+
+- `./build-apk.sh [-ip <ip> -pk <hex>] [-p <port>]` builds the APK only
+  (steps 6–7). With no flags it bakes in the relay on this machine, at its
+  network IP, port 4430. `-ip` needs `-pk`, the relay's "Server Static
+  Pubkey".
+- `./install-apk.sh` then installs the newest build over USB (step 8).
+- `./run-emulator.sh` starts an Android emulator with the app, to test
+  with one phone or none. Build for it with `./build-apk.sh --emulator`
+  first, which adds the emulator's x86_64 code to the same APK. The
+  emulator's back camera is this computer's webcam.
+
 ## 1. Base toolchain
 
 Skip this if `./runpeer.sh` already works on this machine.
@@ -112,8 +124,15 @@ from git afterwards. They're all under
   keeping the UI clear of the status bar, navigation bar and keyboard,
   and the back button, which `MainActivity` hands to the page on every
   activity (Tauri's own back handling only covers the first).
-- `res/values/strings.xml`, `res/drawable/ic_stat_message.xml` and
-  `res/xml/data_extraction_rules.xml`.
+- `res/values/strings.xml`: the app's name, "Cryptogram" (the launcher
+  label and the activity's title), and the notifications' text.
+- `res/drawable/ic_stat_message.xml`: the notification icon.
+- `res/xml/data_extraction_rules.xml`: backups switched off.
+- The launcher icon: `res/mipmap-anydpi-v26/ic_launcher.xml` (an adaptive
+  icon) and the `ic_launcher*.png` files in each `res/mipmap-*` folder.
+  These are generated rather than written by hand: run
+  `cargo tauri icon ../branding/icon.json` from `src-tauri/` to make them
+  again from `code/frontend/branding/`.
 
 The folder's own `.gitignore` already excludes build output.
 
@@ -142,6 +161,11 @@ relay runs on the same machine.
 - The relay must run the same version of `code/server` as the app. Older
   relays send each message only once, without waiting for the phone to
   confirm it, so messages sent while the phone is asleep get lost.
+
+The easy way is `./build-apk.sh` from the repo root, which sets both for
+you and builds (step 7): `-ip <ip> -pk <hex>` for a relay elsewhere, with
+`-p <port>` if it isn't on 4430. With no flags it uses the relay on this
+machine.
 
 ## 7. Build the APK
 
@@ -200,7 +224,8 @@ cargo tauri android build --debug --apk --target aarch64
 1. Allow notifications when Android asks (Android 13 and newer). Without
    them, the app still receives messages in the background but can't tell
    you about them.
-2. **Create identity**, then log in, the same way as on desktop.
+2. The app opens on a start page. **Sign in** goes to Login: use
+   **Create identity** there, then log in, the same way as on desktop.
 3. Press **Connect**. The relay's public key is already built in (step 6).
 4. Add contacts from the **+** by "Contacts": **Scan QR code** (Android
    asks for camera permission the first time) or **Manual add**, pasting
@@ -218,9 +243,9 @@ shows this as an ongoing "Connected" notification.
 
 - A message that arrives while the app is in the background shows a "New
   message" notification. It never shows the text. It says who the message
-  is from only if you turn that on, under **Settings** on your identity
-  card, since notifications can show on the lock screen. Opening the app
-  clears it.
+  is from only if you turn that on, under **Settings** (the section after
+  the contact list), since notifications can show on the lock screen.
+  Opening the app clears it.
 - Swiping the app away from the recent-apps screen doesn't log you out. The
   app keeps receiving, and reopening it goes straight back to your chats.
 - **Log out** stops the service and the notification.
@@ -232,7 +257,7 @@ shows this as an ongoing "Connected" notification.
   the app's network access until the phone next wakes. Messages then arrive
   late but aren't lost. Some phone makers also stop background apps more
   aggressively. If messages only arrive when you open the app, set
-  Settings → Apps → e2e-messenger → Battery to **Unrestricted**.
+  Settings → Apps → Cryptogram → Battery to **Unrestricted**.
 
 ## How it differs from desktop
 
@@ -244,13 +269,15 @@ shows this as an ongoing "Connected" notification.
 - **No backups.** Android's cloud backup and phone-to-phone transfer are
   switched off for this app, so identities never leave the phone.
 - **Message marks.** A message you send gets a ✓ once the relay has it, or
-  a red ! if it didn't get there within 30 seconds (send it again). The ✓
-  doesn't mean they've read it, or even received it yet: the relay holds it
-  until their phone takes it. Every message shows the time it was sent or
-  arrived.
-- **No screenshots.** The app blocks screenshots and screen recording, and
-  shows as blank on the recent-apps screen, so no other app can capture
-  your chats. That includes your QR code: show it to people in person.
+  a red ! if it didn't get there within 30 seconds (its retry button sends
+  it again). The ✓ doesn't mean they've read it, or even received it yet:
+  the relay holds it until their phone takes it. Every message shows the
+  time it was sent or arrived.
+- **Screen capture is allowed.** Screenshots, screen recording, mirroring
+  to a laptop (with scrcpy, say) and the recent-apps thumbnail all show
+  the app, so a phone can be mirrored for demos. Anything on screen,
+  including your chats and your QR code, can be captured by another app
+  or someone recording the screen.
 - **No Google scanner unless you want it.** The QR scanner decodes with the
   app's own code. Ticking "Also use this device's own scanner" adds
   Android's (Google Play services' ML Kit), which copes better with blur
@@ -292,8 +319,9 @@ must be on the same Wi-Fi.
       ```powershell
       New-NetFirewallHyperVRule -Name E2E-Relay -DisplayName "E2E relay (UDP 4430)" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol UDP -LocalPorts 4430
       ```
-3. Build with `./runpeer-lan.sh --mobile`. With no IP given, it bakes in
-   this machine's IP. If the IP changes later, build again.
+3. Build with `./runpeer-lan.sh --mobile`, or `./build-apk.sh` then
+   `./install-apk.sh`. With no IP given, they bake in this machine's IP.
+   If the IP changes later, build again.
 4. If the phone still can't connect, your Wi-Fi may block devices from
    talking to each other. This is common on campus and office networks.
    Turn on the phone's hotspot, connect the PC to it, and run steps 1 and 3
@@ -313,6 +341,25 @@ way, and phones connect to it the same way.
   On WSL, also allow UDP 4431 as in step 2.3, with another `-Name` and
   `-LocalPorts 4431`.
 
+**Or simulate it in the app.** With the normal relay, the app's own
+**Simulated loss**, in the **Network** fold after the contact list, drops
+the percentage you set of that device's packets, sending and receiving set
+separately. It's off by default and resets to 0 when the app closes.
+
+## Watching the app's log
+
+Debug builds (the `--debug` builds above) send what the client prints to
+Android's log, tagged `E2E`. With the phone connected for `adb` (step 8,
+Option B), watch it with:
+
+```bash
+adb logcat -s E2E
+```
+
+It shows what the client does with each packet: sessions set up, PQ
+refreshes, messages it can't decrypt yet. It also prints the text of
+every message that arrives, which is why only debug builds do this.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -322,6 +369,6 @@ way, and phones connect to it the same way.
 | Gradle complains about the Java version | `JAVA_HOME` must point at JDK 17 or newer. |
 | The app opens but Connect fails or times out | `SERVER_ADDR` wasn't exported when you built (export it and build again), or the phone can't reach that host over UDP. |
 | "App not installed" | See [Updating the app](#updating-the-app). |
-| No notifications for new messages | Notifications were denied. Allow them in Settings → Apps → e2e-messenger → Notifications. |
+| No notifications for new messages | Notifications were denied. Allow them in Settings → Apps → Cryptogram → Notifications. |
 | Messages only arrive when you open the app | The relay is an older version (see step 6), or the phone is stopping the app in the background (see [Receiving in the background](#receiving-in-the-background)). |
-| The QR scanner says the camera is blocked | Camera permission was denied. Grant it in Settings → Apps → e2e-messenger → Permissions. |
+| The QR scanner says the camera is blocked | Camera permission was denied. Grant it in Settings → Apps → Cryptogram → Permissions. |

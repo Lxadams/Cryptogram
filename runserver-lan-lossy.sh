@@ -11,10 +11,11 @@
 # Every second that packets flow, it prints how many got through and how
 # many were dropped, each way, and the loss so far.
 #
-# While it runs, type a new loss and press Enter to change it. Adding a
-# contact takes several single packets, resent only after 30 s, then 60 s
-# and so on, so at 70% it can take many minutes. To test messages, type 0,
-# add contacts, then type 0.7.
+# While it runs, type a new loss and press Enter to change it. When you add
+# a contact, the first request each way is a single packet, resent after
+# 10 s, then 20 s and so on; once they've added you, setup packets go out
+# three times. So at 70% it can take a few minutes. To test messages, type
+# 0, add contacts, then type 0.7.
 #
 # Clients connect exactly as to runserver-lan.sh's relay (UDP 4430, the
 # same key), so the ./runpeer-lan.sh commands it prints, and APKs from

@@ -1,5 +1,20 @@
 # Implementation Plan: E2E Cryptographic Hardening (Phase 5)
 
+## Status, 20 October 2026
+
+This is the July 2026 plan, kept as a record of what was planned. All four items were built, some of them differently. The design as it is now is in [documentations/Logan-info.md](documentations/Logan-info.md) and [documentations/doable-cryptographic-flow.md](documentations/doable-cryptographic-flow.md).
+
+| Item | Status | What was built |
+|---|---|---|
+| 1. Persistent storage | Done, differently in the app | **The CLI** saves its state as planned, to `client_state.json` (or the file `E2E_STATE_FILE` names), in plaintext, so the warning below still applies to it. **The app** doesn't use JSON: each identity's state and chat history are SQLCipher databases (`client_state.sqlite`, `chat_history.sqlite`), keyed by a vault key derived from the passcode with Argon2id. The PQ keys are ML-KEM-768 now, not `pqcrypto_kyber`. `client_state.json` isn't tracked by git. |
+| 2. Relay authentication and replay | Done, with changes | **As planned:** the relay signs the handshake with its Ed25519 key, which the client pins (the CLI takes it as its argument), and the link key comes from an ephemeral-ephemeral X25519 DH. **Changed:** the relay picks the session ID, so the client's init carries only its ephemeral key, and the signature covers the session ID too. There's a key per direction, and numbered packets with a replay window, so link packets can't be replayed either. The client isn't identified in the handshake: its signed sync proves it owns its routing token. |
+| 3. Session replay cache | Built, then replaced | `seen_session_keys` was built as planned, then replaced by **add IDs**. Each side numbers every time it adds the other, from a counter that only goes up, and both numbers travel in every KeyExchange and SessionEstablish. A replayed SessionEstablish names a session that exists already or an older one, and changes nothing. |
+| 4. Skip dictionary | Done | An 8-byte `seq_no`, `recv_count` and `skip_dict`, as planned. A chunk can be up to 100 ahead, and at most 500 skipped keys are kept (not 1000), the oldest dropped first. The `0x01` header also carries the sender's routing token: `[0x01 \| sender token 16 \| seq_no 8 \| nonce 24 \| ciphertext]`. |
+
+The verification plan's tests exist for items 1, 2 and 4. The replay-cache test went with the cache; add IDs have their own tests.
+
+---
+
 This plan addresses the four specific security and reliability requirements identified in the cryptographic review.
 
 ## Proposed Changes

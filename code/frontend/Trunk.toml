@@ -1,10 +1,11 @@
 # Without this, Trunk's default watch covers the whole code/frontend tree,
 # including src-tauri/ — which has its own separate build (cargo/cargo-tauri
-# already recompiles it on source changes) and, at runtime, is where the
-# backend writes client_state.json (see src-tauri/src/commands.rs). Trunk
-# picking that file write up as a "source changed" event was triggering a
-# full WASM rebuild + hot-reload of the running app a moment after every
-# successful connect, wiping all in-memory UI state (the exact bug: the
-# app flashing to the main screen then reverting to the Connect screen).
+# already recompiles it on source changes), and nothing Trunk needs. It was
+# also where the backend once wrote its state at runtime: Trunk picking that
+# file write up as a "source changed" event triggered a full WASM rebuild +
+# hot-reload of the running app a moment after every successful connect,
+# wiping all in-memory UI state (the app flashed to the main screen, then
+# back to the Connect screen). State now lives in the per-app data
+# directory (see `identities_root` in src-tauri/src/commands.rs).
 [watch]
 ignore = ["src-tauri"]

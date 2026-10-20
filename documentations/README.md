@@ -3,17 +3,17 @@
 
 ## Project Overview
 
-E2E-Messenger is a highly secure, extreme-loss tolerant tactical messenger designed as a Proof of Concept (PoC) for rugged operational environments. Built with a high-performance **Rust cryptography and networking core** accessed via a **Mobile UI (Android/Kotlin)**, this project demonstrates novel approaches to metadata obfuscation, network reliability without TCP, and Post-Quantum cryptography.
+E2E-Messenger is a highly secure, extreme-loss tolerant tactical messenger designed as a Proof of Concept (PoC) for rugged operational environments. Built with a high-performance **Rust cryptography and networking core** accessed via the **Cryptogram app** (a **Leptos UI in a Tauri shell**, on desktop and Android), this project demonstrates novel approaches to metadata obfuscation, network reliability without TCP, and Post-Quantum cryptography.
 
 The architecture is designed to survive hostile network conditions (heavy packet loss, jamming, and eventually Deep Packet Inspection censorship firewalls) while leaking as little metadata as it can about who is communicating, or when. What's built so far, and what isn't yet, is set out below and in the [Stage 3 roadmap](stage-3-roadmap.md).
 
-For the full implementation schedule, see the [doable-roadmap.md](doable-roadmap.md). For what comes next (the constant-rate tunnel and hardening), see [stage-3-roadmap.md](stage-3-roadmap.md).
+The original implementation schedule, the July plan, is in [doable-roadmap.md](doable-roadmap.md); the build has since moved on from it. For what comes next (the constant-rate tunnel and hardening), see [stage-3-roadmap.md](stage-3-roadmap.md).
 
 ---
 
 ## How It Works: The Core Mechanics
 
-Our architecture abandons traditional messaging paradigms (like WebSockets, TCP, or central identity servers) in favor of a decentralized, metronomic, and rateless UDP approach. Here is how the components interact:
+Our architecture abandons traditional messaging paradigms (like WebSockets, TCP, or central identity servers) in favor of an account-free, rateless UDP approach. Here is how the components interact:
 
 ### 1. Identity & Trust (QR Codes)
 Users do not register accounts, usernames, or phone numbers. Trust is established completely out-of-band by physically scanning a QR code on a peer's device. The code holds the peer's routing token (where the relay delivers their messages) and their Ed25519 identity key, against which everything they later send is checked. Both people scan each other.
@@ -21,7 +21,7 @@ Users do not register accounts, usernames, or phone numbers. Trust is establishe
 ### 2. Hybrid Post-Quantum Key Exchange (PQXDH)
 To protect against future quantum computers harvesting encrypted data today ("Harvest Now, Decrypt Later"), each session's handshake combines elliptic curve Diffie-Hellman (**X25519**) with the NIST-standardized Post-Quantum Key Encapsulation Mechanism, **ML-KEM-768** (FIPS 203). The two secrets are merged with HKDF into the session's root key, which stays safe unless both are broken.
 
-Every five messages, the sender also mixes a fresh ML-KEM secret into its chain (a "PQ refresh"). These are encapsulated to the contact's long-term ML-KEM key. That keeps a session post-quantum, but doesn't heal it after a device is compromised: healing needs the ratchet planned in the roadmap (item 3.1).
+Every five messages, the sender also mixes a fresh ML-KEM secret into its chain (a "PQ refresh"). These are encapsulated to the contact's long-term ML-KEM key. That keeps a session post-quantum, but doesn't heal it after a device is compromised: healing needs the ratchet planned in the roadmap (item 3.1). A refresh travels inside its message's burst; if that burst is lost, the receiver asks for it again with a signed request, and the sender, which keeps its latest 20, sends it again. Anything else that breaks a session is fixed with **Repair session**, which sets up a new one and keeps the contact and the chat history.
 
 ### 3. End-to-End Encryption (Symmetric Hash Ratchet)
 Once a session is established, messages are encrypted with a **symmetric hash ratchet**, not the Double Ratchet:
@@ -37,6 +37,8 @@ Instead, our Rust core uses **RaptorQ**, a Forward Error Correction (FEC) founta
 - **The burst:** the sender pads and encrypts the message, then sends it as a burst of symbols sized to survive **70% loss** on either side's link. That's the loss it's tested at, against the real relay.
 - **Rebuilding:** the receiver rebuilds the message from any large enough subset of those symbols. There are no end-to-end ACKs.
 - **Offline phones:** the relay keeps each packet until the recipient's client acknowledges it, so a phone that's offline or asleep still gets it later.
+- **The ✓:** the sender asks the relay which of the burst's packets it holds (a receipt), and shows ✓ once there are enough to rebuild the message. If that doesn't happen within 30 seconds, it shows a red **!** with a retry button.
+- **Contact setup:** a setup packet (KeyExchange or SessionEstablish) is a single packet, which can't be spread over FEC symbols. So to a contact who has added you back, each goes out as 3 copies, and an unanswered KeyExchange is sent again after 10 seconds, then less and less often.
 
 ### 5. Traffic Obfuscation (Planned: the Constant-Rate Tunnel)
 **The plan:** to stop a passive observer learning *when* you talk or *how much*, each end will send fixed-size cells at a constant, randomised rate, padding when there's nothing to say. That's Phase 1 of the [Stage 3 roadmap](stage-3-roadmap.md).
@@ -60,8 +62,14 @@ While the core architecture focuses on strict 1-on-1 privacy, the project includ
 ---
 
 ### Project Documentation
-*   [Realistic Implementation Roadmap](doable-roadmap.md)
+*   [Realistic Implementation Roadmap](doable-roadmap.md): the original July plan, kept for reference
 *   [Stage 3 Roadmap: Constant-Rate Tunnel and Hardening](stage-3-roadmap.md)
 *   [Cryptographic Flow, as Implemented](doable-cryptographic-flow.md)
+*   [Protocol Flow Diagrams](architecture-diagrams.md)
+*   [How a Message Gets from Phone A to Phone B](Logan-info.md): a message's path, the ✓, and the packet formats
+*   [How the Frontend / UI Works](Frontend-UI-info.md)
 *   [RaptorQ FEC Transport](raptorq-fec-transport.md)
+*   [Implementation Review](implementation-review.md) (5 October) and [Cryptographic Security Review](cryptographic_security_review.md) (July): dated reviews, many of whose findings have been fixed since
+*   [Deploying the Relay to EC2](ec2-deployment.md) (through GitHub Actions) and [by Hand](ec2-manual-deploy.md)
+*   [Tech Decision: Leptos Instead of Kotlin for the Client](tech-decision-leptos-client.md)
 *   [Prerequisite Learning Guide](LEARNING.md)

@@ -1,5 +1,22 @@
 # Student 1 (Mobile UI & FFI Lead): Concept Study Guide
 
+## Status, 20 October 2026
+
+This is the July 2026 study guide for the planned Kotlin and `uniffi` app, kept as a record. That app was never built. It was replaced by a **Leptos** UI (Rust compiled to WebAssembly) in a **Tauri** shell, the same code on desktop and Android (see [tech-decision-leptos-client.md](tech-decision-leptos-client.md)). How the app works is in [Frontend-UI-info.md](Frontend-UI-info.md), the Android build in [../code/frontend/ANDROID.md](../code/frontend/ANDROID.md), and the current study guide for it in [LEARNING.md](LEARNING.md#5-the-app-leptos-tauri-and-android-student-1).
+
+| Section | Still applies? |
+|---|---|
+| 1. FFI and `uniffi` | **No.** The UI calls 24 Tauri commands, with JSON arguments and results. The only JNI is `NativeBridge`'s two hand-written calls, `nextEvent()` and `appResumed()`. Data is still copied across the boundary, never shared. |
+| 2. Threading across the boundary | **Partly.** Rust's `tokio` runtime still runs apart from the UI. There's no callback interface: a Kotlin thread blocks in `nextEvent()` until Rust reports something, then posts the event to the main thread, for the reason this section gives. The webview side has no such problem, as it polls once a second. |
+| 3. Foreground services and lifecycle | **Yes.** `MessageService` keeps the process and its UDP socket alive while someone is logged in. It runs no timer, as there's no metronome, and returns `START_NOT_STICKY`. Phone makers' extra battery limits still bite: `ANDROID.md` says to set the app's battery use to Unrestricted. |
+| 4. Camera and QR | **Partly.** The runtime `CAMERA` permission applies. CameraX and ML Kit don't: the QR code is drawn and scanned in the WASM (`qrcode`, then `getUserMedia` and `rqrr`), and the device's `BarcodeDetector` (ML Kit on Android) is an option, off by default. The payload is text, not raw bytes: `CG2:` + Base45 of the routing token and Ed25519 key, 72 characters in QR's alphanumeric mode, a 29×29 code (version 3, level L). |
+| 5. Crypto at black-box level | **Partly.** A session still has state the UI shows: a contact is "pending" until both have added each other, then "connecting" while the session is set up. But there's no Double Ratchet (it's a symmetric hash ratchet with PQ refreshes every 5 steps) and no "blunt force" reset. In its place, the chat's ⋮ menu has **Repair session**, which sets up a fresh session and keeps the contact and the chat history. Nothing resets by itself every 100 messages. |
+| 6. Local storage | **Yes, as SQLCipher.** Each identity's state and chat history are SQLCipher databases, keyed by a vault key derived from the passcode with Argon2id. The Android Keystore isn't used. Stage 3 item 2.4 plans to wrap the vault key with it. |
+| 7. Networking | **Mostly.** Raw UDP on port 443, and the weak obfuscation claim, are as described. There's no metronome yet (Stage 3 Phase 1 plans a constant-rate tunnel). The design target is 70% loss each way, not 90–95%. A sent message's ✓ means the relay has it, not that it was delivered. |
+| 8. Build tooling | **Partly.** The Android targets still matter (`aarch64` for phones, `x86_64` for the emulator, `armv7` for old phones), but `cargo tauri android build` replaces `cargo-ndk`. |
+
+---
+
 Not a schedule — a map of what you actually need to *understand* to do this role well. Organized by concept area, each with why it matters for this project specifically and what to go learn. Some sections are core to your lead role; a few are "know enough to integrate," where you don't need Logan's or Student 3's depth but do need to not be blindsided by their black boxes.
 
 ---
@@ -79,7 +96,7 @@ You're not building the transport layer, but callbacks and UI state depend on it
 
 - **Why raw UDP over port 443 (not QUIC):** the current roadmap cut QUIC in favor of raw UDP for extreme-loss tolerance — port 443 is chosen so casual traffic inspection sees "probably HTTPS-shaped traffic" on a common port, even though it isn't actually QUIC/TLS underneath. Understand this is a much weaker obfuscation claim than the original QUIC-based design and don't oversell it in the demo narrative.
 - **The metronome/constant-rate concept:** fixed-interval packet emission (dummy packets when idle) exists to prevent traffic-timing analysis. You need to understand this only well enough to know *why* the Foreground Service can't just fire on-demand — it fires on a strict clock regardless of whether there's a real message to send.
-- **RaptorQ at a conceptual level:** you don't need the math, but understand the shape of the guarantee: any sufficient subset of transmitted symbols reconstructs the original message, which is *why* the app can tolerate 90-95% packet loss without traditional retransmission/ACKs. This is relevant to how you frame "message sent" vs "message delivered" states in the UI — delivery confirmation works differently here than in a normal chat app.
+- **RaptorQ at a conceptual level:** you don't need the math, but understand the shape of the guarantee: any sufficient subset of transmitted symbols reconstructs the original message, which is *why* the app can tolerate heavy packet loss (it's designed and tested for 70% each way) without end-to-end retransmission/ACKs. This is relevant to how you frame "message sent" vs "message delivered" states in the UI — delivery confirmation works differently here than in a normal chat app.
 
 ---
 

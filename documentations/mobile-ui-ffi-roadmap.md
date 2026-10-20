@@ -1,5 +1,24 @@
 # Mobile UI & FFI Lead: Detailed Personal Roadmap
 
+## Status, 20 October 2026
+
+This is the July 2026 plan, kept as a record of what was planned. The Kotlin and `uniffi` app it describes was never built. It was replaced by a **Leptos** UI (Rust compiled to WebAssembly) in a **Tauri** shell, the same code on desktop and Android (see [tech-decision-leptos-client.md](tech-decision-leptos-client.md)). How the app works is in [Frontend-UI-info.md](Frontend-UI-info.md), and how to build it for Android is in [../code/frontend/ANDROID.md](../code/frontend/ANDROID.md).
+
+**What still applies:**
+- **The foreground service (weeks 5 and 7).** `MessageService` runs while someone is logged in, with an ongoing "Connected" notification (`foregroundServiceType="specialUse"`), so Android keeps the process and its UDP socket alive. Tapping a notification brings the app back. It returns `START_NOT_STICKY`: if Android kills the process, nobody can log in again without their passcode, and the relay holds messages until then. There's no battery-optimisation prompt yet; that is Stage 3 item 1.6.
+- **Runtime permissions (week 2).** `CAMERA` is in the manifest, and Android asks for it when the scanner first opens. Notification permission is asked for at launch on Android 13 and newer.
+- **The Android lifecycle (week 7).** Swiping the app away doesn't log you out: the backend keeps running for the service, and reopening the app loads a fresh UI that goes straight back to your chats. Rotation doesn't recreate the activity.
+- **A background thread talking to Kotlin (week 6).** It runs the other way round from a `uniffi` callback: a Kotlin thread in `NativeBridge` blocks in the JNI call `nextEvent()` until Rust reports something (logged in, logged out, a message), and posts each event to the main thread.
+
+**What doesn't:**
+- **`uniffi`, Android Studio and `cargo-ndk` (week 1).** The UI calls 24 Tauri commands instead, and `cargo tauri android build` cross-compiles the Rust and builds the APK. The SDK command-line tools and the NDK are still needed.
+- **CameraX and ML Kit (weeks 2 and 3).** The QR code is drawn and scanned in the WASM (`qrcode`, then `getUserMedia` and `rqrr`). The device's `BarcodeDetector`, which is ML Kit on Android, is an option that's off by default. The code is `CG2:` + Base45 of the routing token and the Ed25519 key, a 29×29 QR code, and both people scan each other.
+- **The metronome (weeks 5 and 6).** It wasn't built, so the service runs no timer. A constant-rate tunnel is planned for Stage 3 Phase 1.
+- **Fetching queued packets on app open (weeks 8 and 9).** There's no fetch request. When the app comes back on screen, the backend syncs with the relay at once, and the relay resends whatever is queued.
+- **The 90% loss demo (week 12).** It was tested at 70% loss each way, through a loss-injecting proxy (`runserver-lan-lossy.sh`). The app can also simulate loss itself, and its **Network stats** setting shows the loss each way.
+
+---
+
 Scoped from the team's E2E Messenger MVP roadmap. This breaks your three phases (1, 2, 4) into weekly, task-level detail — what to build, what "done" looks like, and where you're blocked waiting on teammates.
 
 ---
